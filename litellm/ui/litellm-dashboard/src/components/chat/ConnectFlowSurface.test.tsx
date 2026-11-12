@@ -151,6 +151,16 @@ describe("ConnectFlowSurface", () => {
     expect(onChangeAfterReturn).toHaveBeenCalledWith(["catalog"]);
   });
 
+  it("offers no picker and an open Finish when the flow cannot be narrowed", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue({ ...flow("unscoped"), selectable: false });
+    renderSurface();
+
+    expect(await screen.findByRole("button", { name: /finish connecting/i })).toBeEnabled();
+    expect(screen.queryByTestId("mcp-apps-panel")).not.toBeInTheDocument();
+    expect(screen.getByText("Click Finish connecting to return to https://claude.ai.")).toBeInTheDocument();
+  });
+
   it("finishes with the ids of the servers the panel shows as connected", async () => {
     state.connectFlow = "flow-handle-123";
     vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));

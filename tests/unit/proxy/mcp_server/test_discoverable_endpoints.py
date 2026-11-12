@@ -12212,12 +12212,12 @@ def test_gateway_connect_rechecks_session_after_authorize(
 
 
 @pytest.mark.parametrize(
-    ("resource", "sealed_ids"),
+    ("resource", "sealed_ids", "selectable"),
     [
-        (None, ("alpha-id", "beta-id")),
-        ("http://testserver", ("alpha-id", "beta-id")),
-        ("http://testserver/mcp", ("alpha-id", "beta-id")),
-        ("http://testserver/mcp/alpha,beta", None),
+        (None, ("alpha-id", "beta-id"), "absent"),
+        ("http://testserver", ("alpha-id", "beta-id"), "absent"),
+        ("http://testserver/mcp", ("alpha-id", "beta-id"), "absent"),
+        ("http://testserver/mcp/alpha,beta", None, False),
     ],
 )
 def test_gateway_connect_complete_reads_each_picked_server(
@@ -12225,6 +12225,7 @@ def test_gateway_connect_complete_reads_each_picked_server(
     browser_session_database: _BrowserSessionDatabase,
     resource: str | None,
     sealed_ids: tuple[str, ...] | None,
+    selectable: Literal["absent", False],
 ) -> None:
     import json
     from urllib.parse import parse_qs, urlparse
@@ -12267,6 +12268,8 @@ def test_gateway_connect_complete_reads_each_picked_server(
         follow_redirects=False,
     )
     flow: Final = parse_qs(urlparse(authorized.headers["location"]).query)["connect_flow"][0]
+    described: Final = client.get("/authorize/flow", params={"flow": flow})
+    assert described.json().get("selectable", "absent") == selectable
     response: Final = client.post(
         "/authorize/complete", data={"flow": flow, "server": ["alpha-id", "beta-id"]}, follow_redirects=False
     )

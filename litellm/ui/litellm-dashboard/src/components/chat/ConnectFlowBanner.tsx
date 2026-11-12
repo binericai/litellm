@@ -46,7 +46,9 @@ const copyFor = (
   if (flow.state === "unscoped") {
     return [
       t("chat.connectFlowBanner.unscoped.title", { client: clientLabel }),
-      t("chat.connectFlowBanner.unscoped.description", { client: clientLabel }),
+      flow.selectable === false
+        ? t("chat.connectFlowBanner.unscoped.fixed", { client: clientLabel })
+        : t("chat.connectFlowBanner.unscoped.description", { client: clientLabel }),
     ];
   }
   if (flow.state === "multi") {
@@ -103,7 +105,6 @@ const ConnectFlowBanner: React.FC<Props> = ({
   const action = `${getProxyBaseUrl()}/authorize/complete`;
   const state = failed || flow === undefined ? "stale" : flow.state;
   const canFinish = canFinishConnectFlow(state, flow);
-  const picksUnknown = state === "unscoped" && connectedServerIds === null;
   const canCancel = state !== "unscoped";
   const loopbackClient = isLoopbackOrigin(flow?.client_origin ?? null);
   const vendorServers = vendorServersFor(state, flow);
@@ -144,7 +145,7 @@ const ConnectFlowBanner: React.FC<Props> = ({
               <input key={serverId} type="hidden" name="server" value={serverId} />
             ))}
             {canFinish && (
-              <Button type="submit" disabled={picksUnknown} className="h-[38px] px-4 font-semibold">
+              <Button type="submit" disabled={connectedServerIds === null} className="h-[38px] px-4 font-semibold">
                 {t("chat.connectFlowBanner.finish")}
               </Button>
             )}

@@ -60,6 +60,8 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
     onChange(servers);
   };
 
+  const selectable = flow?.state === "unscoped" && flow.selectable !== false;
+
   if (connectFlow === null) {
     return <MCPAppsPanel accessToken={accessToken} selectedServers={selectedServers} onChange={onChange} />;
   }
@@ -72,9 +74,9 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
         accessToken={accessToken}
         onConnected={refetch}
         failed={isError}
-        connectedServerIds={connectedServerIds}
+        connectedServerIds={selectable ? connectedServerIds : []}
       />
-      {flow?.state === "unscoped" && (
+      {selectable && (
         <MCPAppsPanel
           accessToken={accessToken}
           selectedServers={selectedServers}

@@ -1034,6 +1034,7 @@ class ConnectFlowDescription(TypedDict):
     connected: ReadOnly[bool | None]
     servers: ReadOnly[Sequence[ConnectFlowServer] | None]
     requested_scopes: NotRequired[ReadOnly[tuple[str, ...]]]
+    selectable: NotRequired[ReadOnly[Literal[False]]]
 
 
 async def _describe_connect_flow_server(
@@ -1115,7 +1116,10 @@ async def _describe_opened_flow(
         "connected": state == "m2m" or None,
         "servers": None,
     }
-    return described
+    if not flow.unresolved_resource:
+        return described
+    unselectable: Final[ConnectFlowDescription] = {**described, "selectable": False}
+    return unselectable
 
 
 async def _describe_interactive_target(
