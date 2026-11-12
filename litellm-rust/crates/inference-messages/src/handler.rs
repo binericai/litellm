@@ -55,6 +55,7 @@ struct ProviderCall {
     whole_sse_frames: bool,
     joined_reads: bool,
     transform_context: MessagesTransformContext,
+    native_output_fallback: Option<Value>,
     ascii_response_headers: bool,
     unencodable_request_header: Option<Vec<u8>>,
     ascii_request_headers: bool,
@@ -279,6 +280,7 @@ async fn provider_call(
     )?;
     let transform_context = MessagesTransformContext {
         drops_unsupported_params: shaping.settings.drops_unsupported_params,
+        global_drop_params: shaping.settings.global_drop_params,
         ..MessagesTransformContext::new(shaping.capabilities, shaping.settings.drop_params)
     };
     let dropped_keys = top_level_paths(&shaping.settings.additional_drop_params);
@@ -321,14 +323,30 @@ async fn provider_call(
 
     let tool_custom_field = config.tool_custom_field(&trimmed.model);
     let requested_output_format = trimmed.params.output_format.clone();
+    let fallback = config
+        .native_output_fallback(&trimmed, &transform_context)
+        .map(|fallback_context| (trimmed.clone(), fallback_context, validated.headers.clone()));
+    let (transformed, transformed_headers) =
+        config.transform_request_with_headers(trimmed, &transform_context, validated.headers)?;
     let body = config.request_body(
-        tool_custom_field.apply(
-            config.transform_anthropic_messages_request(trimmed, &transform_context)?,
-            shaping.settings.drops_unsupported_params,
-        ),
-        &validated.headers,
+        tool_custom_field.apply(transformed, shaping.settings.drops_unsupported_params),
+        &transformed_headers,
         shaping.settings.drop_params,
     )?;
+    let native_output_fallback = fallback
+        .map(|(input, fallback_context, headers)| {
+            let (rebuilt, rebuilt_headers) =
+                config.transform_request_with_headers(input, &fallback_context, headers)?;
+            let rebuilt = config.request_body(
+                tool_custom_field.apply(rebuilt, shaping.settings.drops_unsupported_params),
+                &rebuilt_headers,
+                shaping.settings.drop_params,
+            )?;
+            Ok::<_, Error>(
+                config.wire_body(serde_json::to_value(&rebuilt).map_err(serialize_failure)?),
+            )
+        })
+        .transpose()?;
     let url = config.get_complete_url(
         api_base.as_deref(),
         &body.model,
@@ -339,7 +357,7 @@ async fn provider_call(
     let environment = ValidatedEnvironment {
         headers: config.headers_for_url(
             config.request_headers(
-                with_python_default_headers(validated.headers, config.default_headers()),
+                with_python_default_headers(transformed_headers, config.default_headers()),
                 &with_requested_output_format(&body, requested_output_format),
             ),
             &url,
@@ -354,6 +372,11 @@ async fn provider_call(
         secret_fields: Vec::new(),
         api_key: api_key.map(SecretValue::new),
     };
+    let serialized = serde_json::to_value(&body).map_err(serialize_failure)?;
+    let wire_body = config.wire_body(serialized.clone());
+    let stream_moved_to_url = body.params.streams()
+        && serialized.get("stream").is_some()
+        && wire_body.get("stream").is_none();
     let authenticated = resolve_auth(auth, environment, &|key| std::env::var(key).ok()).await?;
     let identity = ProviderIdentity {
         model: request_context.model.clone(),
@@ -365,15 +388,15 @@ async fn provider_call(
             WireRequest {
                 url,
                 headers: joined_header_values(authenticated.headers),
-                body: config.wire_body(serde_json::to_value(&body).map_err(serialize_failure)?),
+                body: wire_body,
             },
             request_context,
         )
         .await?;
-    let stream = wire
-        .body
-        .get("stream")
-        .is_some_and(litellm_llms_types::recognized::python_truthy);
+    let stream = wire.body.get("stream").map_or(
+        stream_moved_to_url,
+        litellm_llms_types::recognized::python_truthy,
+    );
     Ok(ProviderCall {
         identity,
         wire,
@@ -384,6 +407,7 @@ async fn provider_call(
         whole_sse_frames: shaping.settings.whole_sse_frames,
         joined_reads: shaping.settings.joined_reads,
         transform_context,
+        native_output_fallback,
         ascii_response_headers: shaping.settings.ascii_response_headers,
         unencodable_request_header: shaping.settings.unencodable_request_header,
         ascii_request_headers: shaping.settings.ascii_request_headers,
@@ -658,6 +682,7 @@ async fn send_recovering(
     let config = request.provider.config();
     let mut body = std::borrow::Cow::Borrowed(&request.wire.body);
     let mut attempt = 1;
+    let mut recovered: Vec<(u16, String)> = Vec::new();
     loop {
         log_request_body(request.provider.as_str(), request.stream, &body);
         if let Some(value) = &request.unencodable_request_header {
@@ -723,6 +748,19 @@ async fn send_recovering(
             }
             hosted @ Upstream::Hosted(_) => return Ok(hosted),
         };
+        if let Some(rebuilt) = request.native_output_fallback.as_ref().filter(|_| {
+            config.retries_without_native_output(
+                failure.status,
+                &failure.text,
+                &body,
+                &request.identity.model,
+            )
+        }) {
+            let replayed = replayed_recoveries(config, rebuilt.clone(), &recovered, request);
+            body = std::borrow::Cow::Owned(replayed.body.clone());
+            context.provider_request_retried(replayed).await?;
+            continue;
+        }
         let retried = if attempt == MESSAGES_HTTP_ERROR_ATTEMPTS {
             None
         } else {
@@ -737,12 +775,43 @@ async fn send_recovering(
             return Err(failure.into());
         };
         attempt += 1;
+        recovered.push((failure.status, failure.text.clone()));
         tracing::debug!(
             "Anthropic /v1/messages: retrying after a recoverable HTTP error (attempt {attempt}/{MESSAGES_HTTP_ERROR_ATTEMPTS})."
         );
         body = std::borrow::Cow::Owned(retried.body.clone());
         context.provider_request_retried(retried).await?;
     }
+}
+
+fn replayed_recoveries(
+    config: &dyn BaseMessagesConfig,
+    rebuilt: Value,
+    recovered: &[(u16, String)],
+    request: &ProviderCall,
+) -> litellm_host::interceptors::RetriedRequest {
+    recovered.iter().fold(
+        litellm_host::interceptors::RetriedRequest {
+            reasons: Vec::new(),
+            body: rebuilt,
+        },
+        |replayed, (status, text)| match config.retry_after_http_error(
+            *status,
+            text,
+            &replayed.body,
+            &request.transform_context,
+        ) {
+            Some(retried) => litellm_host::interceptors::RetriedRequest {
+                reasons: replayed
+                    .reasons
+                    .into_iter()
+                    .chain(retried.reasons)
+                    .collect(),
+                body: retried.body,
+            },
+            None => replayed,
+        },
+    )
 }
 
 fn serialize_failure(err: serde_json::Error) -> Error {
@@ -921,6 +990,7 @@ fn streaming_response(
         Some(decode) => decoded_chunks(
             chunks.map_err(std::io::Error::other).boxed(),
             decode,
+            headers.clone(),
             provider,
         ),
     };
@@ -942,6 +1012,7 @@ fn hosted_streaming_response(
         Some(decode) => decoded_chunks(
             chunks.map_err(std::io::Error::other).boxed(),
             decode,
+            headers.clone(),
             provider,
         ),
     };
@@ -1000,9 +1071,10 @@ fn complete_frames_end(pending: &[u8]) -> usize {
 fn decoded_chunks(
     bytes: ByteStream,
     decode: StreamDecoder,
+    headers: Vec<(String, String)>,
     provider: &'static str,
 ) -> BoxStream<'static, Result<Bytes, Error>> {
-    futures_util::stream::try_unfold(decode(bytes), move |mut events| async move {
+    futures_util::stream::try_unfold(decode(bytes, headers), move |mut events| async move {
         let Some(event) = events.try_next().await? else {
             return Ok(None);
         };
@@ -1787,7 +1859,7 @@ mod tests {
             .unwrap();
         let MessagesCallResponse::Stream { mut chunks, .. } = streaming_response(
             response,
-            Some(streaming::event_stream),
+            Some(|bytes, _| streaming::event_stream(bytes)),
             "test",
             Duration::from_secs(5),
             false,

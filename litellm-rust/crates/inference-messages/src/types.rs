@@ -85,6 +85,8 @@ pub struct MessagesSettings {
     #[serde(default)]
     pub drops_unsupported_params: bool,
     #[serde(default)]
+    pub global_drop_params: bool,
+    #[serde(default)]
     pub intercepted: bool,
     #[serde(default)]
     pub mcp_gateway: bool,
@@ -194,6 +196,7 @@ mod tests {
                 supports_sampling_params: false,
                 supports_speed: true,
                 supports_mid_conversation_system: false,
+                bedrock: Default::default(),
                 effort_tiers: SupportedEffortTiers {
                     minimal: false,
                     low: true,

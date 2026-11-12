@@ -16,7 +16,9 @@ use litellm_inference_messages::{
     litellm_params, messages_body,
     route::{Messages, MessagesStreamHead},
 };
-use litellm_llms::base_llm::messages::context::MessagesModelCapabilities;
+use litellm_llms::base_llm::messages::context::{
+    BedrockCapabilities, MessagesModelCapabilities, NativeOutputSupport,
+};
 use litellm_llms_types::headers::ProviderSpecificHeaders;
 use litellm_router_types::LitellmParams;
 use pyo3::{
@@ -24,7 +26,7 @@ use pyo3::{
     gc::{PyTraverseError, PyVisit},
     prelude::*,
     sync::PyOnceLock,
-    types::{PyBytes, PyDict, PyList, PyMapping, PyString, PyTuple},
+    types::{IntoPyDict, PyBytes, PyDict, PyList, PyMapping, PyString, PyTuple},
 };
 use serde_json::{Map, Value};
 
@@ -130,6 +132,137 @@ fn merge_headers(
 
 const FEDERATING_PROVIDER: &str = "anthropic";
 
+const BEDROCK_PROVIDER: &str = "bedrock";
+const BEDROCK_COMMON_UTILS_MODULE: &str = "litellm.llms.bedrock.common_utils";
+const BEDROCK_PASSTHROUGH_PARAMS: [&str; 2] = ["model_id", "guardrailConfig"];
+const BEDROCK_METADATA_PARAMS: [&str; 2] = ["metadata", "litellm_metadata"];
+const BEDROCK_SPEND_LOGS_METADATA: &str = "spend_logs_metadata";
+const BEDROCK_REQUEST_METADATA_FIELDS: &str = "bedrock_request_metadata_fields";
+
+fn text_pairs(value: &Bound<'_, PyAny>) -> PyResult<Map<String, Value>> {
+    let Ok(mapping) = value.cast::<PyMapping>() else {
+        return Ok(Map::new());
+    };
+    mapping
+        .items()?
+        .iter()
+        .filter_map(|item| {
+            let (key, value): (Bound<'_, PyAny>, Bound<'_, PyAny>) = match item.extract() {
+                Ok(pair) => pair,
+                Err(error) => return Some(Err(error)),
+            };
+            let key = key.cast::<PyString>().ok()?.to_str().ok()?.to_string();
+            if key == BEDROCK_SPEND_LOGS_METADATA {
+                return Some(text_pairs(&value).map(|pairs| (key, Value::Object(pairs))));
+            }
+            let value = value.cast::<PyString>().ok()?.to_str().ok()?.to_string();
+            Some(Ok((key, Value::String(value))))
+        })
+        .collect()
+}
+
+fn bedrock_litellm_params<'py>(
+    py: Python<'py>,
+    argument: impl Fn(&str) -> PyResult<Option<Bound<'py, PyAny>>>,
+) -> PyResult<Map<String, Value>> {
+    let mut extra = project_optional_fields(BEDROCK_PASSTHROUGH_PARAMS, &argument)?;
+    for name in BEDROCK_METADATA_PARAMS {
+        if let Some(value) = argument(name)? {
+            extra.insert(name.to_string(), Value::Object(text_pairs(&value)?));
+        }
+    }
+    let configured = py
+        .import("litellm")?
+        .getattr(BEDROCK_REQUEST_METADATA_FIELDS)?;
+    if configured.is_instance_of::<PyList>() || configured.is_instance_of::<PyTuple>() {
+        let fields = configured
+            .try_iter()?
+            .map(|field| Ok(Value::String(field?.str()?.to_str()?.to_string())))
+            .collect::<PyResult<Vec<Value>>>()?;
+        extra.insert(
+            BEDROCK_REQUEST_METADATA_FIELDS.to_string(),
+            Value::Array(fields),
+        );
+    }
+    Ok(extra)
+}
+
+fn bedrock_capabilities<'py>(
+    py: Python<'py>,
+    model: &str,
+    custom_llm_provider: &str,
+    model_info: Option<Bound<'py, PyAny>>,
+) -> PyResult<BedrockCapabilities> {
+    let resolved: String = py
+        .import("litellm")?
+        .getattr("get_llm_provider")?
+        .call(
+            (),
+            Some(
+                &[
+                    ("model", model),
+                    ("custom_llm_provider", custom_llm_provider),
+                ]
+                .into_py_dict(py)?,
+            ),
+        )
+        .and_then(|resolved| resolved.get_item(0)?.extract())
+        .unwrap_or_else(|_| model.to_string());
+    let model_info = model_info.filter(|info| info.cast::<PyMapping>().is_ok());
+    let utils = py.import(BEDROCK_COMMON_UTILS_MODULE)?;
+    let flag = |function: &str, args: Bound<'py, PyTuple>| -> PyResult<bool> {
+        utils.getattr(function)?.call1(args)?.is_truthy()
+    };
+    let with_info = |function: &str| -> PyResult<bool> {
+        flag(
+            function,
+            (resolved.as_str(), BEDROCK_PROVIDER, model_info.clone()).into_pyobject(py)?,
+        )
+    };
+    Ok(BedrockCapabilities {
+        output_config_effort_ceiling: from_py(
+            &utils
+                .getattr("_get_bedrock_output_config_effort_ceiling")?
+                .call1((resolved.as_str(),))?,
+        )?,
+        supports_output_config: flag(
+            "_bedrock_model_supports",
+            (resolved.as_str(), "supports_output_config").into_pyobject(py)?,
+        )?,
+        supports_prompt_cache_ttl: flag(
+            "supports_bedrock_prompt_cache_ttl",
+            (resolved.as_str(),).into_pyobject(py)?,
+        )?,
+        supports_tool_search: flag(
+            "bedrock_supports_tool_search",
+            (resolved.as_str(),).into_pyobject(py)?,
+        )?,
+        supports_per_turn_control: flag(
+            "bedrock_supports_per_turn_control",
+            (resolved.as_str(), model_info.clone()).into_pyobject(py)?,
+        )?,
+        native_output: NativeOutputSupport {
+            enabled: with_info("_bedrock_native_output_enabled")?,
+            opt_in: with_info("_bedrock_native_output_opt_in")?,
+            mapped: flag(
+                "_bedrock_model_supports",
+                (resolved.as_str(), "supports_native_structured_output").into_pyobject(py)?,
+            )?,
+            replaces_unforceable_tool: flag(
+                "_bedrock_native_output_replaces_unforceable_tool",
+                (resolved.as_str(), model_info.clone()).into_pyobject(py)?,
+            )?,
+        },
+    })
+}
+
+fn global_drop_params(py: Python<'_>) -> PyResult<bool> {
+    Ok(py
+        .import("litellm")?
+        .getattr("drop_params")?
+        .is(pyo3::types::PyBool::new(py, true)))
+}
+
 fn workload_identity_fields(py: Python<'_>) -> PyResult<&'static [String]> {
     static FIELDS: PyOnceLock<Vec<String>> = PyOnceLock::new();
     FIELDS
@@ -152,15 +285,17 @@ fn module_global<'py>(py: Python<'py>, name: &str) -> PyResult<Option<Bound<'py,
 /// leaves out falls back to the module global it names, which stays the host's concern.
 fn project_litellm_params<'a, 'py>(
     names: impl IntoIterator<Item = &'a str>,
+    extra: Map<String, Value>,
     argument: impl Fn(&str) -> PyResult<Option<Bound<'py, PyAny>>>,
     global: impl Fn(&str) -> PyResult<Option<Bound<'py, PyAny>>>,
 ) -> PyResult<Result<LitellmParams, Error>> {
-    let fields = project_optional_fields(
+    let mut fields = project_optional_fields(
         LitellmParams::fields()
             .map(|name| -> &'a str { name })
             .chain(names),
         &argument,
     )?;
+    fields.extend(extra);
     let globals = LitellmParams::specs()
         .filter(|spec| !spec.wire.iter().any(|name| fields.contains_key(*name)))
         .filter_map(|spec| spec.module_global);
@@ -471,15 +606,27 @@ impl MessagesPythonHost {
             custom_llm_provider.as_deref(),
             &mut unencodable_request_header,
         )?;
+        let bedrock = custom_llm_provider.as_deref() == Some(BEDROCK_PROVIDER);
+        let mut capabilities = self.capabilities(py, &model, custom_llm_provider.as_deref())?;
+        if bedrock {
+            capabilities.bedrock =
+                bedrock_capabilities(py, &model, BEDROCK_PROVIDER, argument("model_info")?)?;
+        }
         let shaping = MessagesShaping {
-            capabilities: self.capabilities(py, &model, custom_llm_provider.as_deref())?,
+            capabilities,
             settings: MessagesSettings {
                 whole_sse_frames: settings.stream_cost_model.is_some(),
                 presanitized,
                 intercepted: self.may_intercept(py)?,
                 unencodable_request_header,
+                global_drop_params: global_drop_params(py)?,
                 ..settings.settings
             },
+        };
+        let bedrock_params = if bedrock {
+            bedrock_litellm_params(py, argument)?
+        } else {
+            Map::new()
         };
         let federation_fields: &[String] = match custom_llm_provider.as_deref() {
             Some(FEDERATING_PROVIDER) => workload_identity_fields(py)?,
@@ -487,6 +634,7 @@ impl MessagesPythonHost {
         };
         let litellm_params = project_litellm_params(
             federation_fields.iter().map(String::as_str),
+            bedrock_params,
             argument,
             |name| module_global(py, name),
         )?;
@@ -560,21 +708,18 @@ impl MessagesPythonHost {
         )
     }
 
-    fn provider(&self, py: Python<'_>) -> String {
-        self.view
-            .request(py)
-            .and_then(|request| request.get_item("custom_llm_provider"))
-            .ok()
-            .flatten()
-            .and_then(|value| value.extract::<Option<String>>().ok().flatten())
-            .unwrap_or_else(|| "anthropic".into())
+    fn provider(&self, py: Python<'_>) -> PyResult<String> {
+        py.import(ROUTE_HOST_MODULE)?
+            .getattr("request_provider")?
+            .call1((self.view.request(py)?,))?
+            .extract()
     }
 
     fn map_transport_failure(&self, py: Python<'_>, error: PyErr) -> PyResult<PyErr> {
         let mapped = py
             .import(ROUTE_HOST_MODULE)?
             .getattr("map_transport_failure")?
-            .call1((error.value(py), self.view.request(py)?, self.provider(py)))?;
+            .call1((error.value(py), self.view.request(py)?, self.provider(py)?))?;
         Ok(PyErr::from_value(mapped))
     }
 
@@ -589,7 +734,7 @@ impl MessagesPythonHost {
                 map.call1((
                     error.value(py),
                     self.view.request(py)?,
-                    self.provider(py),
+                    self.provider(py)?,
                     self.asynchronous,
                 ))
             })
@@ -719,6 +864,9 @@ impl PythonBinding for MessagesPythonHost {
             return Ok(answer);
         }
         let public = public_json_response(py, ROUTE_HOST_MODULE, &response)?;
+        py.import(ROUTE_HOST_MODULE)?
+            .getattr("record_guardrail")?
+            .call1((&public, self.view.request(py)?))?;
         self.safeguards.published(py, public)
     }
 
@@ -792,7 +940,7 @@ impl PythonBinding for MessagesPythonHost {
                 .call1((
                     undecodable.to_string(),
                     self.view.request(py)?,
-                    self.provider(py),
+                    self.provider(py)?,
                 ))?;
             return Ok(PyErr::from_value(raised));
         }
@@ -952,6 +1100,14 @@ mod tests {
         json!({"model": "m", "vertex_project": "p", "vertex_ai_location": "us-east5", "vertex_credentials": {"type": "service_account"}}),
         Ok(json!({"model": "m", "vertex_project": "p", "vertex_ai_location": "us-east5", "vertex_credentials": {"type": "service_account"}})),
     )]
+    #[case::aws_session_tags_are_projected(
+        json!({"model": "m", "aws_role_name": "r", "aws_session_tags": [{"Key": "team", "Value": "genai"}]}),
+        Ok(json!({"model": "m", "aws_role_name": "r", "aws_session_tags": [{"Key": "team", "Value": "genai"}]})),
+    )]
+    #[case::malformed_aws_session_tags_are_a_request_error(
+        json!({"model": "m", "aws_session_tags": [{"Key": "team"}]}),
+        Err(()),
+    )]
     #[case::an_explicit_none_is_absent(json!({"model": "m", "aws_region_name": null}), Ok(json!({"model": "m"})))]
     #[case::a_wrong_type_is_a_request_error(json!({"model": "m", "aws_region_name": 7}), Err(()))]
     #[case::a_missing_model_is_a_request_error(json!({"aws_region_name": "eu-central-1"}), Err(()))]
@@ -1058,6 +1214,7 @@ mod tests {
             let bound = PyDict::new(py);
             let projected = project_litellm_params(
                 names.iter().copied(),
+                Map::new(),
                 |name| present(&kwargs, &bound, name),
                 |name| present(&globals, &bound, name),
             )

@@ -1,22 +1,22 @@
 use crate::anthropic::messages::transformation::retry_anthropic_messages_after_http_error;
-use litellm_core_utils::decline::Decline;
 use litellm_host::interceptors::RetriedRequest;
 use std::convert::Infallible;
 
 use crate::{
     anthropic::messages::handler::shape_anthropic_messages_request,
-    base_llm::messages::context::{MessagesShapeOptions, MessagesTransformContext},
+    base_llm::messages::context::{
+        MessagesShapeOptions, MessagesTransformContext, NativeOutputSupport,
+    },
 };
 use futures_util::StreamExt;
-use litellm_auth::AwsParams;
 use litellm_auth::CredentialPlacement;
 use litellm_secret_value::SecretValue;
 
 use litellm_auth_aws::{
-    AwsCredentialSource, bedrock_model_id_and_region,
+    AwsCredentialSource, bedrock_model_id_and_region, bedrock_runtime_endpoint,
     constants::{
         AWS_BEARER_TOKEN_BEDROCK, AWS_BEDROCK_RUNTIME_ENDPOINT, AWS_DEFAULT_REGION, AWS_REGION,
-        AWS_REGION_NAME, BEDROCK_RUNTIME_ENDPOINT_TEMPLATE, BEDROCK_SERVICE,
+        AWS_REGION_NAME, BEDROCK_SERVICE,
     },
     resolve_bedrock_region,
 };
@@ -40,7 +40,19 @@ use crate::{
             transformation::{BaseMessagesConfig, Headers, ValidatedEnvironment},
         },
     },
-    bedrock::chat::invoke_handler::{decode_invoke_anthropic_chunk, invoke_chunk_stream},
+    bedrock::chat::invoke_handler::decode_invoke_anthropic_chunk,
+};
+
+use super::{
+    event_stream::bedrock_invoke_chunk_stream,
+    headers::{
+        GUARDRAIL_CONFIG_PARAM, guardrail_headers, merged_invoke_headers, request_metadata_header,
+    },
+    request::transform_bedrock_invoke_request,
+    structured_output::{
+        is_native_output_rejection, native_output_format, native_output_retry_requested,
+        requested_output_format, sent_output_config_format,
+    },
 };
 
 const METRICS_USAGE_KEYS: [(&str, &str); 4] = [
@@ -51,6 +63,19 @@ const METRICS_USAGE_KEYS: [(&str, &str); 4] = [
 ];
 
 const INVOKE_MODEL_PREFIX: &str = "invoke/";
+
+const MODEL_ID_PARAM: &str = "model_id";
+
+const ROUTING_PREFIXES: [&str; 8] = [
+    "bedrock/",
+    "chat_completions/",
+    "converse/",
+    "invoke/",
+    "openai/",
+    "mantle/",
+    "nova-2/",
+    "nova/",
+];
 
 const SECRET_NAMES: &[&str] = &[
     AWS_BEARER_TOKEN_BEDROCK,
@@ -76,16 +101,58 @@ fn bearer_token(
     .filter(|token| !token.is_empty())
 }
 
+pub fn quote(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+pub fn strip_bedrock_routing_prefix(model: &str) -> &str {
+    ROUTING_PREFIXES.iter().fold(model, |model, prefix| {
+        if model.starts_with(prefix) {
+            model.split_once('/').map_or(model, |(_, rest)| rest)
+        } else {
+            model
+        }
+    })
+}
+
+fn invoke_model_id(model: &str, model_id: Option<&str>) -> String {
+    if let Some(model_id) = model_id {
+        return quote(model_id).replacen(INVOKE_MODEL_PREFIX, "", 1);
+    }
+    let stripped = strip_bedrock_routing_prefix(model);
+    if stripped.starts_with("arn:") {
+        return quote(stripped);
+    }
+    bedrock_model_id_and_region(&stripped.replacen(INVOKE_MODEL_PREFIX, "", 1)).0
+}
+
+fn model_region(model: &str) -> Option<String> {
+    bedrock_model_id_and_region(strip_bedrock_routing_prefix(model)).1
+}
+
 fn invoke_url(
     api_base: Option<&str>,
     model: &str,
-    aws: &AwsParams,
+    litellm_params: &LitellmParams,
     stream: bool,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> String {
-    let (model_id, model_region) =
-        bedrock_model_id_and_region(model.strip_prefix(INVOKE_MODEL_PREFIX).unwrap_or(model));
-    let region = resolve_bedrock_region(model_region.as_deref(), aws, env_lookup);
+    let aws = &litellm_params.aws;
+    let model_id = invoke_model_id(
+        model,
+        litellm_params
+            .extra
+            .get(MODEL_ID_PARAM)
+            .and_then(Value::as_str),
+    );
+    let region = resolve_bedrock_region(model_region(model).as_deref(), aws, env_lookup);
     let path = if stream {
         INVOKE_STREAM_PATH
     } else {
@@ -100,8 +167,31 @@ fn invoke_url(
     let endpoint = configured(api_base)
         .or_else(|| configured(aws.aws_bedrock_runtime_endpoint.as_deref()))
         .or_else(|| env_lookup(AWS_BEDROCK_RUNTIME_ENDPOINT))
-        .unwrap_or_else(|| BEDROCK_RUNTIME_ENDPOINT_TEMPLATE.replace("{region}", &region));
+        .unwrap_or_else(|| bedrock_runtime_endpoint(&region));
     format!("{}/model/{model_id}/{path}", endpoint.trim_end_matches('/'))
+}
+
+fn invoke_headers(headers: Headers, litellm_params: &LitellmParams) -> Result<Headers, Error> {
+    let guardrail = match litellm_params.extra.get(GUARDRAIL_CONFIG_PARAM) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(raw) => guardrail_headers(raw)?,
+    };
+    Ok(merged_invoke_headers(
+        headers,
+        guardrail,
+        request_metadata_header(&litellm_params.extra),
+    ))
+}
+
+fn without_native_output(context: &MessagesTransformContext) -> MessagesTransformContext {
+    let mut fallback = *context;
+    fallback.thinking.capabilities.bedrock.native_output = NativeOutputSupport {
+        enabled: false,
+        opt_in: false,
+        replaces_unforceable_tool: false,
+        ..fallback.thinking.capabilities.bedrock.native_output
+    };
+    fallback
 }
 
 impl BaseMessagesConfig for AmazonAnthropicClaudeMessagesConfig {
@@ -134,7 +224,7 @@ impl BaseMessagesConfig for AmazonAnthropicClaudeMessagesConfig {
         Ok(invoke_url(
             api_base,
             model,
-            &litellm_params.aws,
+            litellm_params,
             stream,
             env_lookup,
         ))
@@ -142,12 +232,66 @@ impl BaseMessagesConfig for AmazonAnthropicClaudeMessagesConfig {
 
     fn transform_anthropic_messages_request(
         &self,
-        _request: MessagesRequest,
-        _context: &MessagesTransformContext,
+        request: MessagesRequest,
+        context: &MessagesTransformContext,
     ) -> Result<MessagesRequest, Error> {
-        Err(Error::Declined(Decline::new(
-            "Bedrock invoke messages request shaping",
-        )))
+        transform_bedrock_invoke_request(request, context, Vec::new()).map(|(request, _)| request)
+    }
+
+    fn transform_request_with_headers(
+        &self,
+        request: MessagesRequest,
+        context: &MessagesTransformContext,
+        headers: Headers,
+    ) -> Result<(MessagesRequest, Headers), Error> {
+        transform_bedrock_invoke_request(request, context, headers)
+    }
+
+    fn native_output_fallback(
+        &self,
+        request: &MessagesRequest,
+        context: &MessagesTransformContext,
+    ) -> Option<MessagesTransformContext> {
+        let native = context.thinking.capabilities.bedrock.native_output;
+        let Ok(Value::Object(params)) = serde_json::to_value(&request.params) else {
+            return None;
+        };
+        if !native_output_retry_requested(&params, native) {
+            return None;
+        }
+        let output_format = requested_output_format(&params)?;
+        native_output_format(output_format, native)
+            .ok()
+            .flatten()
+            .map(|_| without_native_output(context))
+    }
+
+    fn retries_without_native_output(
+        &self,
+        status: u16,
+        error_text: &str,
+        request_body: &Value,
+        model: &str,
+    ) -> bool {
+        let retries = sent_output_config_format(request_body)
+            && is_native_output_rejection(status, error_text);
+        if retries {
+            litellm_tracing::warn!(
+                "Bedrock rejected native structured output for model={model}, so litellm sent the request again without it."
+            );
+        }
+        retries
+    }
+
+    fn wire_body(&self, body: Value) -> Value {
+        match body {
+            Value::Object(mut fields) => {
+                fields.shift_remove("model");
+                fields.shift_remove("stream");
+                Value::Object(fields)
+            }
+            other => other,
+        }
     }
 
     fn secret_names(&self) -> &'static [&'static str] {
@@ -165,6 +309,7 @@ impl BaseMessagesConfig for AmazonAnthropicClaudeMessagesConfig {
         litellm_params: &LitellmParams,
         env_lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<ValidatedEnvironment, Error> {
+        let headers = invoke_headers(headers, litellm_params)?;
         if let Some(token) = bearer_token(api_key, env_lookup) {
             return Ok(ValidatedEnvironment {
                 headers,
@@ -174,13 +319,11 @@ impl BaseMessagesConfig for AmazonAnthropicClaudeMessagesConfig {
                 },
             });
         }
-        let (_, model_region) =
-            bedrock_model_id_and_region(model.strip_prefix(INVOKE_MODEL_PREFIX).unwrap_or(model));
         let params = &litellm_params.aws;
         Ok(ValidatedEnvironment {
             headers,
             auth: AuthScheme::AwsSigV4 {
-                region: resolve_bedrock_region(model_region.as_deref(), params, env_lookup),
+                region: resolve_bedrock_region(model_region(model).as_deref(), params, env_lookup),
                 service: BEDROCK_SERVICE,
                 credentials: Box::new(AwsCredentialSource::from_params(params, env_lookup)),
             },
@@ -225,8 +368,11 @@ fn with_metrics_usage(mut fields: Map<String, Value>) -> Map<String, Value> {
     fields
 }
 
-pub fn bedrock_anthropic_messages_event_stream(bytes: ByteStream) -> EventStream {
-    let events = invoke_chunk_stream(bytes)
+pub fn bedrock_anthropic_messages_event_stream(
+    bytes: ByteStream,
+    headers: Vec<(String, String)>,
+) -> EventStream {
+    let events = bedrock_invoke_chunk_stream(bytes, headers)
         .map(|chunk| decode_invoke_anthropic_chunk(with_invocation_usage(chunk?)));
     Box::pin(
         transform_stream(events, MessageStopUsagePromoter::default())
@@ -309,10 +455,10 @@ impl StreamTransformer for MessageStopUsagePromoter {
                 self.pending_delta = Some(input);
                 Ok(pending.into_iter().collect())
             }
-            MessagesStreamEvent::MessageStop { usage } => Ok(pending
+            MessagesStreamEvent::MessageStop { usage, extra } => Ok(pending
                 .map(|delta| promoted(delta, usage.as_ref(), self.start_usage.as_ref()))
                 .into_iter()
-                .chain([MessagesStreamEvent::MessageStop { usage }])
+                .chain([MessagesStreamEvent::MessageStop { usage, extra }])
                 .collect()),
             MessagesStreamEvent::MessageStart { message } => {
                 self.start_usage = Some(message.usage.clone());
@@ -345,6 +491,7 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
+    use litellm_auth::AwsParams;
     use litellm_auth_aws::constants::DEFAULT_BEDROCK_REGION;
 
     use super::*;
@@ -486,9 +633,15 @@ mod tests {
 
     fn aws_frame(chunk: &Value) -> Vec<u8> {
         let payload = json!({"bytes": STANDARD.encode(chunk.to_string())});
-        let message = Message::new(Bytes::from(serde_json::to_vec(&payload).unwrap())).add_header(
-            Header::new(":event-type", HeaderValue::String("chunk".into())),
-        );
+        let message = Message::new(Bytes::from(serde_json::to_vec(&payload).unwrap()))
+            .add_header(Header::new(
+                ":event-type",
+                HeaderValue::String("chunk".into()),
+            ))
+            .add_header(Header::new(
+                ":message-type",
+                HeaderValue::String("event".into()),
+            ));
         let mut wire = Vec::new();
         write_message_to(&message, &mut wire).unwrap();
         wire
@@ -508,7 +661,7 @@ mod tests {
         )
         .boxed();
 
-        let sse = bedrock_anthropic_messages_event_stream(bytes)
+        let sse = bedrock_anthropic_messages_event_stream(bytes, Vec::new())
             .map_ok(|event| streaming::encode(&event).unwrap())
             .try_collect::<Vec<_>>()
             .await
@@ -527,6 +680,34 @@ mod tests {
         .flat_map(|event| streaming::encode(event).unwrap())
         .collect();
         assert_eq!(sse, expected);
+    }
+
+    #[tokio::test]
+    async fn bedrock_stream_keeps_the_guardrail_trace_on_message_stop() {
+        let trace = json!({"guardrail": {"input": {"gr-1": {"invocationMetrics": {"usage": {"contentPolicyUnits": 1}}}}}});
+        let wire = aws_frame(&json!({"type": "message_stop", "amazon-bedrock-trace": trace}));
+        let bytes: ByteStream = futures_util::stream::iter([Ok(Bytes::from(wire))]).boxed();
+
+        let events = bedrock_anthropic_messages_event_stream(bytes, Vec::new())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![event(
+                json!({"type": "message_stop", "amazon-bedrock-trace": trace})
+            )]
+        );
+        let encoded = String::from_utf8(streaming::encode(&events[0]).unwrap().to_vec()).unwrap();
+        let data = encoded
+            .strip_prefix("event: message_stop\ndata: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(data).unwrap(),
+            json!({"type": "message_stop", "amazon-bedrock-trace": trace})
+        );
     }
 
     fn in_region(region: &str) -> LitellmParams {
@@ -701,5 +882,178 @@ mod tests {
             }
             (other, _) => panic!("unexpected auth {other:?}"),
         }
+    }
+
+    const ARN: &str = "arn:aws:bedrock:us-east-1:086734376398:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0";
+    const ENCODED_ARN: &str = "arn%3Aaws%3Abedrock%3Aus-east-1%3A086734376398%3Ainference-profile%2Fglobal.anthropic.claude-sonnet-4-5-20250929-v1%3A0";
+
+    #[rstest]
+    #[case::bedrock_prefixed_arn(
+        "bedrock/arn:aws:bedrock:us-east-1:086734376398:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        None,
+        ENCODED_ARN
+    )]
+    #[case::compound_prefixed_arn(
+        "bedrock/invoke/arn:aws:bedrock:us-east-1:086734376398:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        None,
+        ENCODED_ARN
+    )]
+    #[case::bare_arn(ARN, None, ENCODED_ARN)]
+    #[case::regular_id(
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        None,
+        "anthropic.claude-3-sonnet-20240229-v1:0"
+    )]
+    #[case::invoke_prefix(
+        "invoke/anthropic.claude-3-sonnet-20240229-v1:0",
+        None,
+        "anthropic.claude-3-sonnet-20240229-v1:0"
+    )]
+    #[case::model_id_override(
+        "anthropic.claude-3",
+        Some("arn:aws:bedrock:us-east-1:1:application-inference-profile/abc"),
+        "arn%3Aaws%3Abedrock%3Aus-east-1%3A1%3Aapplication-inference-profile%2Fabc"
+    )]
+    fn invoke_model_ids_match_python(
+        #[case] model: &str,
+        #[case] model_id: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(invoke_model_id(model, model_id), expected);
+    }
+
+    #[test]
+    fn an_arn_url_is_percent_encoded_in_the_arn_region() {
+        assert_eq!(
+            AmazonAnthropicClaudeMessagesConfig
+                .get_complete_url(
+                    None,
+                    &format!("bedrock/{ARN}"),
+                    &LitellmParams::default(),
+                    true,
+                    &|_| None
+                )
+                .unwrap(),
+            format!(
+                "https://bedrock-runtime.us-east-1.amazonaws.com/model/{ENCODED_ARN}/invoke-with-response-stream"
+            )
+        );
+    }
+
+    #[test]
+    fn the_model_id_param_overrides_the_url_model() {
+        let litellm_params: LitellmParams = serde_json::from_value(serde_json::json!({
+            "model": "bedrock/anthropic.claude-3",
+            "aws_region_name": "us-west-2",
+            "model_id": "my/profile",
+        }))
+        .unwrap();
+        assert_eq!(
+            AmazonAnthropicClaudeMessagesConfig
+                .get_complete_url(None, "anthropic.claude-3", &litellm_params, false, &|_| {
+                    None
+                })
+                .unwrap(),
+            "https://bedrock-runtime.us-west-2.amazonaws.com/model/my%2Fprofile/invoke"
+        );
+    }
+
+    #[test]
+    fn guardrail_and_metadata_headers_are_added_for_both_auth_schemes() {
+        let litellm_params: LitellmParams = serde_json::from_value(serde_json::json!({
+            "model": "bedrock/anthropic.claude-3",
+            "guardrailConfig": {"guardrailIdentifier": "gid", "guardrailVersion": "2", "trace": "enabled"},
+        }))
+        .unwrap();
+        let validated = AmazonAnthropicClaudeMessagesConfig
+            .validate_environment(
+                Vec::new(),
+                Some("token"),
+                "anthropic.claude-3",
+                &MessagesOptionalParams::default(),
+                &litellm_params,
+                &|_| None,
+            )
+            .unwrap();
+        assert_eq!(
+            validated.headers,
+            vec![
+                (
+                    "X-Amzn-Bedrock-GuardrailIdentifier".to_string(),
+                    "gid".to_string()
+                ),
+                (
+                    "X-Amzn-Bedrock-GuardrailVersion".to_string(),
+                    "2".to_string()
+                ),
+                ("X-Amzn-Bedrock-Trace".to_string(), "ENABLED".to_string()),
+            ]
+        );
+    }
+
+    fn native_context(native_output: NativeOutputSupport) -> MessagesTransformContext {
+        let mut context = MessagesTransformContext::default();
+        context.thinking.capabilities.bedrock.native_output = native_output;
+        context
+    }
+
+    fn structured_request() -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "anthropic.claude-sonnet-5",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}}},
+        }))
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::native_enabled(NativeOutputSupport { enabled: true, mapped: true, ..NativeOutputSupport::default() }, true)]
+    #[case::native_opt_in(NativeOutputSupport { opt_in: true, ..NativeOutputSupport::default() }, true)]
+    #[case::inline_only(NativeOutputSupport::default(), false)]
+    fn a_native_output_request_carries_an_inline_fallback(
+        #[case] native_output: NativeOutputSupport,
+        #[case] expected: bool,
+    ) {
+        let fallback = AmazonAnthropicClaudeMessagesConfig
+            .native_output_fallback(&structured_request(), &native_context(native_output));
+        assert_eq!(fallback.is_some(), expected);
+        if let Some(fallback) = fallback {
+            let (rebuilt, _) = AmazonAnthropicClaudeMessagesConfig
+                .transform_request_with_headers(structured_request(), &fallback, Vec::new())
+                .unwrap();
+            let body = serde_json::to_value(rebuilt).unwrap();
+            assert_eq!(body.get("output_config"), None);
+            assert_eq!(
+                body["messages"][0]["content"][1]["type"],
+                serde_json::json!("text")
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::rejected_native_output(400, "output_config.format: Extra inputs are not permitted", serde_json::json!({"output_config": {"format": {}}}), true)]
+    #[case::inline_body_is_not_retried(400, "output_config.format: Extra inputs are not permitted", serde_json::json!({"messages": []}), false)]
+    #[case::other_error(429, "Too many requests", serde_json::json!({"output_config": {"format": {}}}), false)]
+    fn native_output_rejections_retry_without_it(
+        #[case] status: u16,
+        #[case] text: &str,
+        #[case] body: Value,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            AmazonAnthropicClaudeMessagesConfig
+                .retries_without_native_output(status, text, &body, "m"),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_wire_body_drops_model_and_stream() {
+        assert_eq!(
+            AmazonAnthropicClaudeMessagesConfig
+                .wire_body(serde_json::json!({"model": "m", "stream": true, "max_tokens": 1})),
+            serde_json::json!({"max_tokens": 1})
+        );
     }
 }

@@ -38,6 +38,7 @@ strum.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 url.workspace = true
 
 [dev-dependencies]
