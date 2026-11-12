@@ -102,6 +102,7 @@ interface Props {
   onChange: (servers: string[]) => void;
   connectMode?: boolean;
   onConnectedServers?: (servers: ConnectedServers | null) => void;
+  onSignedIn?: (serverId: string) => void;
 }
 
 const AVATAR_COLORS = [
@@ -127,7 +128,14 @@ type TabKey = "all" | "connected";
 
 const TOOLS_FETCH_CONCURRENCY = 5;
 
-const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange, connectMode, onConnectedServers }) => {
+const MCPAppsPanel: React.FC<Props> = ({
+  accessToken,
+  selectedServers,
+  onChange,
+  connectMode,
+  onConnectedServers,
+  onSignedIn,
+}) => {
   const { t } = useTranslation();
   const [servers, setServers] = useState<MCPServer[]>([]);
   const [loading, setLoading] = useState(true);
@@ -180,10 +188,10 @@ const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange,
   const returningOAuth = useUserMcpOAuthFlow({
     accessToken,
     serverId: returningServerId,
-    onSuccess: useCallback(
-      () => setOauthConnected((prev) => new Set(prev).add(returningServerId)),
-      [returningServerId],
-    ),
+    onSuccess: useCallback(() => {
+      setOauthConnected((prev) => new Set(prev).add(returningServerId));
+      onSignedIn?.(returningServerId);
+    }, [returningServerId, onSignedIn]),
   });
 
   const fetchToolCount = useCallback(

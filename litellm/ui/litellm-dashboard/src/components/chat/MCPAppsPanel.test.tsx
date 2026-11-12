@@ -253,6 +253,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
   const oauthReturnPage = (
     onConnectedServers: (servers: ConnectedServers | null) => void,
     picked: string[] = ["reachable_srv"],
+    onSignedIn?: (serverId: string) => void,
   ) => {
     vi.mocked(fetchMCPServers).mockResolvedValue([
       {
@@ -279,6 +280,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
           onChange={setSelected}
           connectMode
           onConnectedServers={onConnectedServers}
+          onSignedIn={onSignedIn}
         />
       );
     };
@@ -309,6 +311,23 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
     });
 
     expect(idsReported(onConnectedServers)).toEqual([["s-oauth", "s-m2m", "s-reach"]]);
+  });
+
+  it("names the server signed in to only once the login returning from OAuth is saved", async () => {
+    oauthReturn.serverId = "s-oauth";
+    oauthReturn.status = "exchanging";
+    const onSignedIn = vi.fn();
+    oauthReturnPage(vi.fn(), [], onSignedIn);
+
+    expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
+    expect(onSignedIn).not.toHaveBeenCalled();
+
+    await act(async () => {
+      oauthReturn.status = "success";
+      oauthReturn.onSuccess();
+    });
+
+    expect(onSignedIn.mock.calls).toEqual([["s-oauth"]]);
   });
 
   it("reports the earlier picks when the login returning from OAuth fails", async () => {

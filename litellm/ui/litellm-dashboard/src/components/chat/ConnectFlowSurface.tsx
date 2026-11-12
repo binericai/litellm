@@ -14,7 +14,7 @@ interface Props {
 }
 
 const picksKey = (flow: string) => `litellm-connect-picks:${flow}`;
-const onAtStartKey = (flow: string) => `litellm-connect-on-at-start:${flow}`;
+const signedInKey = (flow: string) => `litellm-connect-signed-in:${flow}`;
 
 const stored = (key: string): string[] | null => {
   try {
@@ -31,8 +31,10 @@ const remember = (key: string, values: string[]) => {
   } catch {}
 };
 
-const idsToPost = (connected: ConnectedServers, onAtStart: string[]) =>
-  connected.on.some((id) => !onAtStart.includes(id)) ? connected.on : [];
+const idsToPost = (connected: ConnectedServers, signedIn: string[]) => {
+  const isPick = (id: string) => !connected.authorized.includes(id) || signedIn.includes(id);
+  return connected.on.some(isPick) ? connected.on : [];
+};
 
 /** Renders the sealed gateway connect flow without trusting URL context. */
 const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onChange }) => {
@@ -57,7 +59,8 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
   };
   const { data: flow, isError, refetch } = useQuery(flowQuery);
   const [connected, setConnected] = useState<ConnectedServers | null>(null);
-  const [onAtStart, setOnAtStart] = useState(() => (connectFlow ? stored(onAtStartKey(connectFlow)) : null));
+  const [signedIn, setSignedIn] = useState(() => (connectFlow ? stored(signedInKey(connectFlow)) : null) ?? []);
+  const recordSignIn = useCallback((serverId: string) => setSignedIn((earlier) => [...earlier, serverId]), []);
 
   useEffect(() => {
     const picks = connectFlow ? stored(picksKey(connectFlow)) : null;
@@ -69,20 +72,13 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
     onChange(servers);
   };
 
-  const reportConnected = useCallback(
-    (servers: ConnectedServers | null) => {
-      setConnected(servers);
-      if (servers === null || onAtStart !== null || connectFlow === null) return;
-      remember(onAtStartKey(connectFlow), servers.authorized);
-      setOnAtStart(servers.authorized);
-    },
-    [connectFlow, onAtStart],
-  );
+  useEffect(() => {
+    if (connectFlow) remember(signedInKey(connectFlow), signedIn);
+  }, [connectFlow, signedIn]);
 
   const connectedServerIds = (): string[] | null => {
     if (flow?.state !== "unscoped" || flow.selectable === false) return [];
-    if (connected === null || onAtStart === null) return null;
-    return idsToPost(connected, onAtStart);
+    return connected && idsToPost(connected, signedIn);
   };
 
   if (connectFlow === null) {
@@ -105,7 +101,8 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
           selectedServers={selectedServers}
           onChange={rememberPicks}
           connectMode
-          onConnectedServers={reportConnected}
+          onConnectedServers={setConnected}
+          onSignedIn={recordSignIn}
         />
       )}
     </>

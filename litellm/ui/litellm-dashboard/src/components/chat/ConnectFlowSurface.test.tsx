@@ -10,6 +10,7 @@ const { startOAuthFlow, state, onSuccess, panel } = vi.hoisted(() => ({
   panel: {
     onChange: undefined as ((servers: string[]) => void) | undefined,
     onConnectedServers: undefined as ((servers: ConnectedServers | null) => void) | undefined,
+    onSignedIn: undefined as ((serverId: string) => void) | undefined,
   },
   onSuccess: { current: undefined as (() => void) | undefined },
   state: { oauthReturn: null as string | null, connectFlow: null as string | null },
@@ -31,12 +32,15 @@ vi.mock("@/components/chat/MCPAppsPanel", async (importOriginal) => ({
   default: ({
     onChange,
     onConnectedServers,
+    onSignedIn,
   }: {
     onChange: (servers: string[]) => void;
     onConnectedServers?: (servers: ConnectedServers | null) => void;
+    onSignedIn?: (serverId: string) => void;
   }) => {
     panel.onChange = onChange;
     panel.onConnectedServers = onConnectedServers;
+    panel.onSignedIn = onSignedIn;
     return <div data-testid="mcp-apps-panel" />;
   },
 }));
@@ -192,7 +196,6 @@ describe("ConnectFlowSurface", () => {
     vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
     renderSurface();
     await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onConnectedServers?.({ on: ["tracker-id"], authorized: ["tracker-id"] }));
 
     act(() => panel.onConnectedServers?.({ on: ["tracker-id", "catalog-id"], authorized: ["tracker-id"] }));
 
@@ -200,20 +203,47 @@ describe("ConnectFlowSurface", () => {
     expect(screen.getByDisplayValue("catalog-id")).toHaveAttribute("name", "server");
   });
 
-  it("counts a server signed in to during this flow as turned on, across the OAuth round trip", async () => {
+  it("counts a login made during this flow as a pick", async () => {
     state.connectFlow = "flow-handle-123";
     vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
-    const { unmount } = renderSurface();
-    await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onConnectedServers?.({ on: ["ledger-id"], authorized: ["ledger-id"] }));
-    unmount();
-
     renderSurface();
     await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onSignedIn?.("tracker-id"));
+
     act(() => panel.onConnectedServers?.({ on: ["ledger-id", "tracker-id"], authorized: ["ledger-id", "tracker-id"] }));
 
     expect(screen.getByDisplayValue("ledger-id")).toHaveAttribute("name", "server");
     expect(screen.getByDisplayValue("tracker-id")).toHaveAttribute("name", "server");
+  });
+
+  it("still counts that login after a reload and another login", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    const { unmount } = renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onSignedIn?.("tracker-id"));
+    unmount();
+
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onSignedIn?.("catalog-id"));
+    act(() => panel.onConnectedServers?.({ on: ["ledger-id", "tracker-id"], authorized: ["ledger-id", "tracker-id"] }));
+
+    expect(screen.getByDisplayValue("ledger-id")).toHaveAttribute("name", "server");
+    expect(screen.getByDisplayValue("tracker-id")).toHaveAttribute("name", "server");
+  });
+
+  it("posts nothing once the login made during this flow is disconnected again", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onSignedIn?.("tracker-id"));
+
+    act(() => panel.onConnectedServers?.({ on: ["ledger-id"], authorized: ["ledger-id"] }));
+
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
+    expect(screen.queryByDisplayValue("ledger-id")).not.toBeInTheDocument();
   });
 
   it("finishes with the ids of the servers the panel shows as connected", async () => {
