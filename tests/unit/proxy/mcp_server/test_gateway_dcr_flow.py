@@ -3778,6 +3778,38 @@ async def test_selection_on_an_upstream_step_up_keeps_the_step_up_server() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource", "step_up", "selectable"),
+    [
+        ("https://llm.example.com/mcp/alpha,beta", False, False),
+        ("https://llm.example.com/mcp/alpha,beta", True, False),
+        ("https://llm.example.com/mcp", True, "absent"),
+    ],
+)
+async def test_the_page_is_told_when_a_flow_ignores_picks(resource: str, step_up: bool, selectable: bool | str) -> None:
+    from unittest.mock import patch
+
+    from litellm.proxy.mcp_server.oauth_utils import encode_upstream_scope
+
+    tracker: Final = _scoped_mcp_server(name="tracker")
+    client_id: Final = (await _register([REDIRECT_URI]))["client_id"]
+    with patch(_MANAGER_PATCH) as manager:
+        manager.get_mcp_server_by_identifier.return_value = None
+        manager.get_mcp_server_by_id.return_value = tracker
+        authorized: Final = _scoped_authorize(
+            client_id, resource, scope=encode_upstream_scope(tracker.server_id, "write") if step_up else None
+        )
+
+    async def vendor_credential(user_id: str, server_id: str, requested_scopes: tuple[str, ...] = ()) -> str:
+        return "present"
+
+    described: Final = await _describe_page(authorized, scoped_server=tracker, vendor=vendor_credential)
+
+    body: Final = json.loads(described.body)
+    assert (body["state"], body.get("selectable", "absent")) == ("unscoped", selectable)
+
+
+@pytest.mark.asyncio
 async def test_deny_ignores_the_selection() -> None:
     _, completed = await _complete_with_selection(("deleted-id",), (), decision="deny")
     assert completed.status_code == 303

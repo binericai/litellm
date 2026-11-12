@@ -1116,10 +1116,7 @@ async def _describe_opened_flow(
         "connected": state == "m2m" or None,
         "servers": None,
     }
-    if not flow.unresolved_resource:
-        return described
-    unselectable: Final[ConnectFlowDescription] = {**described, "selectable": False}
-    return unselectable
+    return described
 
 
 async def _describe_interactive_target(
@@ -1184,6 +1181,13 @@ async def _describe_upstream_scope_flow(
     return descriptions[0]
 
 
+def _marked_unselectable(flow: _ConnectFlow, described: ConnectFlowDescription) -> ConnectFlowDescription:
+    if not flow.unresolved_resource:
+        return described
+    unselectable: Final[ConnectFlowDescription] = {**described, "selectable": False}
+    return unselectable
+
+
 async def describe_connect_flow(
     request: Request,
     flow_handle: str,
@@ -1198,7 +1202,7 @@ async def describe_connect_flow(
     return (
         described
         if isinstance(described, Response)
-        else JSONResponse(content=described, headers=TOKEN_NO_CACHE_HEADERS)
+        else JSONResponse(content=_marked_unselectable(opened, described), headers=TOKEN_NO_CACHE_HEADERS)
     )
 
 
