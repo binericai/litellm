@@ -3,7 +3,8 @@ import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import MCPAppsPanel from "./MCPAppsPanel";
-import { fetchMCPServers, listMCPTools } from "../networking";
+import { fetchMCPServers, getMCPOAuthUserCredentialStatus, listMCPTools } from "../networking";
+import type { MCPOAuthUserCredentialStatus } from "../networking";
 import type { MCPServer } from "../mcp_tools/types";
 import { setServerRootPath } from "@/lib/serverRootPath";
 
@@ -14,8 +15,14 @@ vi.mock("../networking", () => ({
   deleteMCPOAuthUserCredential: vi.fn(),
 }));
 
+const oauthReturn = vi.hoisted(() => ({ serverId: null as string | null, status: "idle", onSuccess: () => {} }));
 vi.mock("@/hooks/useUserMcpOAuthFlow", () => ({
-  useUserMcpOAuthFlow: () => ({ startOAuthFlow: vi.fn(), status: "idle" }),
+  pendingUserMcpOAuthServerId: () => oauthReturn.serverId,
+  useUserMcpOAuthFlow: ({ serverId, onSuccess }: { serverId: string; onSuccess: () => void }) => {
+    if (serverId !== oauthReturn.serverId) return { startOAuthFlow: vi.fn(), status: "idle" };
+    oauthReturn.onSuccess = onSuccess;
+    return { startOAuthFlow: vi.fn(), status: oauthReturn.status };
+  },
 }));
 
 const servers = [
@@ -116,9 +123,295 @@ const renderConnectPanel = (connectMode: boolean, selectedServers: string[] = []
     </QueryClientProvider>,
   );
 
+const idsReported = (onConnectedServerIds: ReturnType<typeof vi.fn>): string[][] =>
+  [...new Set(onConnectedServerIds.mock.calls.map(([ids]) => JSON.stringify(ids)))]
+    .map((ids) => JSON.parse(ids))
+    .filter((ids) => ids !== null);
+
 describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    oauthReturn.serverId = null;
+    oauthReturn.status = "idle";
+    oauthReturn.onSuccess = () => {};
+  });
+
+  it("reports every server it shows as on once one is picked, machine-to-machine ones included", async () => {
+    vi.mocked(fetchMCPServers).mockResolvedValue([
+      ...connectServers,
+      { server_id: "s-twin", server_name: "reachable_srv", auth_type: "true_passthrough" },
+    ] as MCPServer[]);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    const onConnectedServerIds = vi.fn();
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={["reachable_srv", "unreachable_srv", "deleted_srv"]}
+          onChange={vi.fn()}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(idsReported(onConnectedServerIds)).toEqual([["s-m2m", "s-reach"]]));
+  });
+
+  it("reports nothing while the list is still loading", async () => {
+    vi.mocked(fetchMCPServers).mockReturnValue(new Promise(() => {}));
+    const onConnectedServerIds = vi.fn();
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={["alpha"]}
+          onChange={vi.fn()}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(fetchMCPServers).toHaveBeenCalled());
+    expect(idsReported(onConnectedServerIds)).toEqual([]);
+  });
+
+  it("reports nothing and says so when the list fails to load in connect mode", async () => {
+    vi.mocked(fetchMCPServers).mockRejectedValue(new Error("list failed"));
+    const onConnectedServerIds = vi.fn();
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={["alpha"]}
+          onChange={vi.fn()}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText("Could not load your MCP servers. Reload the page to try again."),
+    ).toBeInTheDocument();
+    expect(idsReported(onConnectedServerIds)).toEqual([]);
+  });
+
+  it("reports an OAuth server only once its saved credential has turned it on", async () => {
+    vi.mocked(fetchMCPServers).mockResolvedValue([
+      {
+        server_id: "s-oauth",
+        server_name: "oauth_srv",
+        auth_type: "oauth2",
+        oauth2_flow: "authorization_code",
+        connected_app_reachable: true,
+      },
+      ...connectServers,
+    ] as MCPServer[]);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    let resolveCredential: (status: MCPOAuthUserCredentialStatus) => void = () => {};
+    vi.mocked(getMCPOAuthUserCredentialStatus).mockReturnValue(
+      new Promise<MCPOAuthUserCredentialStatus>((resolve) => {
+        resolveCredential = resolve;
+      }),
+    );
+    const onConnectedServerIds = vi.fn();
+    const Page = () => {
+      const [selected, setSelected] = React.useState<string[]>(["reachable_srv"]);
+      return (
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={selected}
+          onChange={setSelected}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      );
+    };
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <Page />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
+    expect(idsReported(onConnectedServerIds)).toEqual([]);
+    await act(async () => resolveCredential({ server_id: "s-oauth", has_credential: true, is_expired: false }));
+
+    expect(idsReported(onConnectedServerIds)).toEqual([["s-oauth", "s-m2m", "s-reach"]]);
+  });
+
+  const oauthReturnPage = (
+    onConnectedServerIds: (ids: string[] | null) => void,
+    picked: string[] = ["reachable_srv"],
+  ) => {
+    vi.mocked(fetchMCPServers).mockResolvedValue([
+      {
+        server_id: "s-oauth",
+        server_name: "oauth_srv",
+        auth_type: "oauth2",
+        oauth2_flow: "authorization_code",
+        connected_app_reachable: true,
+      },
+      ...connectServers,
+    ] as MCPServer[]);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    vi.mocked(getMCPOAuthUserCredentialStatus).mockResolvedValue({
+      server_id: "s-oauth",
+      has_credential: false,
+      is_expired: false,
+    } as MCPOAuthUserCredentialStatus);
+    const Page = () => {
+      const [selected, setSelected] = React.useState<string[]>(picked);
+      return (
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={selected}
+          onChange={setSelected}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      );
+    };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <Page />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree());
+    return () => rerender(tree());
+  };
+
+  it("holds the report until the login returning from OAuth is saved, then includes its server", async () => {
+    oauthReturn.serverId = "s-oauth";
+    oauthReturn.status = "exchanging";
+    const onConnectedServerIds = vi.fn();
+    oauthReturnPage(onConnectedServerIds);
+
+    expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
+    await waitFor(() => expect(getMCPOAuthUserCredentialStatus).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByText(/^Connect(ing…)?$/)).not.toBeInTheDocument();
+
+    await act(async () => {
+      oauthReturn.status = "success";
+      oauthReturn.onSuccess();
+    });
+
+    expect(idsReported(onConnectedServerIds)).toEqual([["s-oauth", "s-m2m", "s-reach"]]);
+  });
+
+  it("reports the earlier picks when the login returning from OAuth fails", async () => {
+    oauthReturn.serverId = "s-oauth";
+    oauthReturn.status = "exchanging";
+    const onConnectedServerIds = vi.fn();
+    const rerenderPage = oauthReturnPage(onConnectedServerIds);
+
+    expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
+    await waitFor(() => expect(getMCPOAuthUserCredentialStatus).toHaveBeenCalled());
+    await act(async () => {});
+    oauthReturn.status = "error";
+    rerenderPage();
+
+    await waitFor(() => expect(idsReported(onConnectedServerIds)).toEqual([["s-m2m", "s-reach"]]));
+  });
+
+  it("leaves out a picked OAuth server whose card still offers Connect", async () => {
+    const onConnectedServerIds = vi.fn();
+    oauthReturnPage(onConnectedServerIds, ["oauth_srv", "reachable_srv"]);
+
+    expect(await screen.findByText("Connect", { exact: true })).toBeInTheDocument();
+
+    expect(idsReported(onConnectedServerIds)).toEqual([["s-m2m", "s-reach"]]);
+  });
+
+  it("leaves a login returning from OAuth to the server's own badge outside connect mode", async () => {
+    oauthReturn.serverId = "s-oauth";
+    oauthReturn.status = "exchanging";
+    vi.mocked(fetchMCPServers).mockResolvedValue([
+      { server_id: "s-oauth", server_name: "oauth_srv", auth_type: "oauth2", oauth2_flow: "authorization_code" },
+    ] as MCPServer[]);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    vi.mocked(getMCPOAuthUserCredentialStatus).mockResolvedValue({
+      server_id: "s-oauth",
+      has_credential: false,
+      is_expired: false,
+    } as MCPOAuthUserCredentialStatus);
+
+    renderConnectPanel(false);
+
+    expect(await screen.findByText("Connecting…")).toBeInTheDocument();
+  });
+
+  it("reports again once a reload succeeds after the list failed to load", async () => {
+    vi.mocked(fetchMCPServers).mockRejectedValueOnce(new Error("list failed")).mockResolvedValue(connectServers);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    const onConnectedServerIds = vi.fn();
+    const panel = (token: string) => (
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MCPAppsPanel
+          accessToken={token}
+          selectedServers={["reachable_srv"]}
+          onChange={vi.fn()}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(panel("tok"));
+    expect(await screen.findByText(/could not load your mcp servers/i)).toBeInTheDocument();
+
+    rerender(panel("tok-refreshed"));
+
+    await waitFor(() => expect(idsReported(onConnectedServerIds)).toEqual([["s-m2m", "s-reach"]]));
+  });
+
+  it("keeps the plain panel's empty text when the list fails to load outside connect mode", async () => {
+    vi.mocked(fetchMCPServers).mockRejectedValue(new Error("list failed"));
+
+    renderConnectPanel(false);
+
+    expect(await screen.findByText(/no mcp servers configured/i)).toBeInTheDocument();
+  });
+
+  it("reports nothing while a Connect is still loading the server's tools", async () => {
+    vi.mocked(fetchMCPServers).mockResolvedValue(connectServers);
+    vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
+    const onConnectedServerIds = vi.fn();
+    const Page = () => {
+      const [selected, setSelected] = React.useState<string[]>([]);
+      return (
+        <MCPAppsPanel
+          accessToken="tok"
+          selectedServers={selected}
+          onChange={setSelected}
+          connectMode
+          onConnectedServerIds={onConnectedServerIds}
+        />
+      );
+    };
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <Page />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByText("reachable_srv"));
+    await waitFor(() => expect(onConnectedServerIds).toHaveBeenLastCalledWith([]));
+    let finishConnect: (result: { tools: never[] }) => void = () => {};
+    vi.mocked(listMCPTools).mockImplementationOnce(() => new Promise((resolve) => (finishConnect = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await waitFor(() => expect(onConnectedServerIds).toHaveBeenLastCalledWith(null));
+    await act(async () => finishConnect({ tools: [] }));
+
+    expect(onConnectedServerIds).toHaveBeenLastCalledWith(["s-m2m", "s-reach"]);
   });
 
   it("requests the connected-app view and hides unreachable servers in connect mode", async () => {

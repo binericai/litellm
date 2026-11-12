@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { Search, ArrowLeft, ChevronRight, Wrench, CheckCircle, Loader2 } from "lucide-react";
@@ -24,7 +24,7 @@ import {
 import { Logo } from "@/components/molecules/logo/Logo";
 import i18n from "@/i18n/i18n";
 import { toast } from "@/lib/toast";
-import { useUserMcpOAuthFlow } from "@/hooks/useUserMcpOAuthFlow";
+import { pendingUserMcpOAuthServerId, useUserMcpOAuthFlow } from "@/hooks/useUserMcpOAuthFlow";
 import { getSecureItem, setSecureItem } from "@/utils/secureStorage";
 
 interface OAuth2ConnectButtonProps {
@@ -96,6 +96,7 @@ interface Props {
   selectedServers: string[];
   onChange: (servers: string[]) => void;
   connectMode?: boolean;
+  onConnectedServerIds?: (serverIds: string[] | null) => void;
 }
 
 const AVATAR_COLORS = [
@@ -121,10 +122,17 @@ type TabKey = "all" | "connected";
 
 const TOOLS_FETCH_CONCURRENCY = 5;
 
-const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange, connectMode }) => {
+const MCPAppsPanel: React.FC<Props> = ({
+  accessToken,
+  selectedServers,
+  onChange,
+  connectMode,
+  onConnectedServerIds,
+}) => {
   const { t } = useTranslation();
   const [servers, setServers] = useState<MCPServer[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [query, setQuery] = useState("");
   const [activeTab, setActiveTab] = useState<TabKey>("all");
   const [togglingOn, setTogglingOn] = useState<Set<string>>(new Set());
@@ -168,6 +176,16 @@ const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange,
     },
     [connectUnavailabilityLabel],
   );
+
+  const [returningServerId] = useState(() => (connectMode ? pendingUserMcpOAuthServerId() : null) ?? "");
+  const returningOAuth = useUserMcpOAuthFlow({
+    accessToken,
+    serverId: returningServerId,
+    onSuccess: useCallback(
+      () => setOauthConnected((prev) => new Set(prev).add(returningServerId)),
+      [returningServerId],
+    ),
+  });
 
   const fetchToolCount = useCallback(
     async (server: MCPServer, isCurrentLoad: () => boolean) => {
@@ -218,6 +236,7 @@ const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange,
         const oauthServers = reachable.filter((s) => getMcpOAuthMode(s) === "authorization_code");
         commitServers(reachable);
         setOauthChecking(new Set(oauthServers.map((s) => s.server_id)));
+        setLoadFailed(false);
         setLoading(false);
 
         oauthServers.forEach((s) => checkOauthCredential(s, isCurrentLoad));
@@ -235,6 +254,7 @@ const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange,
       .catch(() => {
         if (isCurrentLoad()) {
           commitServers([]);
+          setLoadFailed(true);
           setLoading(false);
         }
       });
@@ -306,7 +326,10 @@ const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange,
       if (oauthConnected.has(server.server_id)) {
         return <CheckCircle className="h-3.5 w-3.5 text-success shrink-0" />;
       }
-      if (oauthChecking.has(server.server_id)) {
+      if (
+        oauthChecking.has(server.server_id) ||
+        (returningOAuth.status === "exchanging" && server.server_id === returningServerId)
+      ) {
         return <Skeleton className="h-6 w-16 shrink-0 rounded-md" />;
       }
       return (
@@ -346,7 +369,31 @@ const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange,
     (s) => selectedServers.includes(nameOf(s)) && connectUnavailabilityLabel(s) === null,
   ).length;
 
+  const connectedServerIds = useMemo(() => {
+    const isAlwaysOn = (s: MCPServer) => getMcpOAuthMode(s) === "m2m";
+    const isPicked = (s: MCPServer) =>
+      getMcpOAuthMode(s) === "authorization_code"
+        ? oauthConnected.has(s.server_id)
+        : selectedServers.includes(nameOf(s));
+    const shownOn = servers.filter((s) => connectUnavailabilityLabel(s) === null && (isAlwaysOn(s) || isPicked(s)));
+    // Without a pick the connection stays unscoped.
+    return shownOn.every(isAlwaysOn) ? [] : shownOn.map((s) => s.server_id);
+  }, [servers, selectedServers, oauthConnected, connectUnavailabilityLabel]);
+  useEffect(() => {
+    const settling = oauthChecking.size + togglingOn.size > 0 || returningOAuth.status === "exchanging";
+    onConnectedServerIds?.(loading || loadFailed || settling ? null : connectedServerIds);
+  }, [
+    loading,
+    loadFailed,
+    oauthChecking.size,
+    togglingOn.size,
+    returningOAuth.status,
+    connectedServerIds,
+    onConnectedServerIds,
+  ]);
+
   const emptyStateText = () => {
+    if (loadFailed && connectMode) return t("chat.mcpAppsPanel.empty.loadFailed");
     if (servers.length === 0) {
       return connectMode ? t("chat.mcpAppsPanel.empty.connectMode") : t("chat.mcpAppsPanel.empty.noServers");
     }

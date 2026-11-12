@@ -14,6 +14,7 @@ interface Props {
   accessToken: string;
   onConnected: () => void;
   failed: boolean;
+  connectedServerIds?: string[] | null;
 }
 
 /** Finish remains an explicit POST because a cross-site navigation must never mint a code. */
@@ -89,11 +90,19 @@ const vendorServersFor = (
   return [{ server_id: flow.server_id, server_name: flow.server_name }];
 };
 
-const ConnectFlowBanner: React.FC<Props> = ({ flowHandle, flow, accessToken, onConnected, failed }) => {
+const ConnectFlowBanner: React.FC<Props> = ({
+  flowHandle,
+  flow,
+  accessToken,
+  onConnected,
+  failed,
+  connectedServerIds = [],
+}) => {
   const { t } = useTranslation();
   const action = `${getProxyBaseUrl()}/authorize/complete`;
   const state = failed || flow === undefined ? "stale" : flow.state;
   const canFinish = canFinishConnectFlow(state, flow);
+  const picksUnknown = state === "unscoped" && connectedServerIds === null;
   const canCancel = state !== "unscoped";
   const loopbackClient = isLoopbackOrigin(flow?.client_origin ?? null);
   const vendorServers = vendorServersFor(state, flow);
@@ -130,10 +139,14 @@ const ConnectFlowBanner: React.FC<Props> = ({ flowHandle, flow, accessToken, onC
           ))}
           <form method="POST" action={action}>
             <input type="hidden" name="flow" value={flowHandle} />
+            {(connectedServerIds ?? []).map((serverId) => (
+              <input key={serverId} type="hidden" name="server" value={serverId} />
+            ))}
             {canFinish && (
               <button
                 type="submit"
-                className="h-[38px] rounded-md bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
+                disabled={picksUnknown}
+                className="h-[38px] rounded-md bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
               >
                 {t("chat.connectFlowBanner.finish")}
               </button>

@@ -4,8 +4,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import ConnectFlowSurface from "./ConnectFlowSurface";
 import { fetchConnectFlow } from "@/components/networking";
 
-const { startOAuthFlow, state, onSuccess } = vi.hoisted(() => ({
+const { startOAuthFlow, state, onSuccess, panel } = vi.hoisted(() => ({
   startOAuthFlow: vi.fn(),
+  panel: {
+    onChange: undefined as ((servers: string[]) => void) | undefined,
+    onConnectedServerIds: undefined as ((serverIds: string[] | null) => void) | undefined,
+  },
   onSuccess: { current: undefined as (() => void) | undefined },
   state: { oauthReturn: null as string | null, connectFlow: null as string | null },
 }));
@@ -23,7 +27,17 @@ vi.mock("@/components/networking", async (importOriginal) => ({
 }));
 vi.mock("@/components/chat/MCPAppsPanel", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/components/chat/MCPAppsPanel")>()),
-  default: () => <div data-testid="mcp-apps-panel" />,
+  default: ({
+    onChange,
+    onConnectedServerIds,
+  }: {
+    onChange: (servers: string[]) => void;
+    onConnectedServerIds?: (serverIds: string[] | null) => void;
+  }) => {
+    panel.onChange = onChange;
+    panel.onConnectedServerIds = onConnectedServerIds;
+    return <div data-testid="mcp-apps-panel" />;
+  },
 }));
 vi.mock("@/hooks/useUserMcpOAuthFlow", () => ({
   useUserMcpOAuthFlow: ({ onSuccess: success }: { onSuccess: () => void }) => {
@@ -47,10 +61,10 @@ const flow = (state: "unscoped" | "interactive" | "m2m" | "multi" | "stale", con
       : null,
 });
 
-const renderSurface = () =>
+const renderSurface = (onChange = vi.fn()) =>
   render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <ConnectFlowSurface accessToken="token-123" selectedServers={[]} onChange={vi.fn()} />
+      <ConnectFlowSurface accessToken="token-123" selectedServers={[]} onChange={onChange} />
     </QueryClientProvider>,
   );
 
@@ -121,5 +135,32 @@ describe("ConnectFlowSurface", () => {
     renderSurface();
     expect(fetchConnectFlow).not.toHaveBeenCalled();
     expect(screen.getByTestId("mcp-apps-panel")).toBeInTheDocument();
+  });
+
+  it("keeps the servers turned on across the OAuth round trip", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    const { unmount } = renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onChange?.(["catalog"]));
+    unmount();
+
+    const onChangeAfterReturn = vi.fn();
+    renderSurface(onChangeAfterReturn);
+
+    expect(onChangeAfterReturn).toHaveBeenCalledWith(["catalog"]);
+  });
+
+  it("finishes with the ids of the servers the panel shows as connected", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
+
+    act(() => panel.onConnectedServerIds?.(["catalog-id"]));
+
+    expect(screen.getByDisplayValue("catalog-id")).toHaveAttribute("name", "server");
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
   });
 });
