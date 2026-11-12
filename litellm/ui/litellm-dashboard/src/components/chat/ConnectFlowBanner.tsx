@@ -6,6 +6,7 @@ import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { getProxyBaseUrl, ConnectFlowStatus } from "@/components/networking";
 import { OAuth2ConnectButton } from "@/components/chat/MCPAppsPanel";
+import { Button } from "@/components/ui/button";
 import i18n from "@/i18n/i18n";
 
 interface Props {
@@ -143,13 +144,9 @@ const ConnectFlowBanner: React.FC<Props> = ({
               <input key={serverId} type="hidden" name="server" value={serverId} />
             ))}
             {canFinish && (
-              <button
-                type="submit"
-                disabled={picksUnknown}
-                className="h-[38px] rounded-md bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
-              >
+              <Button type="submit" disabled={picksUnknown} className="h-[38px] px-4 font-semibold">
                 {t("chat.connectFlowBanner.finish")}
-              </button>
+              </Button>
             )}
             {canCancel && (
               <button
