@@ -60,7 +60,6 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
   const { data: flow, isError, refetch } = useQuery(flowQuery);
   const [connected, setConnected] = useState<ConnectedServers | null>(null);
   const [signedIn, setSignedIn] = useState(() => (connectFlow ? stored(signedInKey(connectFlow)) : null) ?? []);
-  const recordSignIn = useCallback((serverId: string) => setSignedIn((earlier) => [...earlier, serverId]), []);
 
   useEffect(() => {
     const picks = connectFlow ? stored(picksKey(connectFlow)) : null;
@@ -72,9 +71,15 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
     onChange(servers);
   };
 
-  useEffect(() => {
-    if (connectFlow) remember(signedInKey(connectFlow), signedIn);
-  }, [connectFlow, signedIn]);
+  const recordSignIn = useCallback(
+    (serverId: string) => {
+      if (connectFlow === null) return;
+      const signedInNow = [...(stored(signedInKey(connectFlow)) ?? []), serverId];
+      remember(signedInKey(connectFlow), signedInNow);
+      setSignedIn(signedInNow);
+    },
+    [connectFlow],
+  );
 
   const connectedServerIds = (): string[] | null => {
     if (flow?.state !== "unscoped" || flow.selectable === false) return [];

@@ -351,7 +351,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
 
     expect(await screen.findByText("Connect", { exact: true })).toBeInTheDocument();
 
-    expect(idsReported(onConnectedServers)).toEqual([["s-m2m", "s-reach"]]);
+    await waitFor(() => expect(idsReported(onConnectedServers)).toEqual([["s-m2m", "s-reach"]]));
   });
 
   it("leaves a login returning from OAuth to the server's own badge outside connect mode", async () => {

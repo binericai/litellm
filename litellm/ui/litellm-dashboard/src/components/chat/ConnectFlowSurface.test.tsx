@@ -216,7 +216,23 @@ describe("ConnectFlowSurface", () => {
     expect(screen.getByDisplayValue("tracker-id")).toHaveAttribute("name", "server");
   });
 
-  it("still counts that login after a reload and another login", async () => {
+  it("still counts that login after a reload", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    const { unmount } = renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onSignedIn?.("tracker-id"));
+    unmount();
+
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onConnectedServers?.({ on: ["ledger-id", "tracker-id"], authorized: ["ledger-id", "tracker-id"] }));
+
+    expect(screen.getByDisplayValue("ledger-id")).toHaveAttribute("name", "server");
+    expect(screen.getByDisplayValue("tracker-id")).toHaveAttribute("name", "server");
+  });
+
+  it("still counts that login after another login in the same flow", async () => {
     state.connectFlow = "flow-handle-123";
     vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
     const { unmount } = renderSurface();
