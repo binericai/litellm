@@ -2,7 +2,7 @@ import React from "react";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import MCPAppsPanel from "./MCPAppsPanel";
+import MCPAppsPanel, { type ConnectedServers } from "./MCPAppsPanel";
 import { fetchMCPServers, getMCPOAuthUserCredentialStatus, listMCPTools } from "../networking";
 import type { MCPOAuthUserCredentialStatus } from "../networking";
 import type { MCPServer } from "../mcp_tools/types";
@@ -123,8 +123,8 @@ const renderConnectPanel = (connectMode: boolean, selectedServers: string[] = []
     </QueryClientProvider>,
   );
 
-const idsReported = (onConnectedServerIds: ReturnType<typeof vi.fn>): string[][] =>
-  [...new Set(onConnectedServerIds.mock.calls.map(([ids]) => JSON.stringify(ids)))]
+const idsReported = (onConnectedServers: ReturnType<typeof vi.fn>): string[][] =>
+  [...new Set(onConnectedServers.mock.calls.map(([servers]) => JSON.stringify(servers?.on ?? null)))]
     .map((ids) => JSON.parse(ids))
     .filter((ids) => ids !== null);
 
@@ -136,13 +136,13 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
     oauthReturn.onSuccess = () => {};
   });
 
-  it("reports every server it shows as on once one is picked, machine-to-machine ones included", async () => {
+  it("reports every server it shows as on, machine-to-machine ones included", async () => {
     vi.mocked(fetchMCPServers).mockResolvedValue([
       ...connectServers,
       { server_id: "s-twin", server_name: "reachable_srv", auth_type: "true_passthrough" },
     ] as MCPServer[]);
     vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
-    const onConnectedServerIds = vi.fn();
+    const onConnectedServers = vi.fn();
 
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -151,17 +151,17 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
           selectedServers={["reachable_srv", "unreachable_srv", "deleted_srv"]}
           onChange={vi.fn()}
           connectMode
-          onConnectedServerIds={onConnectedServerIds}
+          onConnectedServers={onConnectedServers}
         />
       </QueryClientProvider>,
     );
 
-    await waitFor(() => expect(idsReported(onConnectedServerIds)).toEqual([["s-m2m", "s-reach"]]));
+    await waitFor(() => expect(idsReported(onConnectedServers)).toEqual([["s-m2m", "s-reach"]]));
   });
 
   it("reports nothing while the list is still loading", async () => {
     vi.mocked(fetchMCPServers).mockReturnValue(new Promise(() => {}));
-    const onConnectedServerIds = vi.fn();
+    const onConnectedServers = vi.fn();
 
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -170,18 +170,18 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
           selectedServers={["alpha"]}
           onChange={vi.fn()}
           connectMode
-          onConnectedServerIds={onConnectedServerIds}
+          onConnectedServers={onConnectedServers}
         />
       </QueryClientProvider>,
     );
 
     await waitFor(() => expect(fetchMCPServers).toHaveBeenCalled());
-    expect(idsReported(onConnectedServerIds)).toEqual([]);
+    expect(idsReported(onConnectedServers)).toEqual([]);
   });
 
   it("reports nothing and says so when the list fails to load in connect mode", async () => {
     vi.mocked(fetchMCPServers).mockRejectedValue(new Error("list failed"));
-    const onConnectedServerIds = vi.fn();
+    const onConnectedServers = vi.fn();
 
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -190,7 +190,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
           selectedServers={["alpha"]}
           onChange={vi.fn()}
           connectMode
-          onConnectedServerIds={onConnectedServerIds}
+          onConnectedServers={onConnectedServers}
         />
       </QueryClientProvider>,
     );
@@ -198,7 +198,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
     expect(
       await screen.findByText("Could not load your MCP servers. Reload the page to try again."),
     ).toBeInTheDocument();
-    expect(idsReported(onConnectedServerIds)).toEqual([]);
+    expect(idsReported(onConnectedServers)).toEqual([]);
   });
 
   it("reports an OAuth server only once its saved credential has turned it on", async () => {
@@ -219,7 +219,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
         resolveCredential = resolve;
       }),
     );
-    const onConnectedServerIds = vi.fn();
+    const onConnectedServers = vi.fn();
     const Page = () => {
       const [selected, setSelected] = React.useState<string[]>(["reachable_srv"]);
       return (
@@ -228,7 +228,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
           selectedServers={selected}
           onChange={setSelected}
           connectMode
-          onConnectedServerIds={onConnectedServerIds}
+          onConnectedServers={onConnectedServers}
         />
       );
     };
@@ -240,14 +240,18 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
     );
 
     expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
-    expect(idsReported(onConnectedServerIds)).toEqual([]);
+    expect(idsReported(onConnectedServers)).toEqual([]);
     await act(async () => resolveCredential({ server_id: "s-oauth", has_credential: true, is_expired: false }));
 
-    expect(idsReported(onConnectedServerIds)).toEqual([["s-oauth", "s-m2m", "s-reach"]]);
+    expect(idsReported(onConnectedServers)).toEqual([["s-oauth", "s-m2m", "s-reach"]]);
+    expect(onConnectedServers).toHaveBeenLastCalledWith({
+      on: ["s-oauth", "s-m2m", "s-reach"],
+      authorized: ["s-oauth", "s-m2m"],
+    });
   });
 
   const oauthReturnPage = (
-    onConnectedServerIds: (ids: string[] | null) => void,
+    onConnectedServers: (servers: ConnectedServers | null) => void,
     picked: string[] = ["reachable_srv"],
   ) => {
     vi.mocked(fetchMCPServers).mockResolvedValue([
@@ -274,7 +278,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
           selectedServers={selected}
           onChange={setSelected}
           connectMode
-          onConnectedServerIds={onConnectedServerIds}
+          onConnectedServers={onConnectedServers}
         />
       );
     };
@@ -291,8 +295,8 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
   it("holds the report until the login returning from OAuth is saved, then includes its server", async () => {
     oauthReturn.serverId = "s-oauth";
     oauthReturn.status = "exchanging";
-    const onConnectedServerIds = vi.fn();
-    oauthReturnPage(onConnectedServerIds);
+    const onConnectedServers = vi.fn();
+    oauthReturnPage(onConnectedServers);
 
     expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
     await waitFor(() => expect(getMCPOAuthUserCredentialStatus).toHaveBeenCalled());
@@ -304,14 +308,14 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
       oauthReturn.onSuccess();
     });
 
-    expect(idsReported(onConnectedServerIds)).toEqual([["s-oauth", "s-m2m", "s-reach"]]);
+    expect(idsReported(onConnectedServers)).toEqual([["s-oauth", "s-m2m", "s-reach"]]);
   });
 
   it("reports the earlier picks when the login returning from OAuth fails", async () => {
     oauthReturn.serverId = "s-oauth";
     oauthReturn.status = "exchanging";
-    const onConnectedServerIds = vi.fn();
-    const rerenderPage = oauthReturnPage(onConnectedServerIds);
+    const onConnectedServers = vi.fn();
+    const rerenderPage = oauthReturnPage(onConnectedServers);
 
     expect(await screen.findByText("oauth_srv")).toBeInTheDocument();
     await waitFor(() => expect(getMCPOAuthUserCredentialStatus).toHaveBeenCalled());
@@ -319,16 +323,16 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
     oauthReturn.status = "error";
     rerenderPage();
 
-    await waitFor(() => expect(idsReported(onConnectedServerIds)).toEqual([["s-m2m", "s-reach"]]));
+    await waitFor(() => expect(idsReported(onConnectedServers)).toEqual([["s-m2m", "s-reach"]]));
   });
 
   it("leaves out a picked OAuth server whose card still offers Connect", async () => {
-    const onConnectedServerIds = vi.fn();
-    oauthReturnPage(onConnectedServerIds, ["oauth_srv", "reachable_srv"]);
+    const onConnectedServers = vi.fn();
+    oauthReturnPage(onConnectedServers, ["oauth_srv", "reachable_srv"]);
 
     expect(await screen.findByText("Connect", { exact: true })).toBeInTheDocument();
 
-    expect(idsReported(onConnectedServerIds)).toEqual([["s-m2m", "s-reach"]]);
+    expect(idsReported(onConnectedServers)).toEqual([["s-m2m", "s-reach"]]);
   });
 
   it("leaves a login returning from OAuth to the server's own badge outside connect mode", async () => {
@@ -352,7 +356,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
   it("reports again once a reload succeeds after the list failed to load", async () => {
     vi.mocked(fetchMCPServers).mockRejectedValueOnce(new Error("list failed")).mockResolvedValue(connectServers);
     vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
-    const onConnectedServerIds = vi.fn();
+    const onConnectedServers = vi.fn();
     const panel = (token: string) => (
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <MCPAppsPanel
@@ -360,7 +364,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
           selectedServers={["reachable_srv"]}
           onChange={vi.fn()}
           connectMode
-          onConnectedServerIds={onConnectedServerIds}
+          onConnectedServers={onConnectedServers}
         />
       </QueryClientProvider>
     );
@@ -369,7 +373,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
 
     rerender(panel("tok-refreshed"));
 
-    await waitFor(() => expect(idsReported(onConnectedServerIds)).toEqual([["s-m2m", "s-reach"]]));
+    await waitFor(() => expect(idsReported(onConnectedServers)).toEqual([["s-m2m", "s-reach"]]));
   });
 
   it("keeps the plain panel's empty text when the list fails to load outside connect mode", async () => {
@@ -383,7 +387,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
   it("reports nothing while a Connect is still loading the server's tools", async () => {
     vi.mocked(fetchMCPServers).mockResolvedValue(connectServers);
     vi.mocked(listMCPTools).mockResolvedValue({ tools: [] });
-    const onConnectedServerIds = vi.fn();
+    const onConnectedServers = vi.fn();
     const Page = () => {
       const [selected, setSelected] = React.useState<string[]>([]);
       return (
@@ -392,7 +396,7 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
           selectedServers={selected}
           onChange={setSelected}
           connectMode
-          onConnectedServerIds={onConnectedServerIds}
+          onConnectedServers={onConnectedServers}
         />
       );
     };
@@ -403,15 +407,15 @@ describe("MCPAppsPanel connected-app reachability (LIT-4861)", () => {
     );
 
     fireEvent.click(await screen.findByText("reachable_srv"));
-    await waitFor(() => expect(onConnectedServerIds).toHaveBeenLastCalledWith([]));
+    await waitFor(() => expect(onConnectedServers).toHaveBeenLastCalledWith({ on: ["s-m2m"], authorized: ["s-m2m"] }));
     let finishConnect: (result: { tools: never[] }) => void = () => {};
     vi.mocked(listMCPTools).mockImplementationOnce(() => new Promise((resolve) => (finishConnect = resolve)));
     fireEvent.click(screen.getByRole("button", { name: "Connect" }));
 
-    await waitFor(() => expect(onConnectedServerIds).toHaveBeenLastCalledWith(null));
+    await waitFor(() => expect(onConnectedServers).toHaveBeenLastCalledWith(null));
     await act(async () => finishConnect({ tools: [] }));
 
-    expect(onConnectedServerIds).toHaveBeenLastCalledWith(["s-m2m", "s-reach"]);
+    expect(onConnectedServers).toHaveBeenLastCalledWith({ on: ["s-m2m", "s-reach"], authorized: ["s-m2m"] });
   });
 
   it("requests the connected-app view and hides unreachable servers in connect mode", async () => {

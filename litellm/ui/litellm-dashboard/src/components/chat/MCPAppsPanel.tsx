@@ -91,12 +91,17 @@ export const OAuth2ConnectButton: React.FC<OAuth2ConnectButtonProps> = ({
   );
 };
 
+export interface ConnectedServers {
+  on: string[];
+  authorized: string[];
+}
+
 interface Props {
   accessToken: string;
   selectedServers: string[];
   onChange: (servers: string[]) => void;
   connectMode?: boolean;
-  onConnectedServerIds?: (serverIds: string[] | null) => void;
+  onConnectedServers?: (servers: ConnectedServers | null) => void;
 }
 
 const AVATAR_COLORS = [
@@ -122,13 +127,7 @@ type TabKey = "all" | "connected";
 
 const TOOLS_FETCH_CONCURRENCY = 5;
 
-const MCPAppsPanel: React.FC<Props> = ({
-  accessToken,
-  selectedServers,
-  onChange,
-  connectMode,
-  onConnectedServerIds,
-}) => {
+const MCPAppsPanel: React.FC<Props> = ({ accessToken, selectedServers, onChange, connectMode, onConnectedServers }) => {
   const { t } = useTranslation();
   const [servers, setServers] = useState<MCPServer[]>([]);
   const [loading, setLoading] = useState(true);
@@ -369,27 +368,27 @@ const MCPAppsPanel: React.FC<Props> = ({
     (s) => selectedServers.includes(nameOf(s)) && connectUnavailabilityLabel(s) === null,
   ).length;
 
-  const connectedServerIds = useMemo(() => {
-    const isAlwaysOn = (s: MCPServer) => getMcpOAuthMode(s) === "m2m";
-    const isPicked = (s: MCPServer) =>
-      getMcpOAuthMode(s) === "authorization_code"
-        ? oauthConnected.has(s.server_id)
-        : selectedServers.includes(nameOf(s));
-    const shownOn = servers.filter((s) => connectUnavailabilityLabel(s) === null && (isAlwaysOn(s) || isPicked(s)));
-    // Without a pick the connection stays unscoped.
-    return shownOn.every(isAlwaysOn) ? [] : shownOn.map((s) => s.server_id);
+  const connectedServers = useMemo(() => {
+    const isAuthorized = (s: MCPServer) => getMcpOAuthMode(s) === "m2m" || oauthConnected.has(s.server_id);
+    const isToggledOn = (s: MCPServer) =>
+      getMcpOAuthMode(s) !== "authorization_code" && selectedServers.includes(nameOf(s));
+    const available = servers.filter((s) => connectUnavailabilityLabel(s) === null);
+    return {
+      on: available.filter((s) => isAuthorized(s) || isToggledOn(s)).map((s) => s.server_id),
+      authorized: available.filter(isAuthorized).map((s) => s.server_id),
+    };
   }, [servers, selectedServers, oauthConnected, connectUnavailabilityLabel]);
   useEffect(() => {
     const settling = oauthChecking.size + togglingOn.size > 0 || returningOAuth.status === "exchanging";
-    onConnectedServerIds?.(loading || loadFailed || settling ? null : connectedServerIds);
+    onConnectedServers?.(loading || loadFailed || settling ? null : connectedServers);
   }, [
     loading,
     loadFailed,
     oauthChecking.size,
     togglingOn.size,
     returningOAuth.status,
-    connectedServerIds,
-    onConnectedServerIds,
+    connectedServers,
+    onConnectedServers,
   ]);
 
   const emptyStateText = () => {

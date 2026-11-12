@@ -1,9 +1,9 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import MCPAppsPanel from "@/components/chat/MCPAppsPanel";
+import MCPAppsPanel, { type ConnectedServers } from "@/components/chat/MCPAppsPanel";
 import ConnectFlowBanner from "@/components/chat/ConnectFlowBanner";
 import { fetchConnectFlow } from "@/components/networking";
 
@@ -14,15 +14,25 @@ interface Props {
 }
 
 const picksKey = (flow: string) => `litellm-connect-picks:${flow}`;
+const onAtStartKey = (flow: string) => `litellm-connect-on-at-start:${flow}`;
 
-const storedPicks = (flow: string): string[] | null => {
+const stored = (key: string): string[] | null => {
   try {
-    const stored: unknown = JSON.parse(sessionStorage.getItem(picksKey(flow)) ?? "null");
-    return Array.isArray(stored) ? stored.filter((name): name is string => typeof name === "string") : null;
+    const value: unknown = JSON.parse(sessionStorage.getItem(key) ?? "null");
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : null;
   } catch {
     return null;
   }
 };
+
+const remember = (key: string, values: string[]) => {
+  try {
+    sessionStorage.setItem(key, JSON.stringify(values));
+  } catch {}
+};
+
+const idsToPost = (connected: ConnectedServers, onAtStart: string[]) =>
+  connected.on.some((id) => !onAtStart.includes(id)) ? connected.on : [];
 
 /** Renders the sealed gateway connect flow without trusting URL context. */
 const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onChange }) => {
@@ -46,21 +56,34 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
     retry: false,
   };
   const { data: flow, isError, refetch } = useQuery(flowQuery);
-  const [connectedServerIds, setConnectedServerIds] = useState<string[] | null>(null);
+  const [connected, setConnected] = useState<ConnectedServers | null>(null);
+  const [onAtStart, setOnAtStart] = useState(() => (connectFlow ? stored(onAtStartKey(connectFlow)) : null));
 
   useEffect(() => {
-    const stored = connectFlow ? storedPicks(connectFlow) : null;
-    if (stored) onChange(stored);
+    const picks = connectFlow ? stored(picksKey(connectFlow)) : null;
+    if (picks) onChange(picks);
   }, [connectFlow, onChange]);
 
   const rememberPicks = (servers: string[]) => {
-    try {
-      if (connectFlow) sessionStorage.setItem(picksKey(connectFlow), JSON.stringify(servers));
-    } catch {}
+    if (connectFlow) remember(picksKey(connectFlow), servers);
     onChange(servers);
   };
 
-  const selectable = flow?.state === "unscoped" && flow.selectable !== false;
+  const reportConnected = useCallback(
+    (servers: ConnectedServers | null) => {
+      setConnected(servers);
+      if (servers === null || onAtStart !== null || connectFlow === null) return;
+      remember(onAtStartKey(connectFlow), servers.authorized);
+      setOnAtStart(servers.authorized);
+    },
+    [connectFlow, onAtStart],
+  );
+
+  const connectedServerIds = (): string[] | null => {
+    if (flow?.state !== "unscoped" || flow.selectable === false) return [];
+    if (connected === null || onAtStart === null) return null;
+    return idsToPost(connected, onAtStart);
+  };
 
   if (connectFlow === null) {
     return <MCPAppsPanel accessToken={accessToken} selectedServers={selectedServers} onChange={onChange} />;
@@ -74,15 +97,15 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
         accessToken={accessToken}
         onConnected={refetch}
         failed={isError}
-        connectedServerIds={selectable ? connectedServerIds : []}
+        connectedServerIds={connectedServerIds()}
       />
-      {selectable && (
+      {flow?.state === "unscoped" && (
         <MCPAppsPanel
           accessToken={accessToken}
           selectedServers={selectedServers}
           onChange={rememberPicks}
           connectMode
-          onConnectedServerIds={setConnectedServerIds}
+          onConnectedServers={reportConnected}
         />
       )}
     </>

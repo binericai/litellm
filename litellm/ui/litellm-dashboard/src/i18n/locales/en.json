@@ -9363,7 +9363,7 @@
       "unscoped": {
         "title": "Connect your MCP servers to {{client}}",
         "description": "Authorize the servers you want to use below, then click Finish connecting to return to {{client}}.",
-        "fixed": "Click Finish connecting to return to {{client}}."
+        "fixed": "{{client}} will get every server you can reach. Authorize the ones that need it below, then click Finish connecting to return to {{client}}."
       },
       "multi": {
         "title": "Allow {{client}} to use {{servers}}",
