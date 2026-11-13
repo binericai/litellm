@@ -3709,6 +3709,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "litellm-callbacks-model-capacity"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "litellm-callbacks",
+ "parking_lot",
+ "rstest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "litellm-callbacks-python"
 version = "0.1.0"
 dependencies = [
