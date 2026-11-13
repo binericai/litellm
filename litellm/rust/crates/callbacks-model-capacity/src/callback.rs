@@ -84,7 +84,11 @@ impl ModelCapacity {
                 subscriptions: vec![
                     Subscription {
                         reads: FieldSet::of(&[Field::Model, Field::DeprecatedKwargs]),
-                        writes: FieldSet::of(&[Field::Model]),
+                        writes: FieldSet::of(&[
+                            Field::Model,
+                            Field::Metadata,
+                            Field::OptionalParams,
+                        ]),
                         may_abort: true,
                         ..Subscription::on(Hook::PreCall)
                     },
