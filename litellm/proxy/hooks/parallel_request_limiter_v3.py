@@ -5332,6 +5332,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         response_obj: object,
         rate_limit_type: Literal["output", "input", "total"],
         keep_slot: bool,
+        turn: bool = False,
     ) -> None:
         from litellm.litellm_core_utils.core_helpers import (
             get_litellm_metadata_from_kwargs,  # pyright: ignore[reportUnknownVariableType]  # the helper is untyped
@@ -5355,6 +5356,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         usage_source: Final = response_obj if usage is None else usage
         end_user: Final = kwargs.get("user") or metadata.get("user_api_key_end_user_id")
         session: Final = metadata.get("session_id") or metadata.get("trace_id")
+        socket: Final = kwargs.get("call_type") == CallTypes.aresponses_websocket.value
+        ptu_usage_source: Final = response_obj if usage is None or socket else usage
+        ptu_total_tokens: Final = 0 if socket else total_tokens
         facts: Final = {
             "call_id": _call_id_from_callback_kwargs(kwargs),
             "exempt": bool(origin and origin != "autorouter_compaction"),
@@ -5373,7 +5377,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             if served_model is None
             else {"requested": served_model.requested, "group": served_model.group},
             "models": {
-                model.requested: self._native_model_facts(model, request_metadata, team_id, usage_source, total_tokens)
+                model.requested: self._native_model_facts(
+                    model, request_metadata, team_id, ptu_usage_source, ptu_total_tokens
+                )
                 for model in (served_model, reserved_model)
                 if model is not None
             },
@@ -5388,11 +5394,19 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 or self._aggregate_only_total_tokens(self._response_usage(kwargs.get("combined_usage_object"))),
             },
         }
-        await native.settle_success(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+        settle: Final = native.settle_turn if turn else native.settle_success
+        await settle(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
             native_state,
             json.dumps(facts, default=str),
             post_call_request() if self.rate_limits.has_redis else None,
         )
+
+    def _socket_turn_native_state(
+        self, stash: RequestRateLimiterStash | None, kwargs: Mapping[str, object]
+    ) -> "NativeParallelRequestLimiterState | None":
+        if stash is not None or self.native_companion is None or not _is_socket_turn(kwargs):
+            return None
+        return self._native_state(get_request_stash())
 
     def _build_team_ptu_tpm_ops(
         self,
@@ -5486,6 +5500,18 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                         end_time if isinstance(end_time, datetime) and not callback_kwargs.get("stream") else None,
                         stash.parallel_slot_reused_at if stash is not None else None,
                     ),
+                )
+                return
+            turn_state: Final = self._socket_turn_native_state(stash, callback_kwargs)
+            if self.native_companion is not None and turn_state is not None:
+                await self._settle_success_natively(
+                    self.native_companion,
+                    turn_state,
+                    callback_kwargs,
+                    response_obj,  # pyright: ignore[reportUnknownArgumentType]  # hook arguments are unannotated
+                    rate_limit_type,
+                    keep_slot=True,
+                    turn=True,
                 )
                 return
             await self._release_stashed_parallel_slot(
@@ -5674,6 +5700,19 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     ),
                     post_call_request() if self.rate_limits.has_redis else None,
                 )
+                return
+            failed_turn_state: Final = self._socket_turn_native_state(stash, failed_call)
+            if self.native_companion is not None and failed_turn_state is not None:
+                if self._recovered_partial_usage_tokens(failed_call)[0] > 0:
+                    await self._settle_success_natively(
+                        self.native_companion,
+                        failed_turn_state,
+                        failed_call,
+                        None,
+                        self.get_rate_limit_type(),
+                        keep_slot=True,
+                        turn=True,
+                    )
                 return
             await self._release_stashed_parallel_slot(stash, litellm_parent_otel_span, in_logging_callback=True)
 

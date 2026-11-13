@@ -42,6 +42,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointT
 from litellm.types.utils import CallTypes
 
 _IO_KEYS: Final = frozenset({"model_per_project_itpm", "model_per_project_otpm"})
+_AGENT_DESCRIPTOR_KEYS: Final = frozenset({"agent", "agent_session"})
 PROJECT_OTPM_DESCRIPTOR_KEY: Final = "model_per_project_otpm"
 PTU_TEAM_DESCRIPTOR_KEY: Final = "model_per_team_ptu"
 
@@ -62,7 +63,6 @@ RATE_LIMITED_KIND: Final = "proxy_rate_limit"
 UNVERIFIABLE_KIND: Final = "rate_limit_unverifiable"
 PTU_SHARE_EXCEEDED_KIND: Final = "ptu_share_exceeded"
 BATCH_RATE_LIMITED_KIND: Final = "batch_rate_limit"
-_UNSUPPORTED_CALL_TYPES: Final = frozenset({CallTypes.aresponses_websocket.value})
 _HEADERS: Final = TypeAdapter(dict[str, str])
 _SCOPES: Final = TypeAdapter(tuple[BatchEnqueuedTokenScope, ...])
 _RESERVATION: Final = TypeAdapter(BatchEnqueuedTokenReservation)
@@ -268,7 +268,6 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         stash: Final = get_request_stash()
         return (
             auth is None
-            or call_type in _UNSUPPORTED_CALL_TYPES
             or (stash is not None and stash.native_state is None and stash.call_type is not None)
             or request_identity(data) is None
         )
@@ -334,6 +333,14 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         )
         stash.call_type = call_type
         stash.native_state = state
+        stash.tpm_limited_tags = frozenset(
+            descriptor["value"]
+            for descriptor in descriptors
+            if descriptor["key"] == "tag" and (descriptor["rate_limit"] or {}).get("tokens_per_unit") is not None
+        )
+        stash.socket_agent_windows = tuple(
+            descriptor for descriptor in descriptors if descriptor["key"] in _AGENT_DESCRIPTOR_KEYS
+        )
         model_value: Final = data.get("model")
         requested_model: Final = model_value if isinstance(model_value, str) else None
         ceiling: Final = stash.ptu_ceiling

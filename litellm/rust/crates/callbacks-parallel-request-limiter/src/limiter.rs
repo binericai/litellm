@@ -898,6 +898,30 @@ impl ParallelRequestLimiter {
         }
     }
 
+    pub async fn settle_turn(
+        &self,
+        connection: &LimiterState,
+        facts: SuccessFacts,
+        request: Option<&RequestRedis>,
+    ) {
+        let turn = LimiterState::default();
+        {
+            let mut stash = turn.stash();
+            stash.owned = true;
+            stash.tpm_limited_tags = connection.stash().tpm_limited_tags.clone();
+        }
+        self.settle_success(
+            &turn,
+            SuccessFacts {
+                call_id: None,
+                keep_slot: true,
+                ..facts
+            },
+            request,
+        )
+        .await;
+    }
+
     fn io_success_settlement(&self, stash: &Stash, usage: &IoUsage) -> Option<Settlement> {
         let (itpm, otpm) = (stash.itpm.tokens, stash.otpm.tokens);
         if itpm <= 0 && otpm <= 0 {

@@ -40,7 +40,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
 from litellm.proxy.utils import InternalUsageCache
 from litellm.redis.stores.rate_limits import RateLimitScope
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
-from litellm.types.utils import ModelResponse, Usage
+from litellm.types.utils import CallTypes, ModelResponse, Usage
 
 pytest.importorskip("litellm.rust_bridge._native")
 
@@ -1106,3 +1106,95 @@ async def test_realtime_sessions_are_limited_natively_like_python(
         backend,
     )
     assert observed[0] is None
+
+
+_WS_EVENTS: Final = [
+    {"type": "response.created", "response": {"id": "resp_1"}},
+    {
+        "type": "response.completed",
+        "response": {"id": "resp_1", "usage": {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42}},
+    },
+]
+
+
+def _turn_kwargs(turn: int, auth: UserAPIKeyAuth, failed: bool) -> dict[str, object]:
+    from litellm.constants import RESPONSES_WEBSOCKET_CALL_ID_METADATA_KEY
+
+    return {
+        "litellm_call_id": f"turn-{turn}",
+        "call_type": CallTypes.aresponses_websocket.value,
+        "litellm_params": {
+            "metadata": {"model_group": "gpt-4o"},
+            "litellm_metadata": {RESPONSES_WEBSOCKET_CALL_ID_METADATA_KEY: "call-0", "model_group": "gpt-4o"},
+        },
+        "standard_logging_object": {
+            "metadata": {
+                "user_api_key_hash": auth.api_key,
+                "user_api_key_team_id": auth.team_id,
+                "user_api_key_project_id": auth.project_id,
+            },
+            "hidden_params": {},
+        },
+        **({"combined_usage_object": _CACHED_USAGE} if failed else {}),
+    }
+
+
+async def _socket_turn(side: Side, turn: int, auth: UserAPIKeyAuth) -> object:
+    frame = await _guarded(
+        side.limiter.enforce_token_limits_for_frame(user_api_key_dict=auth, requested_model="gpt-4o")
+    )
+    failed = turn % 3 == 2
+    kwargs = _turn_kwargs(turn, auth, failed)
+    if failed:
+        await side.limiter.async_log_failure_event(kwargs, None, None, None)
+    else:
+        await side.limiter.async_log_success_event(kwargs, list(_WS_EVENTS), None, None)
+    return frame
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "disconnect"))
+@pytest.mark.parametrize(
+    ("limits", "ceiling"),
+    (
+        ({"tpm_limit": 150, "rpm_limit": 20, "max_parallel_requests": 1}, None),
+        ({"team_id": "t1", "tpm_limit": 5000}, _CEILING),
+        (
+            {
+                "project_id": "p1",
+                "project_metadata": {"model_itpm_limit": {"gpt-4o": 400}, "model_tpm_limit": {"gpt-4o": 120}},
+            },
+            None,
+        ),
+    ),
+)
+async def test_responses_websocket_turns_are_settled_natively_like_python(
+    end: str,
+    limits: dict[str, object],
+    ceiling: PTUTeamCeiling | None,
+    backend: tuple[int | None, int | None],
+) -> None:
+    clock: Final = Clock()
+    sides: Final = (
+        _side(clock, native=False, port=backend[0], ceiling=ceiling),
+        _side(clock, native=True, port=backend[1], ceiling=ceiling),
+    )
+    auth: Final = _auth(**limits)
+    connection: Final = Request(auth, {"model": "gpt-4o"}, call_type=CallTypes.aresponses_websocket.value, end=end)
+    scopes: Final = [("api_key", _KEY), ("model_per_team_ptu", "t1:gpt-4o"), *_PROJECT_SCOPES]
+    admitted: Final = [await _run(side, 0, _admit, connection) for side in sides]
+    assert admitted[0] == admitted[1] == None
+    assert sides[0].datas[0] == sides[1].datas[0]
+    frames: Final[list[object]] = []
+    for turn in range(6):
+        outcomes = [
+            await asyncio.get_running_loop().create_task(_socket_turn(side, turn, auth), context=side.contexts[0])
+            for side in sides
+        ]
+        assert outcomes[0] == outcomes[1], (turn, outcomes)
+        assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes), turn
+        frames.append(outcomes[0])
+    ended: Final = [await _run(side, 0, _end, connection) for side in sides]
+    assert ended[0] == ended[1]
+    assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
+    assert frames[0] is None

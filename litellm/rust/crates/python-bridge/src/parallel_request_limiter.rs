@@ -456,6 +456,24 @@ impl NativeParallelRequestLimiter {
     }
 
     #[pyo3(signature = (state, facts, request = None))]
+    fn settle_turn<'py>(
+        &self,
+        py: Python<'py>,
+        state: PyRef<'py, NativeParallelRequestLimiterState>,
+        facts: &str,
+        request: Option<PyRef<'py, NativeRequestRedis>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let facts: SuccessFacts = decoded(facts)?;
+        let state = Arc::clone(&state.0);
+        let request = request.map(|request| request.0.clone());
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            limiter.settle_turn(&state, facts, request.as_ref()).await;
+            Ok(())
+        })
+    }
+
+    #[pyo3(signature = (state, facts, request = None))]
     fn settle_failure<'py>(
         &self,
         py: Python<'py>,

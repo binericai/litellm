@@ -1352,6 +1352,9 @@ class NativeParallelRequestLimiter:
     def settle_failure(
         self, state: NativeParallelRequestLimiterState, facts: str, request: NativeRequestRedis | None = None
     ) -> Future[None]: ...
+    def settle_turn(
+        self, state: NativeParallelRequestLimiterState, facts: str, request: NativeRequestRedis | None = None
+    ) -> Future[None]: ...
     def release_on_disconnect(self, state: NativeParallelRequestLimiterState) -> Future[None]: ...
     def fallback_target_allowed(
         self,
