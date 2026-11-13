@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use litellm_callbacks::{CallFacts, Callback, Field, FieldValues, Hook, HookInput, Verdict};
 use litellm_callbacks_parallel_request_limiter::{
-    Backend, Ctx, Descriptor, Engine, EnqueuedReservation, EnqueuedScope, FailureFacts,
-    IoReservation, LimiterState, ParallelRequestLimiter, PolicyFacts, Response, Settings,
-    SlotAcquisition, SuccessFacts, Unverifiable, WindowIdentity, process_monotonic,
+    AuthFacts, Backend, Ctx, Descriptor, Engine, EnqueuedReservation, EnqueuedScope, FailureFacts,
+    IoReservation, LimiterState, OutputCapFacts, ParallelRequestLimiter, PolicyFacts, Response,
+    Settings, SlotAcquisition, SuccessFacts, Unverifiable, WindowIdentity, auth_descriptors,
+    output_cap, process_monotonic,
 };
 use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value};
 use litellm_redis_store::rate_limits::Scope;
@@ -418,6 +419,18 @@ impl NativeParallelRequestLimiter {
 
     fn holds_parallel_slot(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> bool {
         state.0.stash().parallel_slot.is_some()
+    }
+
+    fn auth_descriptors(&self, facts: &str) -> PyResult<String> {
+        let facts: AuthFacts = decoded(facts)?;
+        let built =
+            auth_descriptors(&facts).map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(json!([built.leading, built.organization]).to_string())
+    }
+
+    fn output_cap(&self, facts: &str) -> PyResult<Option<i64>> {
+        let facts: OutputCapFacts = decoded(facts)?;
+        Ok(output_cap(&facts))
     }
 
     fn take_parallel_slot(

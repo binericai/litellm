@@ -2,7 +2,7 @@ import dataclasses
 import json
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar, Token
 from datetime import datetime
 from types import MappingProxyType
@@ -50,7 +50,12 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
     from litellm.proxy.hooks.batch_rate_limiter import PROXY_BatchRateLimiter
-    from litellm.proxy.hooks.parallel_request_limiter_v3 import PROXY_MaxParallelRequestsHandler_v3, RateLimitResponse
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+        AuthDescriptors,
+        PROXY_MaxParallelRequestsHandler_v3,
+        RateLimitDescriptor,
+        RateLimitResponse,
+    )
     from litellm.proxy.utils import InternalUsageCache
     from litellm.rust_bridge._native import (
         NativeParallelRequestLimiter,
@@ -69,6 +74,27 @@ _RESERVATION: Final = TypeAdapter(BatchEnqueuedTokenReservation)
 _OVER_LIMIT: Final = TypeAdapter(BatchEnqueuedTokenOverLimit)
 _OUTCOME: Final = TypeAdapter(dict[str, object])
 _PTU_FIELDS: Final = TypeAdapter(dict[str, str | int | float])
+_AUTH_FIELDS: Final = (
+    "api_key",
+    "rpm_limit",
+    "tpm_limit",
+    "max_parallel_requests",
+    "budget_throttle_pct",
+    "user_id",
+    "user_rpm_limit",
+    "user_tpm_limit",
+    "team_id",
+    "team_rpm_limit",
+    "team_tpm_limit",
+    "team_member_rpm_limit",
+    "team_member_tpm_limit",
+    "end_user_id",
+    "end_user_rpm_limit",
+    "end_user_tpm_limit",
+    "org_id",
+    "organization_rpm_limit",
+    "organization_tpm_limit",
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -329,7 +355,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             mirror_rate_limit_response(self.bridge, state)
             return batch_outcome
         descriptors: Final = await limiter._build_request_rate_limit_descriptors(  # pyright: ignore[reportPrivateUsage]  # the descriptors are the Python limiter's
-            user_api_key_dict=auth, data=data, call_type=call_type
+            user_api_key_dict=auth, data=data, call_type=call_type, auth_descriptors=self._auth_descriptors(auth)
         )
         stash.call_type = call_type
         stash.native_state = state
@@ -368,12 +394,8 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         estimated_tokens: int | None = None  # rebind-ok: set only when the request reserves tokens
         ptu_estimate: Mapping[str, object] | None = None  # rebind-ok: set only for a team PTU reservation
         if reserves:
-            limiter._apply_implicit_output_cap(  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
-                data=probe,
-                min_configured_limit=min(configured_tpm_limits),
-                call_type=call_type,
-                configured_output_tokens=configured_output_tokens,
-                endpoint_type=endpoint_type,
+            self._apply_output_cap(
+                probe, min(configured_tpm_limits), call_type, endpoint_type, configured_output_tokens
             )
             estimated_tokens = await offload_token_count(limiter._estimate_tokens_for_request)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
                 data=probe,
@@ -425,19 +447,59 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         }
         outcome: Final = await self._call(Hook.pre_call, facts, ctx, state=state, request=pre_call_request())
         if reserves and self.bridge.first_pass_admitted(state):
-            limiter._apply_implicit_output_cap(  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
-                data=data,
-                min_configured_limit=min(configured_tpm_limits),
-                call_type=call_type,
-                configured_output_tokens=configured_output_tokens,
-                endpoint_type=endpoint_type,
-            )
+            self._apply_output_cap(data, min(configured_tpm_limits), call_type, endpoint_type, configured_output_tokens)
         if self.bridge.io_reached(state):
-            limiter._apply_implicit_output_cap(  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
-                data=data, min_configured_limit=min_otpm_limit, call_type=call_type, endpoint_type=endpoint_type
-            )
+            self._apply_output_cap(data, min_otpm_limit, call_type, endpoint_type)
         mirror_rate_limit_response(self.bridge, state)
         return outcome
+
+    def _auth_descriptors(self, auth: UserAPIKeyAuth) -> "AuthDescriptors":
+        from litellm.proxy.hooks.parallel_request_limiter_v3 import AUTH_DESCRIPTORS
+
+        fields: Final = {name: getattr(auth, name) for name in _AUTH_FIELDS}
+        window_size: Final = self.limiter.window_size
+
+        def built(
+            rpm_limit_type: str | None, tpm_limit_type: str | None, model_has_failures: bool
+        ) -> tuple[Sequence["RateLimitDescriptor"], Sequence["RateLimitDescriptor"]]:
+            facts: Final = {
+                **fields,
+                "rpm_limit_type": rpm_limit_type,
+                "tpm_limit_type": tpm_limit_type,
+                "model_has_failures": model_has_failures,
+                "window_size": window_size,
+            }
+            return AUTH_DESCRIPTORS.validate_json(self.bridge.auth_descriptors(json.dumps(facts)))
+
+        return built
+
+    def _apply_output_cap(
+        self,
+        data: dict[str, object],  # mutable-ok: the cap is written into the routed request
+        min_configured_limit: int | None,
+        call_type: str,
+        endpoint_type: EndpointType,
+        configured_output_tokens: int | None = None,
+    ) -> None:
+        from litellm.proxy.hooks import parallel_request_limiter_v3 as python_limiter
+
+        cap: Final = self.bridge.output_cap(
+            json.dumps(
+                {
+                    "min_configured_limit": min_configured_limit,
+                    "responses": call_type in python_limiter.RESPONSES_API_CALL_TYPES,
+                    "exempt": python_limiter.PROXY_MaxParallelRequestsHandler_v3.implicit_output_cap_exempt(
+                        data, call_type, endpoint_type
+                    ),
+                    "configured_output_tokens": configured_output_tokens,
+                    "fraction": python_limiter.NO_MAX_TOKENS_TPM_RESERVATION_FRACTION,
+                    "default_max_tokens_estimate": python_limiter.DEFAULT_MAX_TOKENS_ESTIMATE,
+                    "responses_min_output_tokens": python_limiter.RESPONSES_API_MIN_OUTPUT_TOKENS,
+                }
+            )
+        )
+        if cap is not None:
+            python_limiter.PROXY_MaxParallelRequestsHandler_v3.write_implicit_output_cap(data, call_type, cap)
 
 
 def _prior(response: "RateLimitResponse | None") -> Mapping[str, object] | None:

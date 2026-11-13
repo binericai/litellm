@@ -563,6 +563,10 @@ class _NativeStash(TypedDict):
 
 
 _NATIVE_STASH: Final = TypeAdapter(_NativeStash)
+AuthDescriptors: TypeAlias = Callable[
+    [str | None, str | None, bool], tuple[Sequence[RateLimitDescriptor], Sequence[RateLimitDescriptor]]
+]
+AUTH_DESCRIPTORS: Final = TypeAdapter(tuple[list[RateLimitDescriptor], list[RateLimitDescriptor]])
 
 
 def _window_identities(windows: Sequence[_NativeWindow]) -> frozenset[ReservationWindowIdentity]:
@@ -1214,7 +1218,25 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             or call_type in EXTRACTION_API_CALL_TYPES
         ):
             return
-        effective_cap: Final = max(capped_floor, configured_output_tokens or 0)
+        PROXY_MaxParallelRequestsHandler_v3.write_implicit_output_cap(
+            data, call_type, max(capped_floor, configured_output_tokens or 0)
+        )
+
+    @staticmethod
+    def implicit_output_cap_exempt(data: object, call_type: str | None, endpoint_type: EndpointType) -> bool:
+        return (
+            PROXY_MaxParallelRequestsHandler_v3._has_explicit_output_cap(data, call_type)
+            or PROXY_MaxParallelRequestsHandler_v3._is_embedding_request(data, call_type)
+            or endpoint_type == EndpointType.DECISIONS
+            or call_type in EXTRACTION_API_CALL_TYPES
+        )
+
+    @staticmethod
+    def write_implicit_output_cap(
+        data: dict[str, object],  # mutable-ok: the cap is written into the routed request
+        call_type: str | None,
+        effective_cap: int,
+    ) -> None:
         if call_type in GOOGLE_GENAI_NATIVE_CALL_TYPES:
             config_field: Final = "config" if "config" in data or "generationConfig" not in data else "generationConfig"
             config: Final = data.get(config_field)
@@ -1226,7 +1248,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             return
         cap_field: Final = "max_output_tokens" if call_type in RESPONSES_API_CALL_TYPES else "max_tokens"
         existing_cap: Final = data.get(cap_field)
-        if existing_cap is None or effective_cap < existing_cap:
+        if existing_cap is None or effective_cap < existing_cap:  # pyright: ignore[reportOperatorIssue]  # an unparsable existing cap fails as it always has
             data[cap_field] = effective_cap  # rebind-ok: downstream routing requires the bounded output cap
 
     def estimate_request_tokens(
@@ -2863,13 +2885,23 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         )
 
     def create_organization_rate_limit_descriptor(
-        self, user_api_key_dict: UserAPIKeyAuth, requested_model: str | None = None
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        requested_model: str | None = None,
+        organization: Sequence[RateLimitDescriptor] | None = None,
     ) -> list[RateLimitDescriptor]:
-        descriptors: Final[list[RateLimitDescriptor]] = []
+        descriptors: Final[list[RateLimitDescriptor]] = (  # mutable-ok: the global descriptor is appended in place
+            [] if organization is None else list(organization)
+        )
 
         # Global org rate limits
-        if user_api_key_dict.org_id is not None and (
-            user_api_key_dict.organization_rpm_limit is not None or user_api_key_dict.organization_tpm_limit is not None
+        if (
+            organization is None
+            and user_api_key_dict.org_id is not None
+            and (
+                user_api_key_dict.organization_rpm_limit is not None
+                or user_api_key_dict.organization_tpm_limit is not None
+            )
         ):
             descriptors.append(
                 RateLimitDescriptor(
@@ -3317,6 +3349,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         tpm_limit_type: str | None,
         model_has_failures: bool,
         call_type: str | None = None,
+        leading: Sequence[RateLimitDescriptor] | None = None,
     ) -> list[RateLimitDescriptor]:
         """
         Create all rate limit descriptors for the request.
@@ -3324,6 +3357,72 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         Returns list of descriptors for API key, user, team, team member, end user,
         model-specific, agent, and agent-session limits.
         """
+        descriptors: Final[list[RateLimitDescriptor]] = (  # mutable-ok: existing descriptor helpers append in place
+            list(leading)
+            if leading is not None
+            else self._leading_rate_limit_descriptors(
+                user_api_key_dict, rpm_limit_type, tpm_limit_type, model_has_failures
+            )
+        )
+
+        # Model rate limits
+        requested_model: Final = data.get("model", None)
+        model_candidates: Final = expand_model_latest_alias(requested_model if isinstance(requested_model, str) else "")
+        for candidate in model_candidates:
+            self._add_model_per_key_rate_limit_descriptor(
+                user_api_key_dict=user_api_key_dict,
+                requested_model=candidate,
+                descriptors=descriptors,
+            )
+            if (end_user_model := self._end_user_model_rate_limit_descriptor(user_api_key_dict, candidate)) is not None:
+                descriptors.append(end_user_model)
+
+        # Per-request-tag rate limits scoped to this key
+        self._add_tag_per_key_rate_limit_descriptor(
+            user_api_key_dict=user_api_key_dict,
+            data=data,
+            descriptors=descriptors,
+        )
+
+        for candidate in model_candidates:
+            self._add_team_model_rate_limit_descriptor_from_metadata(
+                user_api_key_dict=user_api_key_dict,
+                requested_model=candidate,
+                descriptors=descriptors,
+            )
+        self._add_team_ptu_rate_limit_descriptor(
+            user_api_key_dict=user_api_key_dict,
+            requested_model=requested_model if isinstance(requested_model, str) else None,
+            descriptors=descriptors,
+        )
+
+        resolved_agent_id: Final = self._get_resolved_agent_id(user_api_key_dict, data)
+        for agent_id in dict.fromkeys((resolved_agent_id, user_api_key_dict.invoked_agent_id)):
+            if agent_id is None:
+                continue
+            descriptors.extend(
+                self._create_agent_rate_limit_descriptors(
+                    agent_id=agent_id,
+                    data=data,
+                    policy=(
+                        user_api_key_dict.managed_agent_policy
+                        if agent_id == user_api_key_dict.agent_id
+                        else user_api_key_dict.invoked_agent_policy
+                    ),
+                )
+            )
+
+        return descriptors if len(model_candidates) == 1 else list(_coalesce_rate_limit_descriptors(descriptors))
+
+    _create_rate_limit_descriptors = create_rate_limit_descriptors
+
+    def _leading_rate_limit_descriptors(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        rpm_limit_type: str | None,
+        tpm_limit_type: str | None,
+        model_has_failures: bool,
+    ) -> list[RateLimitDescriptor]:  # mutable-ok: existing descriptor helpers append in place
         descriptors: Final[list[RateLimitDescriptor]] = []  # mutable-ok: existing descriptor helpers append in place
 
         # API Key rate limits
@@ -3419,56 +3518,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 )
             )
 
-        # Model rate limits
-        requested_model: Final = data.get("model", None)
-        model_candidates: Final = expand_model_latest_alias(requested_model if isinstance(requested_model, str) else "")
-        for candidate in model_candidates:
-            self._add_model_per_key_rate_limit_descriptor(
-                user_api_key_dict=user_api_key_dict,
-                requested_model=candidate,
-                descriptors=descriptors,
-            )
-            if (end_user_model := self._end_user_model_rate_limit_descriptor(user_api_key_dict, candidate)) is not None:
-                descriptors.append(end_user_model)
-
-        # Per-request-tag rate limits scoped to this key
-        self._add_tag_per_key_rate_limit_descriptor(
-            user_api_key_dict=user_api_key_dict,
-            data=data,
-            descriptors=descriptors,
-        )
-
-        for candidate in model_candidates:
-            self._add_team_model_rate_limit_descriptor_from_metadata(
-                user_api_key_dict=user_api_key_dict,
-                requested_model=candidate,
-                descriptors=descriptors,
-            )
-        self._add_team_ptu_rate_limit_descriptor(
-            user_api_key_dict=user_api_key_dict,
-            requested_model=requested_model if isinstance(requested_model, str) else None,
-            descriptors=descriptors,
-        )
-
-        resolved_agent_id: Final = self._get_resolved_agent_id(user_api_key_dict, data)
-        for agent_id in dict.fromkeys((resolved_agent_id, user_api_key_dict.invoked_agent_id)):
-            if agent_id is None:
-                continue
-            descriptors.extend(
-                self._create_agent_rate_limit_descriptors(
-                    agent_id=agent_id,
-                    data=data,
-                    policy=(
-                        user_api_key_dict.managed_agent_policy
-                        if agent_id == user_api_key_dict.agent_id
-                        else user_api_key_dict.invoked_agent_policy
-                    ),
-                )
-            )
-
-        return descriptors if len(model_candidates) == 1 else list(_coalesce_rate_limit_descriptors(descriptors))
-
-    _create_rate_limit_descriptors = create_rate_limit_descriptors
+        return descriptors
 
     async def _check_model_has_recent_failures(
         self,
@@ -4139,6 +4189,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth,
         data: Mapping[str, object],
         call_type: str | None,
+        auth_descriptors: AuthDescriptors | None = None,
     ) -> list[RateLimitDescriptor]:  # mutable-ok: the shared generation reservation helpers require a list
         metadata: Final = _REQUEST_RATE_LIMIT_DATA.validate_python(
             user_api_key_dict.metadata or MappingProxyType({})  # pyright: ignore[reportUnknownMemberType]  # validates the legacy auth metadata boundary
@@ -4157,6 +4208,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             if requested_model and self._is_dynamic_rate_limiting_enabled(rpm_limit_type, tpm_limit_type)
             else False
         )
+        native_auth: Final = (
+            None if auth_descriptors is None else auth_descriptors(rpm_limit_type, tpm_limit_type, model_has_failures)
+        )
         descriptors: Final = self.create_rate_limit_descriptors(  # pyright: ignore[reportUnknownMemberType]  # legacy helper reads a dictionary with validated keys
             user_api_key_dict=user_api_key_dict,
             data=dict(data),
@@ -4164,6 +4218,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             tpm_limit_type=tpm_limit_type,
             model_has_failures=model_has_failures,
             call_type=call_type,
+            leading=None if native_auth is None else native_auth[0],
         )
         self._add_project_model_rate_limit_descriptor_from_metadata(
             user_api_key_dict=user_api_key_dict,
@@ -4177,7 +4232,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         )
         return [
             *descriptors,
-            *self.create_organization_rate_limit_descriptor(user_api_key_dict, requested_model),
+            *self.create_organization_rate_limit_descriptor(
+                user_api_key_dict, requested_model, None if native_auth is None else native_auth[1]
+            ),
             *await self._create_tag_rate_limit_descriptors(data),
         ]
 

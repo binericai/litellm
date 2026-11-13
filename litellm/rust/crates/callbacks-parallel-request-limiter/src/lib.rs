@@ -1,3 +1,4 @@
+mod arithmetic;
 mod batch;
 mod descriptor;
 mod engine;
@@ -8,6 +9,10 @@ mod refusal;
 mod state;
 mod status;
 
+pub use arithmetic::{
+    ArithmeticError, AuthDescriptors, AuthFacts, OutputCapFacts, auth_descriptors,
+    no_max_tokens_output_floor, output_cap, throttled_limit,
+};
 pub use batch::{BatchFacts, TPD_SUFFIX, TPD_WINDOW_SECONDS};
 pub use descriptor::{Descriptor, Limits, PROJECT_ITPM, PROJECT_OTPM, PTU_TEAM};
 pub use engine::{

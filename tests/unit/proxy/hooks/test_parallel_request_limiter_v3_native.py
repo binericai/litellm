@@ -1198,3 +1198,100 @@ async def test_responses_websocket_turns_are_settled_natively_like_python(
     assert ended[0] == ended[1]
     assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
     assert frames[0] is None
+
+
+_AUTH_VARIANTS: Final[tuple[Mapping[str, object], ...]] = (
+    {"rpm_limit": 10, "tpm_limit": 1000, "max_parallel_requests": 3},
+    {"rpm_limit": 10, "tpm_limit": 1000, "budget_throttle_pct": 0.37},
+    {"rpm_limit": 1, "tpm_limit": 2, "budget_throttle_pct": 0.01},
+    {"max_parallel_requests": 0},
+    {"api_key": "", "rpm_limit": 4, "user_id": "u1", "user_rpm_limit": 2},
+    {"user_id": "u1", "user_tpm_limit": 300, "team_member_rpm_limit": 5},
+    {"user_id": "", "team_member_rpm_limit": 5, "user_rpm_limit": 1},
+    {"user_id": "u1", "team_id": "t1", "team_member_tpm_limit": 70, "team_rpm_limit": 9, "team_tpm_limit": 900},
+    {"team_id": "t1", "team_tpm_limit": 0},
+    {"end_user_id": "e1", "end_user_rpm_limit": 3, "end_user_tpm_limit": None},
+    {"end_user_id": "", "end_user_rpm_limit": 3},
+    {"org_id": "o1", "organization_rpm_limit": 8, "organization_tpm_limit": 800},
+    {"org_id": "", "organization_tpm_limit": 50},
+    {"org_id": "o1"},
+    {},
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limits", _AUTH_VARIANTS)
+@pytest.mark.parametrize("rpm_limit_type", (None, "dynamic", "guaranteed_throughput"))
+@pytest.mark.parametrize("tpm_limit_type", (None, "dynamic"))
+@pytest.mark.parametrize("model_has_failures", (False, True))
+async def test_auth_descriptors_are_built_in_rust_like_python(
+    limits: Mapping[str, object], rpm_limit_type: str | None, tpm_limit_type: str | None, model_has_failures: bool
+) -> None:
+    side: Final = _side(Clock(), native=True)
+    assert side.native is not None
+    auth: Final = UserAPIKeyAuth(**{"api_key": _KEY, **limits})  # pyright: ignore[reportArgumentType]  # pydantic fields by keyword
+    leading, organization = side.native._auth_descriptors(auth)(rpm_limit_type, tpm_limit_type, model_has_failures)  # pyright: ignore[reportPrivateUsage]  # the arithmetic under test
+    assert leading == side.limiter._leading_rate_limit_descriptors(  # pyright: ignore[reportPrivateUsage]  # the Python reference
+        auth, rpm_limit_type, tpm_limit_type, model_has_failures
+    )
+    assert side.limiter.create_organization_rate_limit_descriptor(auth, None, organization) == (
+        side.limiter.create_organization_rate_limit_descriptor(auth, None)
+    )
+
+
+_CAP_BODIES: Final[tuple[tuple[str, Mapping[str, object]], ...]] = (
+    ("acompletion", _CHAT),
+    ("acompletion", {**_CHAT, "max_tokens": 0}),
+    ("acompletion", {**_CHAT, "max_completion_tokens": "12"}),
+    ("aresponses", {"model": "gpt-4o", "input": "hi"}),
+    ("aresponses", {"model": "gpt-4o", "input": "hi", "max_output_tokens": 3}),
+    ("aembedding", {"model": "text-embedding-3-small", "input": "hi"}),
+    ("agenerate_content", {"model": "gemini-2.5-pro", "contents": [{"parts": [{"text": "hi"}]}]}),
+    ("agenerate_content", {"model": "gemini-2.5-pro", "contents": [], "generationConfig": {"temperature": 1}}),
+    ("", {**_CHAT, "input": "x"}),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("call_type", "body"), _CAP_BODIES)
+@pytest.mark.parametrize("min_limit", (None, 1, 40, 100, 4095, 100_000))
+@pytest.mark.parametrize("configured_output_tokens", (None, 0, 60, 5000))
+@pytest.mark.parametrize("endpoint_type", (EndpointType.GENERIC, EndpointType.DECISIONS))
+async def test_the_implicit_output_cap_is_decided_in_rust_like_python(
+    call_type: str,
+    body: Mapping[str, object],
+    min_limit: int | None,
+    configured_output_tokens: int | None,
+    endpoint_type: EndpointType,
+) -> None:
+    side: Final = _side(Clock(), native=True)
+    assert side.native is not None
+    python: Final = dict(body)
+    native: Final = dict(body)
+    PROXY_MaxParallelRequestsHandler_v3._apply_implicit_output_cap(  # pyright: ignore[reportPrivateUsage]  # the Python reference
+        python, min_limit, call_type, configured_output_tokens, endpoint_type
+    )
+    side.native._apply_output_cap(native, min_limit, call_type, endpoint_type, configured_output_tokens)  # pyright: ignore[reportPrivateUsage]  # the arithmetic under test
+    assert native == python
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "limits",
+    (
+        {"rpm_limit": 6, "tpm_limit": 900, "budget_throttle_pct": 0.5},
+        {"rpm_limit": 3, "tpm_limit": 400, "metadata": {"rpm_limit_type": "dynamic", "tpm_limit_type": "dynamic"}},
+        {"org_id": "o1", "organization_rpm_limit": 3, "organization_tpm_limit": 500, "end_user_id": "e1"},
+        {"user_id": "u1", "team_member_tpm_limit": 120, "end_user_id": "e1", "end_user_rpm_limit": 2},
+    ),
+)
+async def test_auth_descriptors_from_rust_limit_requests_like_python(
+    limits: dict[str, object], backend: tuple[int | None, int | None]
+) -> None:
+    auth: Final = _auth(**limits)
+    observed: Final = await _differential(
+        [Request(auth, _CHAT) for _ in range(4)],
+        [("api_key", _KEY), ("organization", "o1"), ("team_member", "None:u1"), ("end_user", "e1")],
+        backend,
+    )
+    assert observed[0] is None
