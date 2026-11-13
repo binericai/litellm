@@ -13,8 +13,17 @@ from litellm.integrations.custom_logger_v2.call import CallContext
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.outcomes import Abort
 from litellm.proxy import proxy_server
+from litellm.models.budget import LiteLLM_BudgetTable
+from litellm.models.tag import LiteLLM_TagTable
+from litellm.models.team_membership import LiteLLM_TeamMembership
 from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable, UserAPIKeyAuth
-from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+from litellm.proxy.common_utils.user_api_key_cache import (
+    UserApiKeyCache,
+    model_access_group_cache_key,
+    project_cache_key,
+    tag_cache_key,
+    team_membership_reservation_cache_key,
+)
 from litellm.proxy.spend_tracking import native_budgets
 from litellm.proxy.spend_tracking.budget_reservation import (
     estimate_request_max_cost,
@@ -28,6 +37,7 @@ from litellm.proxy.spend_tracking.budget_reservation import (
 from litellm.proxy.utils import ProxyLogging, hash_token
 from litellm.redis.stores.connection import connect
 from litellm.redis.stores.spend_counters import SpendCounterStore
+from litellm.types.proxy.model_access_group_budget import ModelAccessGroupBudget
 
 ROUTE: Final = "/chat/completions"
 BODY: Final = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 1000}
@@ -359,3 +369,146 @@ async def test_a_throttled_key_holds_only_its_other_counters_on_both_sides(store
     ]
     assert held == [[TEAM], [TEAM]]
     assert native.counters == python.counters
+
+
+class _AnyDatabase:
+    pass
+
+
+ORG: Final = "spend:org:org-1"
+PROJECT: Final = "spend:project:project-1"
+MAG: Final = "spend:model_access_group:mag-1"
+MEMBER: Final = "spend:team_member:user-1:team-1"
+TAG: Final = "spend:tag:tag-1"
+KEY_WINDOW: Final = f"{KEY}:window:1d"
+
+
+@dataclass(frozen=True, slots=True)
+class Kind:
+    counter: str
+    entity_type: str
+    token: Mapping[str, object] = field(default_factory=dict)
+    cache: Mapping[str, object] = field(default_factory=dict)
+    body: Mapping[str, object] = field(default_factory=dict)
+    member: bool = False
+
+
+def _budget(max_budget: float) -> LiteLLM_BudgetTable:
+    return LiteLLM_BudgetTable(max_budget=max_budget)
+
+
+KIND_BUDGET: Final = 10.0
+KINDS: Final[Mapping[str, Kind]] = {
+    "organization": Kind(
+        ORG,
+        "Organization",
+        token={"org_id": "org-1"},
+        cache={"org_id:org-1:with_budget": {"litellm_budget_table": {"max_budget": KIND_BUDGET}, "spend": 0.0}},
+    ),
+    "project": Kind(
+        PROJECT,
+        "Project",
+        token={"project_id": "project-1"},
+        cache={project_cache_key("project-1"): {"litellm_budget_table": {"max_budget": KIND_BUDGET}, "spend": 0.0}},
+    ),
+    "model_access_group": Kind(
+        MAG,
+        "Model access group",
+        token={"matched_model_access_groups": ["mag-1"]},
+        cache={
+            model_access_group_cache_key("mag-1"): ModelAccessGroupBudget(
+                access_group_name="mag-1", max_budget=KIND_BUDGET
+            )
+        },
+    ),
+    "team_member": Kind(
+        MEMBER,
+        "TeamMember",
+        cache={
+            team_membership_reservation_cache_key(user_id="user-1", team_id="team-1"): LiteLLM_TeamMembership(
+                user_id="user-1", team_id="team-1", litellm_budget_table=_budget(KIND_BUDGET)
+            )
+        },
+        member=True,
+    ),
+    "tag": Kind(
+        TAG,
+        "Tag",
+        cache={tag_cache_key("tag-1"): LiteLLM_TagTable(tag_name="tag-1", litellm_budget_table=_budget(KIND_BUDGET))},
+        body={"metadata": {"tags": ["tag-1"]}},
+    ),
+    "key_window": Kind(
+        KEY_WINDOW,
+        "Key",
+        token={"budget_limits": [{"budget_duration": "1d", "max_budget": KIND_BUDGET}]},
+    ),
+}
+KIND_SPEND: Final[Mapping[str, float]] = {
+    "fits": 1.0,
+    "shrinks_to_what_is_left": KIND_BUDGET - ESTIMATE / 3,
+    "at_max_refuses": KIND_BUDGET,
+}
+
+
+async def _kind_admit(store: SpendCounterStore, kind: Kind, spend: float, native: bool) -> Admitted:
+    cache: Final = UserApiKeyCache()
+    for key, value in kind.cache.items():
+        await cache.async_set_cache(key=key, value=value)
+    token: Final = UserAPIKeyAuth(
+        api_key=API_KEY,
+        token=TOKEN,
+        max_budget=100.0,
+        spend=0.0,
+        user_id="user-1",
+        team_id="team-1" if kind.member else None,
+        **kind.token,  # pyright: ignore[reportArgumentType]  # each kind sets the identity fields it reads
+    )
+    arguments: Final = {
+        "request_body": {**BODY, **kind.body},
+        "route": ROUTE,
+        "llm_router": None,
+        "valid_token": token,
+        "team_object": LiteLLM_TeamTable(team_id="team-1") if kind.member else None,
+        "user_object": LiteLLM_UserTable(user_id="user-1") if kind.member else None,
+        "prisma_client": _AnyDatabase(),
+        "user_api_key_cache": cache,
+        "proxy_logging_obj": ProxyLogging(user_api_key_cache=DualCache()),
+    }
+    store.flush_local()
+    native_budgets._installed.clear()  # pyright: ignore[reportPrivateUsage]  # the reference run has no native owner
+    logger: Final = _install_native_owner(store) if native else None
+    store.set_local(KEY, 1.0)
+    store.set_local(kind.counter, spend)
+    try:
+        reservation: Final = await reserve_budget_for_request(**arguments)  # pyright: ignore[reportArgumentType]  # the argument table is typed per key above
+    except litellm.BudgetExceededError as error:
+        return Admitted(reservation=None, refusal=error, counters=_snapshot(store))
+    if logger is None:
+        return Admitted(reservation=reservation, refusal=None, counters=_snapshot(store))
+    outcome: Final = await logger.run_native(
+        Hook.pre_call,
+        frozenset({Field.deprecated_kwargs}),
+        type("View", (), {Field.deprecated_kwargs.value: dict(BODY)})(),
+        CallContext[object](hook=Hook.pre_call, call=None, state=None),
+    )
+    return Admitted(
+        reservation=reservation if reservation is not None and "native_call_id" in reservation else None,
+        refusal=outcome.exception if isinstance(outcome, Abort) else None,
+        counters=_snapshot(store),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spend", KIND_SPEND.values(), ids=KIND_SPEND.keys())
+@pytest.mark.parametrize("kind", KINDS.values(), ids=KINDS.keys())
+async def test_every_counter_kind_admits_like_python(store: SpendCounterStore, kind: Kind, spend: float) -> None:
+    python: Final = await _kind_admit(store, kind, spend, native=False)
+    native: Final = await _kind_admit(store, kind, spend, native=True)
+
+    held: Final = (
+        [] if python.reservation is None else [entry["entity_type"] for entry in python.reservation["entries"]]  # pyright: ignore[reportGeneralTypeIssues]  # the entries list the reservation carries
+    )
+    assert python.refusal is not None or held.count(kind.entity_type) >= 1, "the flag-off run must reserve this kind"
+    assert _refusal_fields(native.refusal) == _refusal_fields(python.refusal)
+    assert native.counters == python.counters
+    assert _entries(native.reservation) == _entries(python.reservation)
