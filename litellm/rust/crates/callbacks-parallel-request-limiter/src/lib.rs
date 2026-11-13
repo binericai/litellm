@@ -12,7 +12,8 @@ pub use engine::{
 };
 pub use limiter::{
     CallIdFacts, Candidate, FailureFacts, ModelFacts, NAME, ParallelRequestLimiter, PolicyFacts,
-    PostCallFailureFacts, PreCallFacts, PtuFacts, SuccessFacts, TargetFacts, manifest,
+    PostCallFailureFacts, PreCallFacts, PriorResponse, PtuFacts, SuccessFacts, TargetFacts,
+    manifest,
 };
 pub use ptu::{Ceiling, Usage, settlement_tokens};
 pub use refusal::{PTU_SHARE_EXCEEDED, RATE_LIMITED, UNVERIFIABLE};

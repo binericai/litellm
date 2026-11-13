@@ -6,7 +6,7 @@ use std::sync::{
 use litellm_callbacks::Abort;
 use litellm_callbacks_parallel_request_limiter::{
     Code, Descriptor, Engine, LimiterState, ParallelRequestLimiter, PostCallFailureFacts,
-    PreCallFacts, Settings, SuccessFacts, TargetFacts,
+    PreCallFacts, PriorResponse, Settings, SuccessFacts, TargetFacts,
 };
 use litellm_redis_store::{
     Number,
@@ -245,4 +245,39 @@ async fn the_statuses_reach_the_logging_payload_headers() {
     assert_eq!(response.overall, Code::Ok);
     let headers = litellm_callbacks_parallel_request_limiter::header_map(&response.statuses);
     assert_eq!(headers["x-ratelimit-api_key-remaining-requests"], json!(4));
+}
+
+#[rstest]
+#[case::no_descriptors_keep_it(json!([]), false, vec!["dynamic"])]
+#[case::a_reused_slot_keeps_it(json!([{"key": "api_key", "value": "k", "rate_limit": {"requests_per_unit": 5}}]), true, vec!["dynamic"])]
+#[case::a_reused_slot_extends_it_with_tokens(json!([{"key": "api_key", "value": "k", "rate_limit": {"tokens_per_unit": 500}}]), true, vec!["dynamic", "api_key"])]
+#[case::a_fresh_first_pass_replaces_it(json!([{"key": "api_key", "value": "k", "rate_limit": {"requests_per_unit": 5}}]), false, vec!["api_key"])]
+#[tokio::test]
+async fn the_response_another_limiter_stored_is_kept_like_the_python_stash(
+    #[case] limits: serde_json::Value,
+    #[case] reuses_request_slot: bool,
+    #[case] keys: Vec<&str>,
+) {
+    let (limiter, _, _) = limiter(true);
+    let prior: PriorResponse = serde_json::from_value(json!({
+        "overall_code": "OK",
+        "statuses": [{"code": "OK", "current_limit": 9, "limit_remaining": 8,
+                      "rate_limit_type": "requests", "descriptor_key": "dynamic"}],
+    }))
+    .unwrap();
+    let state = Arc::new(LimiterState::default());
+    let admitted = PreCallFacts {
+        reuses_request_slot,
+        prior_response: Some(prior),
+        ..facts(descriptors(limits), Some(10))
+    };
+    assert_eq!(limiter.pre_call(&state, admitted, None).await, None);
+    let statuses = state.snapshot().rate_limit_response.unwrap().statuses;
+    assert_eq!(
+        statuses
+            .iter()
+            .map(|status| status.descriptor_key.as_str())
+            .collect::<Vec<_>>(),
+        keys
+    );
 }

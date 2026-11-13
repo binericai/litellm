@@ -354,6 +354,21 @@ impl NativeParallelRequestLimiter {
         state.0.stash().parallel_slot.is_some()
     }
 
+    fn take_parallel_slot(
+        &self,
+        state: PyRef<'_, NativeParallelRequestLimiterState>,
+    ) -> Option<(String, Vec<(String, String)>)> {
+        state.0.stash().parallel_slot.take().map(|slot| {
+            (
+                slot.slot_id,
+                slot.gauges
+                    .into_iter()
+                    .map(|scope| (scope.descriptor, scope.value))
+                    .collect(),
+            )
+        })
+    }
+
     #[pyo3(signature = (state, facts, request = None))]
     fn settle_success<'py>(
         &self,

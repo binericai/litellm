@@ -22,6 +22,9 @@ from litellm.integrations.custom_logger_v2.native import NativeState
 from litellm.integrations.custom_logger_v2.outcomes import Abort
 from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
+    _PROXY_DynamicRateLimitHandlerV3,  # pyright: ignore[reportPrivateUsage]  # the class has no public alias
+)
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PARALLEL_REQUEST_SLOT_TTL_SECONDS,
     PROXY_MaxParallelRequestsHandler_v3,
@@ -73,6 +76,7 @@ class Side:
     datas: dict[int, dict[str, object]] = field(default_factory=dict)
     responses: dict[int, ModelResponse] = field(default_factory=dict)
     states: dict[int, object] = field(default_factory=dict)
+    dynamic: _PROXY_DynamicRateLimitHandlerV3 | None = None
 
 
 def _free_port() -> int:
@@ -132,6 +136,39 @@ def _side(clock: Clock, native: bool, port: int | None = None, ceiling: PTUTeamC
     )
 
 
+def _dynamic(
+    monkeypatch: pytest.MonkeyPatch, clock: Clock, native: bool, port: int | None
+) -> _PROXY_DynamicRateLimitHandlerV3:
+    from litellm import Router
+    from litellm.types.utils import PriorityReservationSettings
+
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "gpt-4o",
+                "litellm_params": {"model": "gpt-4o", "api_key": "k", "api_base": "b", "tpm": 400, "rpm": 6},
+            }
+        ]
+    )
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr("litellm.priority_reservation", {"high": 0.5, "low": 0.5})
+    monkeypatch.setattr(
+        "litellm.priority_reservation_settings",
+        PriorityReservationSettings(saturation_threshold=0.3, saturation_check_cache_ttl=0),
+    )
+    monkeypatch.setattr("litellm.callbacks", ["dynamic_rate_limiter_v3"])
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true" if native else "false")
+    handler: Final = _PROXY_DynamicRateLimitHandlerV3(
+        DualCache() if port is None else DualCache(redis_cache=RedisCache(host="127.0.0.1", port=port)),
+        time_provider=clock.now,
+    )
+    monkeypatch.delenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER")
+    assert (handler.v3_limiter.native_companion is not None) == native
+    handler.update_variables(llm_router=router)
+    return handler
+
+
 def _outcome(error: BaseException | None) -> object:
     if error is None:
         return None
@@ -176,6 +213,8 @@ async def _admit(side: Side, index: int, request: Request) -> object:
     side.datas[index] = data
     cache: Final = DualCache()
     try:
+        if side.dynamic is not None:
+            await side.dynamic.async_pre_call_hook(request.auth, cache, data, request.call_type)  # pyright: ignore[reportArgumentType]  # the call types are the CallTypesLiteral values
         if side.native is not None:
             request_state = side.native.request_state
             assert request_state is not None
@@ -230,6 +269,8 @@ async def _end(side: Side, index: int, request: Request) -> object:
     kwargs: Final = _logging_kwargs(index, request)
     match request.end:
         case "success":
+            if side.dynamic is not None:
+                await side.dynamic.async_post_call_success_hook(data, request.auth, response)
             if side.native is not None:
                 await side.native.run_native(
                     Hook.post_call_success,
@@ -248,8 +289,12 @@ async def _end(side: Side, index: int, request: Request) -> object:
                     _ctx(side, index, Hook.log_prepare, request),
                 )
             await side.limiter.async_logging_hook(kwargs, response, request.call_type)
+            if side.dynamic is not None:
+                await side.dynamic.async_log_success_event(kwargs, response, None, None)
             await side.limiter.async_log_success_event(kwargs, response, None, None)
         case "failure" | "partial_failure":
+            if side.dynamic is not None:
+                await side.dynamic.async_log_failure_event(kwargs, None, None, None)
             await side.limiter.async_log_failure_event(kwargs, None, None, None)
         case "proxy_failure":
             if side.native is not None:
@@ -279,11 +324,12 @@ def _run(
 
 def _snapshot(side: Side, scopes: Sequence[tuple[str, str]]) -> object:
     rows: Final[list[object]] = []
-    for key, value in scopes:
+    stores: Final = (side.limiter.rate_limits,) + (
+        () if side.dynamic is None else (side.dynamic.v3_limiter.rate_limits,)
+    )
+    for (key, value), store in ((scope, store) for scope in scopes for store in stores):
         scope = RateLimitScope(key, value)
-        local = side.limiter.rate_limits.local(
-            (scope.window, scope.counter("requests"), scope.counter("tokens"), scope.gauge)
-        )
+        local = store.local((scope.window, scope.counter("requests"), scope.counter("tokens"), scope.gauge))
         gauge = local[3]
         remote = (
             None
@@ -315,10 +361,14 @@ async def _differential(
     backend: tuple[int | None, int | None],
     between: Callable[[Clock], None] | None = None,
     ceiling: PTUTeamCeiling | None = None,
+    dynamic: pytest.MonkeyPatch | None = None,
 ) -> list[object]:
     clock: Final = Clock()
     python: Final = _side(clock, native=False, port=backend[0], ceiling=ceiling)
     native: Final = _side(clock, native=True, port=backend[1], ceiling=ceiling)
+    if dynamic is not None:
+        python.dynamic = _dynamic(dynamic, clock, native=False, port=backend[0])
+        native.dynamic = _dynamic(dynamic, clock, native=True, port=backend[1])
     observed: Final[list[object]] = []
     held: Final[list[tuple[int, Request]]] = []
     for index, request in enumerate(requests):
@@ -701,15 +751,48 @@ async def test_the_dynamic_limiters_private_limiter_runs_on_the_engine_when_the_
     assert _PROXY_DynamicRateLimitHandlerV3(DualCache()).v3_limiter.native_companion is None
 
 
+def _with_dynamic(
+    sides: tuple[Side, Side], monkeypatch: pytest.MonkeyPatch, clock: Clock, backend: tuple[int | None, int | None]
+) -> tuple[Side, Side]:
+    sides[0].dynamic = _dynamic(monkeypatch, clock, native=False, port=backend[0])
+    sides[1].dynamic = _dynamic(monkeypatch, clock, native=True, port=backend[1])
+    return sides
+
+
+_DYNAMIC_SCOPES: Final = [("api_key", _KEY), ("model_saturation_check", "gpt-4o"), ("priority_model", "gpt-4o:high")]
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "failure", "partial_failure", "proxy_failure", "disconnect"))
+async def test_with_the_dynamic_limiter_registered_the_native_owns_the_request_and_limits_like_python(
+    end: str, backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    auth: Final = UserAPIKeyAuth(
+        api_key=_KEY, metadata={"priority": "high"}, rpm_limit=20, tpm_limit=3000, max_parallel_requests=2
+    )
+    observed: Final = await _differential(
+        [Request(auth, {**_CHAT, "max_tokens": 20}, end=end, held=index % 3 == 0) for index in range(7)],
+        _DYNAMIC_SCOPES,
+        backend,
+        dynamic=monkeypatch,
+    )
+    assert observed.count(None) < len(observed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_dynamic", (False, True))
 @pytest.mark.parametrize("tool_limit", (5, 1))
 async def test_a_nested_mcp_tool_call_reuses_the_requests_slot_like_python(
-    tool_limit: int, backend: tuple[int | None, int | None]
+    tool_limit: int, with_dynamic: bool, backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock: Final = Clock()
-    sides: Final = (_side(clock, native=False, port=backend[0]), _side(clock, native=True, port=backend[1]))
+    built: Final = (_side(clock, native=False, port=backend[0]), _side(clock, native=True, port=backend[1]))
+    sides: Final = _with_dynamic(built, monkeypatch, clock, backend) if with_dynamic else built
     outer: Final = Request(
-        _auth(max_parallel_requests=1, rpm_limit=tool_limit, tpm_limit=3000), {**_CHAT, "max_tokens": 20}
+        UserAPIKeyAuth(
+            api_key=_KEY, metadata={"priority": "high"}, max_parallel_requests=1, rpm_limit=tool_limit, tpm_limit=3000
+        ),
+        {**_CHAT, "max_tokens": 20},
     )
     tool: Final = Request(outer.auth, _CHAT, call_type="call_mcp_tool", nested=True)
     for side in sides:
@@ -719,7 +802,7 @@ async def test_a_nested_mcp_tool_call_reuses_the_requests_slot_like_python(
     admitted: Final = [(await _run(side, 0, _admit, outer), await _run(side, 1, _admit, tool)) for side in sides]
     assert admitted[0] == admitted[1]
     assert (admitted[0][1] is None) == (tool_limit > 1)
-    scopes: Final = [("api_key", _KEY)]
+    scopes: Final = _DYNAMIC_SCOPES
     assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
     ended: Final = [(await _run(side, 1, _end, tool), await _run(side, 0, _end, outer)) for side in sides]
     assert ended[0] == ended[1]

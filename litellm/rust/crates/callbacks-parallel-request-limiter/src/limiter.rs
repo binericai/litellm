@@ -18,7 +18,7 @@ use crate::{
     ptu::{Ceiling, Usage, settlement_tokens},
     refusal,
     state::{IoReservation, LimiterState, RateLimitedModel, Stash},
-    status::{WindowIdentity, header_map},
+    status::{Code, Response, Status, WindowIdentity, header_map},
 };
 
 pub const NAME: &str = "parallel_request_limiter_v3";
@@ -72,6 +72,24 @@ pub struct PreCallFacts {
     pub io_estimate: Option<Estimate>,
     #[serde(default)]
     pub reuses_request_slot: bool,
+    #[serde(default)]
+    pub prior_response: Option<PriorResponse>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriorResponse {
+    pub overall_code: Code,
+    pub statuses: Vec<Status>,
+}
+
+impl From<PriorResponse> for Response {
+    fn from(prior: PriorResponse) -> Self {
+        Self {
+            overall: prior.overall_code,
+            statuses: prior.statuses,
+            windows: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +312,7 @@ impl ParallelRequestLimiter {
             stash.first_pass_admitted = false;
             stash.io_reached = false;
             stash.ptu_ceiling = facts.ptu_ceiling.clone();
+            stash.rate_limit_response = facts.prior_response.clone().map(Response::from);
             if let Some(call_id) = &facts.call_id {
                 stash.owner_call_id = Some(call_id.clone());
             }

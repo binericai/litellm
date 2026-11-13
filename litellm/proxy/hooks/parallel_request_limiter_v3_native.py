@@ -127,15 +127,6 @@ def _auth(data: Mapping[str, object]) -> UserAPIKeyAuth | None:
     return None
 
 
-def _dynamic_limiter_registered() -> bool:
-    import litellm
-    from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
-        _PROXY_DynamicRateLimitHandlerV3,  # pyright: ignore[reportPrivateUsage]  # the class has no public alias
-    )
-
-    return any(isinstance(callback, _PROXY_DynamicRateLimitHandlerV3) for callback in litellm.callbacks)
-
-
 def limiter_state(value: object) -> "NativeParallelRequestLimiterState | None":
     from litellm.rust_bridge._native import NativeParallelRequestLimiterState
 
@@ -211,16 +202,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             auth is None
             or call_type in _UNSUPPORTED_CALL_TYPES
             or self.limiter.get_rate_limiter_for_call_type(call_type) is not None
-            or _dynamic_limiter_registered()
-            or (
-                stash is not None
-                and stash.native_state is None
-                and (
-                    stash.rate_limit_response is not None
-                    or stash.parallel_slot is not None
-                    or stash.reserved_tokens != 0
-                )
-            )
+            or (stash is not None and stash.native_state is None and stash.call_type is not None)
             or not isinstance(data.get("litellm_call_id"), str)
         )
 
@@ -235,6 +217,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             return None
         held: Final = get_request_stash()
         shared: Final = None if held is None else limiter_state(held.native_state)
+        prior_response: Final = None if held is None else held.rate_limit_response
         state: Final = (
             shared
             or (limiter_state(ctx.state.handle) if isinstance(ctx.state, NativeState) else None)
@@ -332,6 +315,9 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             "ptu_estimate": ptu_estimate,
             "io_estimate": io_estimate,
             "reuses_request_slot": reuses_request_slot,
+            "prior_response": None
+            if prior_response is None
+            else {"overall_code": prior_response["overall_code"], "statuses": list(prior_response["statuses"])},
         }
         outcome: Final = await self._call(Hook.pre_call, facts, ctx, state=state, request=pre_call_request())
         if reserves and self.bridge.first_pass_admitted(state):
