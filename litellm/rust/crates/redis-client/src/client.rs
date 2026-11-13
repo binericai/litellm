@@ -159,7 +159,8 @@ impl RedisClient {
         Pipeline::new(self.0.namespace.clone())
     }
 
-    pub(crate) fn namespace(&self) -> &Namespace {
+    /// The prefix keys get, which a channel name has to carry itself.
+    pub fn namespace(&self) -> &Namespace {
         &self.0.namespace
     }
 
