@@ -6854,11 +6854,11 @@ async def virtual_key_max_budget_check(
                 "throttle_pct": _budget_exceeded_throttle_pct(valid_token),
             }
         )
-        if native is not None:
-            if native.decision == "throttle" and _apply_budget_exceeded_throttle(valid_token):
-                return
+        if native is not None and native.decision != "throttle":
             if native.refused:
                 raise native.error()
+            return
+        if native is not None and _apply_budget_exceeded_throttle(valid_token):
             return
         if math.isfinite(valid_token.max_budget) and spend >= valid_token.max_budget:
             if _apply_budget_exceeded_throttle(valid_token):
