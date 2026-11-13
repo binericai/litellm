@@ -1274,3 +1274,38 @@ async def test_requests_without_a_request_scope_keep_their_stash_through_the_rea
     assert python[4] == ["opus", {"x-litellm-model-steered-from": "luna"}], python[4]
     assert python[6][1] == "InternalServerError", python[6]
     assert [entry[5][3] for entry in python[9::2]] == [None, None, 30, 30], python
+
+
+async def test_sync_sdk_calls_settle_nothing_like_python(monkeypatch: pytest.MonkeyPatch, isolated: Clock) -> None:
+    _borrowing(monkeypatch, 0.0)
+    router: Final = _router(("sync", 1000, None))
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+    team: Final = _key("team", team_id="team-y", team_metadata={"model_tpm_limit": {"sync": 400}})
+    scopes: Final = [("model_saturation_check", "sync"), ("model_per_team_saturated", "team-y:sync")]
+    transcripts: Final[list[list[object]]] = []
+    for build in (PythonSide, NativeSide):
+        isolated.current = datetime(2026, 11, 13, 12, 0, 0)
+        side = build(router, isolated)
+        for name in ("success_callback", "failure_callback", "_async_success_callback", "_async_failure_callback"):
+            monkeypatch.setattr(litellm, name, [])
+        monkeypatch.setattr(litellm, "callbacks", [side.handler if isinstance(side, PythonSide) else side.logger])
+        request = Request(team, "sync", "y0")
+
+        async def lifecycle(side: Side = side, request: Request = request) -> object:
+            outcome = await side.pre_call(request.data(), request.call_type)
+            await asyncio.to_thread(
+                router.completion,
+                model=request.model,
+                messages=list(request.messages),
+                litellm_call_id=request.call_id,
+                metadata={"user_api_key_auth": team, "user_api_key_team_id": team.team_id},
+                mock_response="a sync sdk call",
+            )
+            await _settled()
+            return outcome
+
+        outcome = await asyncio.create_task(lifecycle(), context=contextvars.Context())
+        transcripts.append([outcome, await _counters(side, scopes)])
+    python, native = transcripts
+    assert native == python
+    assert python[1][3][3] is not None, python

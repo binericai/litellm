@@ -67,7 +67,7 @@ from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate
 from litellm.proxy.request_auth_context import REQUEST_AUTH
 from litellm.proxy.utils import InternalUsageCache
 from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, CounterIncrement, RateLimitCounter, RateLimitScope
-from litellm.types.utils import Usage
+from litellm.types.utils import CallTypes, Usage
 
 if TYPE_CHECKING:
     from litellm.rust_bridge._native import NativeModelCapacity, NativeModelCapacityState
@@ -81,6 +81,8 @@ _METADATA_BUCKETS: Final = ("metadata", "litellm_metadata")
 RATE_LIMIT_KIND: Final = "model_capacity_rate_limit"
 RERAISE_KIND: Final = "model_capacity_reraise"
 _TOKENS: Final = count(1)
+_CALL_TYPES: Final = frozenset(call_type.value for call_type in CallTypes)
+_SYNC_CALL_TYPES: Final = frozenset(name for name in _CALL_TYPES if f"a{name}" in _CALL_TYPES)
 
 
 def native_enabled() -> bool:
@@ -670,6 +672,14 @@ class _StashedNative:
         return self.capacity.handle(hook, fields, call, None if live is None else live.state)
 
 
+def _sync_sdk_call(kwargs: Mapping[str, object]) -> bool:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    return kwargs.get("call_type") in _SYNC_CALL_TYPES and Logging.is_sync_litellm_request(
+        as_str_mapping(kwargs.get("litellm_params")) or {}
+    )
+
+
 def _request_stash(hook: Hook, data: Mapping[str, object] | None) -> RequestRateLimiterStash | None:
     if data is None:
         return None
@@ -708,6 +718,8 @@ class NativeDynamicRateLimiter(NativeLogger):
         self, hook: Hook, reads: frozenset[Field], view: object, ctx: CallContext[object]
     ) -> Patch | Abort | None:
         data: Final = as_str_mapping(getattr(view, Field.deprecated_kwargs.value, None))
+        if hook is Hook.attempt_ended and data is not None and _sync_sdk_call(data):
+            return None
         live: Final = LiveRequest(
             hook=hook,
             data=data if hook is not Hook.attempt_ended else None,
