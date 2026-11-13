@@ -2,7 +2,7 @@ import copy
 import re
 import time
 from collections.abc import Callable, Generator, Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Final
 
@@ -30,7 +30,7 @@ from litellm.integrations.prometheus_helpers.native_store import (
     with_native_companions,
 )
 from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable, Member, UserAPIKeyAuth
 from litellm.rust_bridge import _native
 
 START: Final = datetime(2026, 11, 13, 9, 0, 0)  # noqa: DTZ001  # callback timestamps use the legacy naive contract
@@ -268,6 +268,7 @@ async def _drained() -> None:
 
 async def _drive(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setattr("time.time", lambda: 1_763_000_000.25)
+    monkeypatch.setattr("litellm.integrations.prometheus.datetime", _FixedDatetime)
     if native:
         monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
     else:
@@ -340,7 +341,88 @@ async def _direct_calls(logger: PrometheusLogger) -> list[str]:
         litellm.RateLimitError(message="slow down", llm_provider="openai", model="gpt-4o-mini"),
         UserAPIKeyAuth(api_key="hashed", user_id="u", team_id="team-1"),
     )
-    return outcomes
+    return outcomes + _budget_calls(logger) + [await _counts(logger)]
+
+
+class _FixedClock(type):
+    def __instancecheck__(cls, instance: object) -> bool:
+        return isinstance(instance, datetime)
+
+
+class _FixedDatetime(datetime, metaclass=_FixedClock):
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> datetime:
+        if tz is None:
+            return START
+        return datetime(2026, 11, 13, 9, 0, 0, tzinfo=timezone.utc).astimezone(tz)
+
+
+def _budget_calls(logger: PrometheusLogger) -> list[str]:
+    aware_reset: Final = datetime(2026, 11, 20, 0, 0, 0, tzinfo=timezone.utc)
+    shifted_reset: Final = datetime(2026, 11, 14, 3, 30, 0, tzinfo=timezone(timedelta(hours=5)))
+    naive_reset: Final = START + timedelta(hours=7, seconds=1)
+    team: Final = LiteLLM_TeamTable(
+        team_id="team-1",
+        team_alias="Team One",
+        spend=4.5,
+        max_budget=10.0,
+        budget_reset_at=aware_reset,
+        members_with_roles=[Member(user_id="u", role="admin"), Member(user_id="v", role="user")],
+    )
+    calls: Final = (
+        lambda: logger._set_team_budget_metrics(team),
+        lambda: logger._set_team_budget_metrics(LiteLLM_TeamTable(team_id="team-2", spend=None)),
+        lambda: logger.set_team_members_metric(team),
+        lambda: logger._set_org_budget_metrics("org-1", "", 2.0, None, naive_reset),
+        lambda: logger._set_org_budget_metrics("org-2", "Org", 1.0, 3.0, shifted_reset),
+        lambda: logger._set_key_budget_metrics(
+            UserAPIKeyAuth(token="hashed-1", key_alias="k", spend=1.25, max_budget=None, budget_reset_at=naive_reset)
+        ),
+        lambda: logger._set_key_budget_metrics(
+            UserAPIKeyAuth(token="hashed-2", spend=0.5, max_budget=2.0, budget_reset_at=aware_reset)
+        ),
+        lambda: logger._set_user_budget_metrics(
+            LiteLLM_UserTable(
+                user_id="u", user_email="u@example.com", spend=3.0, max_budget=5.0, budget_reset_at=aware_reset
+            )
+        ),
+        lambda: logger._set_user_budget_metrics(LiteLLM_UserTable(user_id="v", spend=0.0)),
+        lambda: logger._set_customer_budget_metrics("cust-1", 1.0, 4.0, aware_reset),
+        lambda: logger._set_customer_budget_metrics("cust-2", 2.0, None, None),
+        lambda: logger._set_customer_budget_metrics("cust-3", 0.5, 1.0, naive_reset),
+    )
+    return [_outcome(call) for call in calls]
+
+
+class _Counted:
+    def __init__(self, repository: object) -> None:
+        self.repository = repository
+
+    async def count(self) -> int:
+        return 7 if isinstance(self.repository, _Users) else 3
+
+
+class _Users:
+    def __init__(self, _prisma: object) -> None:
+        pass
+
+    async def count_billable_users(self) -> int:
+        return 5
+
+
+class _Teams:
+    def __init__(self, _prisma: object) -> None:
+        pass
+
+
+async def _counts(logger: PrometheusLogger) -> str:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("litellm.proxy.proxy_server.prisma_client", object())
+        patch.setattr("litellm.integrations.prometheus._paginated_table", _Counted)
+        patch.setattr("litellm.integrations.prometheus.UserRepository", _Users)
+        patch.setattr("litellm.integrations.prometheus.TeamRepository", _Teams)
+        await logger._initialize_user_and_team_count_metrics()
+    return "counted"
 
 
 def _failure(index: int, exception: Exception) -> dict[str, object]:

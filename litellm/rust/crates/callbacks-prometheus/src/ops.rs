@@ -477,23 +477,46 @@ impl Ops<'_> {
             ),
             other => return Err(OpError::value(format!("unknown budget entity {other}"))),
         };
-        let values = values_of(self.facts);
+        let context = values_of(self.facts).context(self.settings);
+        let customer = entity == "customer";
+        let mut labels = self.emit().labels(remaining, &context);
+        if customer {
+            let end_user = labels.names.iter().position(|name| name == "end_user");
+            if end_user
+                .and_then(|position| labels.values[position].as_ref())
+                .is_none()
+            {
+                return Ok(());
+            }
+        }
         let max_budget = field(self.facts, "max_budget");
         let spend = field(self.facts, "spend");
-        self.factory(
+        self.emit().record(
             remaining,
-            &values,
+            &labels,
             Op::Set(remaining_budget(max_budget, spend)?),
-            false,
+            customer,
         )?;
         if !max_budget.is_null() {
-            self.factory(max, &values, Op::Set(py_float(max_budget)?), false)?;
+            if !customer {
+                labels = self.emit().labels(max, &context);
+            }
+            self.emit()
+                .record(max, &labels, Op::Set(py_float(max_budget)?), customer)?;
         }
         if let Some(reset_at) = self.moment("budget_reset_at")? {
             let now = self
                 .moment("now")?
                 .ok_or_else(|| OpError::value("now is required"))?;
-            self.factory(hours, &values, Op::Set(hours_until(reset_at, now)?), false)?;
+            if !customer && entity != "api_key" {
+                labels = self.emit().labels(hours, &context);
+            }
+            self.emit().record(
+                hours,
+                &labels,
+                Op::Set(hours_until(reset_at, now)?),
+                customer,
+            )?;
         }
         Ok(())
     }

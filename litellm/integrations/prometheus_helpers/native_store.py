@@ -106,7 +106,7 @@ def json_safe(value: object) -> object:
     return {"$py": str(value)}
 
 
-def _moment(value: object) -> Mapping[str, object] | None:
+def moment(value: object) -> Mapping[str, object] | None:
     if not isinstance(value, datetime):
         return None
     aware: Final = value.utcoffset() is not None
@@ -204,10 +204,10 @@ class AttemptFacts:
             ),
             "stream": json_safe(call.get("stream", False)),
             "times": {
-                "start_time": _moment(call.get("start_time")),
-                "end_time": _moment(call.get("end_time") or datetime.now()),  # noqa: DTZ005  # callback timestamps use the legacy naive contract
-                "api_call_start_time": _moment(call.get("api_call_start_time")),
-                "completion_start_time": _moment(call.get("completion_start_time")),
+                "start_time": moment(call.get("start_time")),
+                "end_time": moment(call.get("end_time") or datetime.now()),  # noqa: DTZ005  # callback timestamps use the legacy naive contract
+                "api_call_start_time": moment(call.get("api_call_start_time")),
+                "completion_start_time": moment(call.get("completion_start_time")),
             },
             "exception": self._exception(call),
             "key": self._key(call, litellm_params, call.get("standard_logging_object")),

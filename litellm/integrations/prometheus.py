@@ -4728,16 +4728,25 @@ class PrometheusLogger(CustomLogger):
         try:
             # Get total user count
             total_users: Final = await _paginated_table(UserRepository(prisma_client)).count()
-            self.litellm_total_users_metric.set(total_users)
+            if self._native_store is not None:
+                self._native_store.op("counts", {"total_users": total_users})
+            else:
+                self.litellm_total_users_metric.set(total_users)
             verbose_logger.debug("Prometheus: set litellm_total_users to %s", total_users)
 
             billable_users: Final = await UserRepository(prisma_client).count_billable_users()
-            self.litellm_active_users_metric.set(billable_users)
+            if self._native_store is not None:
+                self._native_store.op("counts", {"active_users": billable_users})
+            else:
+                self.litellm_active_users_metric.set(billable_users)
             verbose_logger.debug("Prometheus: set litellm_active_users to %s", billable_users)
 
             # Get total team count
             total_teams: Final = await _paginated_table(TeamRepository(prisma_client)).count()
-            self.litellm_teams_count_metric.set(total_teams)
+            if self._native_store is not None:
+                self._native_store.op("counts", {"teams": total_teams})
+            else:
+                self.litellm_teams_count_metric.set(total_teams)
             verbose_logger.debug("Prometheus: set litellm_teams_count to %s", total_teams)
         except Exception as e:
             verbose_logger.exception("Error initializing user/team count metrics: %s", e)
@@ -4881,6 +4890,9 @@ class PrometheusLogger(CustomLogger):
             team=team.team_id,
             team_alias=team.team_alias or "",
         )
+        if self._native_store is not None:
+            self._native_budget_op("team", enum_values, team.spend, team.max_budget, team.budget_reset_at)
+            return
 
         _labels = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_remaining_team_budget_metric"),
@@ -4917,6 +4929,11 @@ class PrometheusLogger(CustomLogger):
             team=team.team_id,
             team_alias=team.team_alias or "",
         )
+        if self._native_store is not None:
+            self._native_store.op(
+                "team_members", {"values": enum_values.model_dump(), "count": len(team.members_with_roles)}
+            )
+            return
         _labels: Final = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_team_members_metric"),
             enum_values=enum_values,
@@ -5005,6 +5022,9 @@ class PrometheusLogger(CustomLogger):
             org_id=org_id,
             org_alias=org_alias,
         )
+        if self._native_store is not None:
+            self._native_budget_op("org", enum_values, spend, max_budget, budget_reset_at)
+            return
 
         _labels = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_remaining_org_budget_metric"),
@@ -5098,6 +5118,11 @@ class PrometheusLogger(CustomLogger):
         max_budget: float | None,
         budget_reset_at: datetime | None,
     ):
+        if self._native_store is not None:
+            self._native_budget_op(
+                "customer", UserAPIKeyLabelValues(end_user=end_user_id), spend, max_budget, budget_reset_at
+            )
+            return
         _labels: Final[dict[str, str | None]] = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_remaining_customer_budget_metric"),
             enum_values=UserAPIKeyLabelValues(end_user=end_user_id),
@@ -5143,6 +5168,15 @@ class PrometheusLogger(CustomLogger):
             hashed_api_key=user_api_key_dict.token,
             api_key_alias=user_api_key_dict.key_alias or "",
         )
+        if self._native_store is not None:
+            self._native_budget_op(
+                "api_key",
+                enum_values,
+                user_api_key_dict.spend,
+                user_api_key_dict.max_budget,
+                user_api_key_dict.budget_reset_at,
+            )
+            return
         _labels = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_remaining_api_key_budget_metric"),
             enum_values=enum_values,
@@ -5339,6 +5373,9 @@ class PrometheusLogger(CustomLogger):
             user_email=user.user_email or "",
             user_alias=user.user_alias or "",
         )
+        if self._native_store is not None:
+            self._native_budget_op("user", enum_values, user.spend, user.max_budget, user.budget_reset_at)
+            return
 
         _labels = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_remaining_user_budget_metric"),
@@ -5368,6 +5405,28 @@ class PrometheusLogger(CustomLogger):
             self.litellm_user_budget_remaining_hours_metric.labels(**_labels).set(
                 self._get_remaining_hours_for_budget_reset(budget_reset_at=user.budget_reset_at)
             )
+
+    def _native_budget_op(
+        self,
+        entity: Literal["team", "org", "api_key", "user", "customer"],
+        enum_values: UserAPIKeyLabelValues,
+        spend: float | None,
+        max_budget: float | None,
+        budget_reset_at: datetime | None,
+    ) -> None:
+        if self._native_store is None:
+            return
+        self._native_store.op(
+            "budget",
+            {
+                "entity": entity,
+                "values": enum_values.model_dump(),
+                "spend": spend,
+                "max_budget": max_budget,
+                "budget_reset_at": native_store.moment(budget_reset_at),
+                "now": None if budget_reset_at is None else native_store.moment(datetime.now(budget_reset_at.tzinfo)),
+            },
+        )
 
     def _get_remaining_hours_for_budget_reset(self, budget_reset_at: datetime) -> float:
         """
