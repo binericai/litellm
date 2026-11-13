@@ -6,6 +6,7 @@ import httpx
 from pydantic import JsonValue
 from typing_extensions import disjoint_base
 
+from litellm.integrations.custom_logger_v2.native import NativeHandle
 from litellm.redis.store_settings import RedisBreakerSettings, RedisStoreSettings
 from litellm.rust_bridge.execution import Execution
 from litellm.rust_bridge.public_call import NativeCall
@@ -452,6 +453,13 @@ class SpendRead:
 class PostCallSettlement:
     @property
     def settled(self) -> bool: ...
+
+@final
+class NativeBudgets:
+    def __new__(cls, spend_counters: NativeSpendCounters) -> NativeBudgets: ...
+    def callback(self) -> NativeHandle: ...
+    def reservation(self, call_id: str, /) -> Future[JsonValue]: ...
+    def settle(self, call_id: str, actual: float, finalize: bool, /) -> Future[bool]: ...
 
 @final
 class NativeSpendCounters:

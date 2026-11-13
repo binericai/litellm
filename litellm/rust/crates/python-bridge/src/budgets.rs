@@ -1,0 +1,47 @@
+use std::sync::Arc;
+
+use litellm_callbacks_budgets::{Budgets, Reservation, Shared};
+use litellm_callbacks_python::NativeCallback;
+use litellm_host_python::{Pythonized, run_async_value};
+use pyo3::{exceptions::PyRuntimeError, prelude::*};
+
+use crate::redis::store::spend_counters::NativeSpendCounters;
+
+#[pyclass(frozen, name = "NativeBudgets")]
+pub(crate) struct NativeBudgets(Arc<Budgets>);
+
+#[pymethods]
+impl NativeBudgets {
+    #[new]
+    fn new(spend_counters: PyRef<'_, NativeSpendCounters>) -> Self {
+        Self(Arc::new(Budgets::new(spend_counters.store())))
+    }
+
+    fn callback(&self) -> PyResult<NativeCallback> {
+        Ok(NativeCallback::new(Arc::new(Shared(Arc::clone(&self.0))))?)
+    }
+
+    fn reservation<'py>(&self, py: Python<'py>, call_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let budgets = Arc::clone(&self.0);
+        run_async_value(py, async move {
+            let reservation: Option<Reservation> = budgets.reservation(&call_id).await;
+            Ok(Pythonized(reservation))
+        })
+    }
+
+    fn settle<'py>(
+        &self,
+        py: Python<'py>,
+        call_id: String,
+        actual: f64,
+        finalize: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let budgets = Arc::clone(&self.0);
+        run_async_value(py, async move {
+            budgets
+                .settle(&call_id, actual, finalize)
+                .await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+}

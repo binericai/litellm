@@ -2370,6 +2370,10 @@ class ProxyLogging:
 
     def _init_litellm_callbacks(self, llm_router: Router | None = None):
         self._add_proxy_hooks(llm_router)
+        from litellm.proxy.proxy_server import spend_counter_store
+        from litellm.proxy.spend_tracking.native_budgets import install_native_budgets
+
+        install_native_budgets(spend_counter_store, litellm.callbacks)
         litellm.logging_callback_manager.add_litellm_callback(self.service_logging_obj)
 
         # Track string callbacks and their initialized instances so we can

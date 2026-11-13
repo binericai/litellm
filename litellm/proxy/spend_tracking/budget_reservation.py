@@ -46,6 +46,13 @@ from litellm.proxy.spend_tracking.input_tokens import (
     models_counted_for,
     openai_chat_pdf_file_tokens,
 )
+from litellm.proxy.spend_tracking.native_budgets import (
+    NATIVE_PLAN_KEY,
+    is_native_reservation,
+    native_budget_route,
+    native_budgets,
+    settle_native_reservation,
+)
 from litellm.proxy.spend_tracking.spend_counter_batch import PendingSpendIncrement, spend_counter_batch_scope
 from litellm.proxy.utils import PrismaClient, ProxyLogging
 from litellm.redis.stores.spend_counters import (
@@ -307,6 +314,21 @@ async def reserve_budget_for_request(
     # In that case we fall back to read-time enforcement only.
     if reservation_cost is None or reservation_cost <= 0:
         return None
+    if native_budgets() is not None and native_budget_route(route):
+        return await _native_budget_plan(
+            counters=counters,
+            valid_token=valid_token,
+            reservation_cost=reservation_cost,
+            input_token_counts=input_token_counts,
+            input_cost=estimate_request_input_cost(
+                request_body=request_body,
+                route=route,
+                llm_router=llm_router,
+                input_token_counts=input_token_counts,
+                path_params=path_params,
+            ),
+            fail_closed_budget_enforcement=fail_closed_budget_enforcement,
+        )
 
     applied_entries: Final[list[dict[str, float | str]]] = []
     try:
@@ -354,6 +376,54 @@ async def reserve_budget_for_request(
     return budget_reservation
 
 
+async def _native_budget_plan(
+    counters: Sequence[_BudgetCounter],
+    valid_token: UserAPIKeyAuth,
+    reservation_cost: float,
+    input_token_counts: Mapping[str, int],
+    input_cost: float | None,
+    fail_closed_budget_enforcement: bool,
+) -> dict | None:  # mutable-ok: settlement stamps finalized on the reservation it returns
+    with _counters_batch_scope(frozenset(counter.counter_key for counter in counters)):
+        reservable: Final = await _initialize_reservation_counters(
+            counters=counters,
+            fail_closed_budget_enforcement=fail_closed_budget_enforcement,
+        )
+    if not reservable:
+        return None
+    input_tokens: Final = max(input_token_counts.values(), default=None)
+    return {
+        NATIVE_PLAN_KEY: {
+            "counters": [
+                {
+                    "counter_key": counter.counter_key,
+                    "max_budget": counter.max_budget,
+                    "fallback_spend": counter.fallback_spend,
+                    "entity_type": counter.entity_type,
+                    "entity_id": counter.entity_id,
+                    "spend_log_entity_id": counter.spend_log_entity_id,
+                }
+                for counter in reservable
+            ],
+            "reservation_cost": float(reservation_cost),
+            "input_cost": float(input_cost or 0.0),
+            "input_tokens": input_tokens,
+            "throttle_counter": key_counter(str(valid_token.token))
+            if should_throttle_budget_exceeded(valid_token)
+            else None,
+            "fail_closed": fail_closed_budget_enforcement,
+            "lease_seconds": float(litellm.request_timeout),
+            "status_code": int(litellm.budget_exceeded_status_code),
+        },
+        "reserved_cost": 0.0,
+        "entries": [],
+        "finalized": False,
+        "callback_bound": False,
+        "input_cost": 0.0,
+        "input_tokens": input_tokens,
+    }
+
+
 async def reconcile_budget_reservation(
     budget_reservation: dict | None,
     actual_cost: float | None,
@@ -368,11 +438,18 @@ async def reconcile_budget_reservation(
 
     reserved_cost: Final = float(budget_reservation.get("reserved_cost") or 0.0)
     actual: Final = float(actual_cost or 0.0)
-    pending: Final = await _set_reserved_entries_actual_cost(
-        entries=budget_reservation.get("entries") or [],
-        actual_cost=actual,
-        default_reserved_cost=reserved_cost,
-        apply_consistent=apply_consistent,
+    native: Final = is_native_reservation(budget_reservation)
+    if native:
+        _ = await settle_native_reservation(budget_reservation, actual, finalize)
+    pending: Final = (
+        ()
+        if native
+        else await _set_reserved_entries_actual_cost(
+            entries=budget_reservation.get("entries") or [],
+            actual_cost=actual,
+            default_reserved_cost=reserved_cost,
+            apply_consistent=apply_consistent,
+        )
     )
     if finalize:
         budget_reservation["finalized"] = True
