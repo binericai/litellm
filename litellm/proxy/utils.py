@@ -3516,7 +3516,11 @@ class ProxyLogging:
             independent_snapshot(data) if needs_raw_request_snapshot else None
         )
 
-        auth_token: Final = REQUEST_AUTH.set(user_api_key_dict)
+        auth_token: Final = (
+            REQUEST_AUTH.set(user_api_key_dict)
+            if any(isinstance(callback, CustomLoggerV2) for callback in litellm.callbacks)
+            else None
+        )
         try:
             return await self._dispatch_pre_call(
                 _PreCallRun(
@@ -3530,7 +3534,8 @@ class ProxyLogging:
                 )
             )
         finally:
-            REQUEST_AUTH.reset(auth_token)
+            if auth_token is not None:
+                REQUEST_AUTH.reset(auth_token)
 
     async def _dispatch_pre_call(self, run: "_PreCallRun") -> dict[str, object] | None:  # mutable-ok: request dict
         try:
@@ -4658,11 +4663,15 @@ class ProxyLogging:
             partial(self._post_call_guardrail_start, run, guardrails),
         )
         run.raise_flow_change()
-        await run_hook_subscribers(
-            hook_subscribers(Hook.post_call_success, other_callbacks),
-            fields,
-            partial(self._post_call_logger, run, data, user_api_key_dict),
-        )
+        auth_token: Final = REQUEST_AUTH.set(user_api_key_dict)
+        try:
+            await run_hook_subscribers(
+                hook_subscribers(Hook.post_call_success, other_callbacks),
+                fields,
+                partial(self._post_call_logger, run, data, user_api_key_dict),
+            )
+        finally:
+            REQUEST_AUTH.reset(auth_token)
         return run.response
 
     async def _post_call_without_v2(

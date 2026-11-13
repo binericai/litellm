@@ -1133,7 +1133,7 @@ class ProxyRun:
 
 
 async def _through_the_proxy(
-    proxy_logging: ProxyLogging, router: Router, capture: _PayloadCapture, request: Request
+    proxy_logging: ProxyLogging, router: Router, capture: _PayloadCapture, request: Request, metadata_auth: bool
 ) -> ProxyRun:
     created: Final[list[RequestRateLimiterStash]] = []
 
@@ -1145,6 +1145,8 @@ async def _through_the_proxy(
     async def lifecycle() -> ProxyRun:
         data: Final = request.data()
         live_auth: Final = _auth(data)
+        if not metadata_auth:
+            data["metadata"] = {}
         with request_scope(), pytest.MonkeyPatch.context() as patch:
             patch.setattr(parallel_request_limiter_v3, "RequestRateLimiterStash", _Counted)
             admitted: Final = await proxy_logging.pre_call_hook(
@@ -1175,9 +1177,10 @@ async def _through_the_proxy(
     return await asyncio.create_task(lifecycle(), context=contextvars.Context())
 
 
+@pytest.mark.parametrize("metadata_auth", [True, False])
 @pytest.mark.parametrize("order", ["alone", "before_parallel_limiter", "after_parallel_limiter"])
 async def test_the_real_proxy_hooks_share_one_request_stash_like_python(
-    monkeypatch: pytest.MonkeyPatch, isolated: Clock, order: str
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock, order: str, metadata_auth: bool
 ) -> None:
     monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.5)
     flexible: Final = _key(
@@ -1209,7 +1212,9 @@ async def test_the_real_proxy_hooks_share_one_request_stash_like_python(
             monkeypatch.setattr(litellm, name, [])
         monkeypatch.setattr(litellm, "callbacks", [*registered, capture])
         proxy_logging = ProxyLogging(user_api_key_cache=DualCache())
-        runs.append([await _through_the_proxy(proxy_logging, router, capture, request) for request in requests])
+        runs.append(
+            [await _through_the_proxy(proxy_logging, router, capture, request, metadata_auth) for request in requests]
+        )
     python, native = runs
     for index, (expected, actual) in enumerate(zip(python, native, strict=True)):
         assert actual == expected, f"request {index} differs\nPY={expected!r}\nRS={actual!r}"
@@ -1347,3 +1352,26 @@ async def test_sync_sdk_calls_settle_nothing_like_python(monkeypatch: pytest.Mon
     python, native = transcripts
     assert native == python
     assert python[1][3][3] is not None, python
+
+
+class _AuthSeen(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[object] = []
+
+    async def async_pre_call_hook(
+        self, user_api_key_dict: UserAPIKeyAuth, cache: DualCache, data: dict[str, object], call_type: str
+    ) -> None:
+        self.seen.append(REQUEST_AUTH.get())
+
+
+async def test_the_request_auth_stays_unbound_without_a_native_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    witness: Final = _AuthSeen()
+    monkeypatch.setattr(litellm, "callbacks", [witness])
+    auth: Final = _key("plain")
+    await ProxyLogging(user_api_key_cache=DualCache()).pre_call_hook(
+        user_api_key_dict=auth,
+        data=Request(auth, "luna", "u0").data(),
+        call_type="acompletion",  # pyright: ignore[reportArgumentType]  # the proxy's call type string
+    )
+    assert witness.seen == [None]
