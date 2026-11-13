@@ -96,6 +96,23 @@ pub fn fixed(value: f64, precision: usize) -> String {
     }
 }
 
+fn python_isspace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}'..='\u{d}'
+            | '\u{1c}'..='\u{20}'
+            | '\u{85}'
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+    )
+}
+
 fn is_masked_key_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("sk-...") else {
         return false;
@@ -103,7 +120,7 @@ fn is_masked_key_name(name: &str) -> bool {
     rest.is_empty()
         || (rest.chars().count() == 4
             && rest.chars().all(|c| {
-                !c.is_whitespace() && !matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
+                !python_isspace(c) && !matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
             }))
 }
 
@@ -572,8 +589,29 @@ mod tests {
     #[case("sk-...ab d", false)]
     #[case("sk-...abcde", false)]
     #[case("sk-...ab\u{85}d", false)]
+    #[case("sk-...ab\u{3000}d", false)]
+    #[case("sk-...ab\u{202f}d", false)]
+    #[case("sk-...ab\u{2028}d", false)]
+    #[case("sk-...ab\u{200b}d", true)]
+    #[case("sk-...ab\u{180e}d", true)]
+    #[case("sk-...ab\u{feff}d", true)]
     #[case("my-key", false)]
     fn masked_key_names_match_the_proxy_pattern(#[case] name: &str, #[case] masked: bool) {
         assert_eq!(is_masked_key_name(name), masked);
+    }
+
+    #[test]
+    fn whitespace_is_exactly_pythons_str_isspace() {
+        let python: Vec<u32> = vec![
+            0x9, 0xa, 0xb, 0xc, 0xd, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x85, 0xa0, 0x1680, 0x2000,
+            0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028,
+            0x2029, 0x202f, 0x205f, 0x3000,
+        ];
+        let ours: Vec<u32> = (0..=0x0010_ffff_u32)
+            .filter_map(char::from_u32)
+            .filter(|c| python_isspace(*c))
+            .map(u32::from)
+            .collect();
+        assert_eq!(ours, python);
     }
 }
