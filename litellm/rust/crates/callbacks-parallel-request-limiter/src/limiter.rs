@@ -70,6 +70,8 @@ pub struct PreCallFacts {
     pub ptu_estimate: Option<Estimate>,
     #[serde(default)]
     pub io_estimate: Option<Estimate>,
+    #[serde(default)]
+    pub reuses_request_slot: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +159,8 @@ pub struct SuccessFacts {
     pub usage: Option<Usage>,
     #[serde(default)]
     pub io_usage: IoUsage,
+    #[serde(default)]
+    pub keep_slot: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +291,8 @@ impl ParallelRequestLimiter {
         {
             let mut stash = state.stash();
             stash.owned = true;
+            stash.first_pass_admitted = false;
+            stash.io_reached = false;
             stash.ptu_ceiling = facts.ptu_ceiling.clone();
             if let Some(call_id) = &facts.call_id {
                 stash.owner_call_id = Some(call_id.clone());
@@ -306,11 +312,16 @@ impl ParallelRequestLimiter {
         if descriptors.is_empty() {
             return Ok(None);
         }
-        let gauges: Vec<_> = descriptors
-            .iter()
-            .filter(|descriptor| descriptor.limits().max_parallel_requests.is_some())
-            .map(Descriptor::scope)
-            .collect();
+        let reuse = facts.reuses_request_slot;
+        let gauges: Vec<_> = if reuse {
+            Vec::new()
+        } else {
+            descriptors
+                .iter()
+                .filter(|descriptor| descriptor.limits().max_parallel_requests.is_some())
+                .map(Descriptor::scope)
+                .collect()
+        };
         let slot_id = (!gauges.is_empty()).then(|| uuid::Uuid::new_v4().simple().to_string());
         let first_pass: Vec<Descriptor> = if settings.tpm_reservation_enabled {
             descriptors.clone()
@@ -328,7 +339,7 @@ impl ParallelRequestLimiter {
                 false,
                 settings.tpm_reservation_enabled,
                 slot_id.as_deref(),
-                false,
+                reuse,
                 ctx,
             )
             .await?;
@@ -338,7 +349,9 @@ impl ParallelRequestLimiter {
         {
             let mut stash = state.stash();
             stash.first_pass_admitted = true;
-            stash.rate_limit_response = Some(response);
+            if !reuse {
+                stash.rate_limit_response = Some(response);
+            }
             if let Some(slot_id) = slot_id {
                 stash.parallel_slot = Some(SlotAcquisition { slot_id, gauges });
             }
@@ -358,7 +371,7 @@ impl ParallelRequestLimiter {
             if let Some(ceiling) = &facts.ptu_ceiling
                 && ptu_estimated > ceiling.tpm_limit
             {
-                self.release_stashed(state, false, ctx).await;
+                self.release_unless_reused(state, facts, ctx).await;
                 return Ok(Some(refusal::ptu_share_exceeded(ceiling, ptu_estimated)));
             }
             let tpm_response = self
@@ -366,7 +379,7 @@ impl ParallelRequestLimiter {
                 .reserve_tpm_tokens(descriptors, estimated, &[(PTU_TEAM, ptu_estimated)], ctx)
                 .await?;
             if tpm_response.is_over() {
-                self.release_stashed(state, false, ctx).await;
+                self.release_unless_reused(state, facts, ctx).await;
                 return Ok(self.refuse(&tpm_response, facts));
             }
             let mut stash = state.stash();
@@ -442,7 +455,7 @@ impl ParallelRequestLimiter {
                     .await;
                 state.stash().reservation_released = true;
             }
-            self.release_stashed(state, false, ctx).await;
+            self.release_unless_reused(state, facts, ctx).await;
             return Ok(self.refuse(&response, facts));
         }
         let mut stash = state.stash();
@@ -467,6 +480,17 @@ impl ParallelRequestLimiter {
             None => {}
         }
         Ok(None)
+    }
+
+    async fn release_unless_reused(
+        &self,
+        state: &LimiterState,
+        facts: &PreCallFacts,
+        ctx: Ctx<'_>,
+    ) {
+        if !facts.reuses_request_slot {
+            self.release_stashed(state, false, ctx).await;
+        }
     }
 
     fn refuse(&self, response: &crate::status::Response, facts: &PreCallFacts) -> Option<Abort> {
@@ -703,7 +727,9 @@ impl ParallelRequestLimiter {
                 return;
             }
         }
-        self.release_stashed(state, true, ctx).await;
+        if !facts.keep_slot {
+            self.release_stashed(state, true, ctx).await;
+        }
         let (operations, io) = {
             let mut stash = state.stash();
             let operations = if facts.exempt {

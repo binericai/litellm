@@ -5219,6 +5219,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         kwargs: Mapping[str, object],
         response_obj: object,
         rate_limit_type: Literal["output", "input", "total"],
+        keep_slot: bool,
     ) -> None:
         from litellm.litellm_core_utils.core_helpers import (
             get_litellm_metadata_from_kwargs,  # pyright: ignore[reportUnknownVariableType]  # the helper is untyped
@@ -5266,6 +5267,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             },
             "team_label": f"{_callback_kwargs_mapping(metadata).get('user_api_key_team_id')}",
             "policy": policy(self),
+            "keep_slot": keep_slot,
             "usage": usage_facts(self._resolve_reconciled_usage(usage_source)),
             "io_usage": {
                 "response": usage_facts(self._resolve_reconciled_usage(response_obj)),
@@ -5368,6 +5370,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     callback_kwargs,
                     response_obj,  # pyright: ignore[reportUnknownArgumentType]  # hook arguments are unannotated
                     rate_limit_type,
+                    _ended_before_slot_reuse(
+                        end_time if isinstance(end_time, datetime) and not callback_kwargs.get("stream") else None,
+                        stash.parallel_slot_reused_at if stash is not None else None,
+                    ),
                 )
                 return
             await self._release_stashed_parallel_slot(

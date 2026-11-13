@@ -61,6 +61,7 @@ class Request:
     held: bool = False
     call_type: str = "acompletion"
     fallback: str | None = None
+    nested: bool = False
 
 
 @dataclass
@@ -169,12 +170,13 @@ def _ctx(side: Side, index: int, hook: Hook, request: Request) -> CallContext[ob
 
 
 async def _admit(side: Side, index: int, request: Request) -> object:
-    _request_stash.set(None)
+    if not request.nested:
+        _request_stash.set(None)
     data: Final = _data(index, request)
     side.datas[index] = data
     cache: Final = DualCache()
     try:
-        if side.native is not None and request.call_type == "acompletion":
+        if side.native is not None:
             request_state = side.native.request_state
             assert request_state is not None
             side.states[index] = request_state()
@@ -186,7 +188,10 @@ async def _admit(side: Side, index: int, request: Request) -> object:
             )
             state = side.states[index]
             assert isinstance(state, NativeState)
-            assert side.native.bridge.owned(state.handle)
+            stash = get_request_stash()
+            owner = stash.native_state if request.nested and stash is not None else state.handle
+            assert owner is not None
+            assert side.native.bridge.owned(owner)  # pyright: ignore[reportArgumentType]  # the handle is the bridge state
             if isinstance(outcome, Abort):
                 assert outcome.exception is not None
                 raise outcome.exception
@@ -670,7 +675,7 @@ async def test_atomic_checks_run_through_the_engine_like_python(
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_calls_fall_through_to_python_and_count_through_the_engine(
+async def test_mcp_tool_calls_are_limited_natively_like_python(
     backend: tuple[int | None, int | None],
 ) -> None:
     observed: Final = await _differential(
@@ -694,3 +699,28 @@ async def test_the_dynamic_limiters_private_limiter_runs_on_the_engine_when_the_
     assert handler.v3_limiter.native_companion is not None
     monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "false")
     assert _PROXY_DynamicRateLimitHandlerV3(DualCache()).v3_limiter.native_companion is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_limit", (5, 1))
+async def test_a_nested_mcp_tool_call_reuses_the_requests_slot_like_python(
+    tool_limit: int, backend: tuple[int | None, int | None]
+) -> None:
+    clock: Final = Clock()
+    sides: Final = (_side(clock, native=False, port=backend[0]), _side(clock, native=True, port=backend[1]))
+    outer: Final = Request(
+        _auth(max_parallel_requests=1, rpm_limit=tool_limit, tpm_limit=3000), {**_CHAT, "max_tokens": 20}
+    )
+    tool: Final = Request(outer.auth, _CHAT, call_type="call_mcp_tool", nested=True)
+    for side in sides:
+        context = contextvars.copy_context()
+        side.contexts[0] = context
+        side.contexts[1] = context
+    admitted: Final = [(await _run(side, 0, _admit, outer), await _run(side, 1, _admit, tool)) for side in sides]
+    assert admitted[0] == admitted[1]
+    assert (admitted[0][1] is None) == (tool_limit > 1)
+    scopes: Final = [("api_key", _KEY)]
+    assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
+    ended: Final = [(await _run(side, 1, _end, tool), await _run(side, 0, _end, outer)) for side in sides]
+    assert ended[0] == ended[1]
+    assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)

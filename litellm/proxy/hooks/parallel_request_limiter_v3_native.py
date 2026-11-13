@@ -44,7 +44,6 @@ UNVERIFIABLE_KIND: Final = "rate_limit_unverifiable"
 PTU_SHARE_EXCEEDED_KIND: Final = "ptu_share_exceeded"
 _UNSUPPORTED_CALL_TYPES: Final = frozenset(
     {
-        CallTypes.call_mcp_tool.value,
         CallTypes.aresponses_websocket.value,
         "pass_through_endpoint",
         "_arealtime",
@@ -215,6 +214,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             or _dynamic_limiter_registered()
             or (
                 stash is not None
+                and stash.native_state is None
                 and (
                     stash.rate_limit_response is not None
                     or stash.parallel_slot is not None
@@ -227,17 +227,28 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
     async def _pre_call(self, data: dict[str, object], ctx: CallContext[object]) -> Patch | Abort | None:
         from litellm.litellm_core_utils.token_counter import offload_token_count
         from litellm.proxy.auth.auth_utils import get_estimated_output_tokens
-        from litellm.proxy.hooks.parallel_request_limiter_v3 import claim_request_stash_for_data
+        from litellm.proxy.hooks.parallel_request_limiter_v3 import claim_request_stash_for_data, get_request_stash
 
         call_type: Final = ctx.call.kind.call_type if ctx.call is not None else ""
         auth: Final = _auth(data)
-        state: Final = (
-            limiter_state(ctx.state.handle) if isinstance(ctx.state, NativeState) else None
-        ) or self.bridge.request_state()
         if auth is None or self._declines(data, call_type, auth):
             return None
+        held: Final = get_request_stash()
+        shared: Final = None if held is None else limiter_state(held.native_state)
+        state: Final = (
+            shared
+            or (limiter_state(ctx.state.handle) if isinstance(ctx.state, NativeState) else None)
+            or self.bridge.request_state()
+        )
         limiter: Final = self.limiter
         stash: Final = claim_request_stash_for_data(data)
+        reuses_request_slot: Final = (
+            call_type == CallTypes.call_mcp_tool.value
+            and shared is not None
+            and self.bridge.holds_parallel_slot(shared)
+        )
+        if reuses_request_slot:
+            stash.parallel_slot_reused_at = limiter._get_current_time()  # pyright: ignore[reportPrivateUsage]  # the reuse time is the Python limiter's clock
         descriptors: Final = await limiter._build_request_rate_limit_descriptors(  # pyright: ignore[reportPrivateUsage]  # the descriptors are the Python limiter's
             user_api_key_dict=auth, data=data, call_type=call_type
         )
@@ -320,6 +331,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             "ptu_ceiling": None if ceiling is None else dataclasses.asdict(ceiling),
             "ptu_estimate": ptu_estimate,
             "io_estimate": io_estimate,
+            "reuses_request_slot": reuses_request_slot,
         }
         outcome: Final = await self._call(Hook.pre_call, facts, ctx, state=state, request=pre_call_request())
         if reserves and self.bridge.first_pass_admitted(state):
