@@ -59,6 +59,7 @@ class Request:
     usage: Usage = field(default_factory=lambda: Usage(prompt_tokens=7, completion_tokens=5, total_tokens=12))
     held: bool = False
     call_type: str = "acompletion"
+    fallback: str | None = None
 
 
 @dataclass
@@ -187,6 +188,8 @@ async def _admit(side: Side, index: int, request: Request) -> object:
                 assert outcome.exception is not None
                 raise outcome.exception
         await side.limiter.async_pre_call_hook(request.auth, cache, data, request.call_type)
+        if request.fallback is not None:
+            return ("fallback", await side.limiter.async_fallback_target_allowed(request.auth, request.fallback, data))
     except Exception as error:  # noqa: BLE001  # the refusal is the observable compared across sides
         return _outcome(error)
     return None
@@ -206,7 +209,7 @@ def _logging_kwargs(index: int, request: Request) -> dict[str, object]:
             },
             "hidden_params": {},
         },
-        "litellm_params": {"metadata": {"model_group": request.body.get("model")}},
+        "litellm_params": {"metadata": {"model_group": request.fallback or request.body.get("model")}},
     }
 
 
@@ -312,7 +315,7 @@ async def _differential(
         assert admitted[0] == admitted[1], (index, admitted)
         assert python.datas[index] == native.datas[index], index
         observed.append(admitted[0])
-        if admitted[0] is None:
+        if admitted[0] is None or admitted[0][0] == "fallback":
             if request.held:
                 held.append((index, request))
             else:
@@ -458,3 +461,28 @@ async def test_a_request_without_auth_metadata_falls_through_to_python() -> None
     assert outcome is None
     stash: Final = get_request_stash()
     assert stash is None or stash.native_state is None
+
+
+@pytest.mark.asyncio
+async def test_router_fallback_targets_are_admitted_and_settled_like_python(
+    backend: tuple[int | None, int | None],
+) -> None:
+    auth: Final = _auth(metadata={"model_tpm_limit": {"gpt-4o": 300, "gpt-4o-mini": 300}})
+    observed: Final = await _differential(
+        [Request(auth, {**_CHAT, "max_tokens": 20}, fallback="gpt-4o-mini") for _ in range(4)],
+        [("model_per_key", f"{_KEY}:gpt-4o"), ("model_per_key", f"{_KEY}:gpt-4o-mini")],
+        backend,
+    )
+    assert observed[0] == ("fallback", True)
+
+
+@pytest.mark.asyncio
+async def test_post_call_charging_without_reservation_matches_python(
+    backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LITELLM_TPM_TOKEN_RESERVATION_ENABLED", "false")
+    await _differential(
+        [Request(_auth(tpm_limit=30, rpm_limit=10), _CHAT) for _ in range(5)],
+        [("api_key", _KEY)],
+        backend,
+    )
