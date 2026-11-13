@@ -49,6 +49,7 @@ PTU_TEAM_DESCRIPTOR_KEY: Final = "model_per_team_ptu"
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
+    from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
     from litellm.proxy.hooks.batch_rate_limiter import PROXY_BatchRateLimiter
     from litellm.proxy.hooks.parallel_request_limiter_v3 import (
         AuthDescriptors,
@@ -226,7 +227,7 @@ def limiter_state(value: object) -> "NativeParallelRequestLimiterState | None":
     return value if isinstance(value, NativeParallelRequestLimiterState) else None
 
 
-def _request_data(value: object) -> dict[str, object]:
+def _request_data(value: object) -> dict[str, object]:  # mutable-ok: the request body is written in place
     return value if isinstance(value, dict) else {}  # pyright: ignore[reportUnknownVariableType]  # the hook's request data is the untyped proxy body
 
 
@@ -277,15 +278,15 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         handle: Final = state if state is not None else self._state(ctx)
         if handle is None:
             return None
-        fields: Final[dict[str, object]] = {
+        fields: Final[dict[str, object]] = {  # mutable-ok: the bridge reads a dict
             Field.deprecated_kwargs.value: dict(facts)
-        }  # mutable-ok: the bridge reads a dict
+        }
         if payload is not None:
             fields[Field.standard_logging_payload.value] = payload
         returned: Final = await self.bridge.handle(hook.value, fields, None, handle, request=request)
         return verdict(returned)
 
-    async def _post_call_failure(self, data: dict[str, object], ctx: CallContext[object]) -> Patch | Abort | None:
+    async def _post_call_failure(self, data: Mapping[str, object], ctx: CallContext[object]) -> Patch | Abort | None:
         return await self._call(Hook.post_call_failure, failure_facts(self.limiter, data), ctx)
 
     def _declines(self, data: Mapping[str, object], call_type: str, auth: UserAPIKeyAuth | None) -> bool:
@@ -298,7 +299,11 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             or request_identity(data) is None
         )
 
-    async def _pre_call(self, data: dict[str, object], ctx: CallContext[object]) -> Patch | Abort | None:
+    async def _pre_call(
+        self,
+        data: dict[str, object],  # mutable-ok: the output cap is written into the request body
+        ctx: CallContext[object],
+    ) -> Patch | Abort | None:
         from litellm.litellm_core_utils.token_counter import offload_token_count
         from litellm.proxy.auth.auth_utils import get_estimated_output_tokens
         from litellm.proxy.hooks.parallel_request_limiter_v3 import (
@@ -410,31 +415,19 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         if first_pass is not None or not self.bridge.first_pass_admitted(state):
             mirror_rate_limit_response(self.bridge, state)
             return first_pass
-        estimated_tokens: int | None = None  # rebind-ok: set only when the request reserves tokens
-        ptu_estimate: Mapping[str, object] | None = None  # rebind-ok: set only for a team PTU reservation
         if reserves:
             self._apply_output_cap(data, min(configured_tpm_limits), call_type, endpoint_type, configured_output_tokens)
-            estimated_tokens = await offload_token_count(limiter._estimate_tokens_for_request)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
-                data=data,
-                model=requested_model,
-                min_configured_tpm_limit=min(configured_tpm_limits),
-                call_type=call_type,
-                configured_output_tokens=configured_output_tokens,
-                team_id=auth.team_id,
+        token_estimates: Final[Mapping[str, object]] = (
+            await self._token_estimates(
+                data, requested_model, min(configured_tpm_limits), call_type, configured_output_tokens, auth, ceiling
             )
-            if ceiling is not None:
-                ptu_input, ptu_output = await offload_token_count(limiter._estimate_input_and_output_tokens)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
-                    data=data,
-                    min_configured_tpm_limit=min(configured_tpm_limits),
-                    call_type=call_type,
-                    configured_output_tokens=configured_output_tokens,
-                    team_id=auth.team_id,
-                    media_model_resolver=limiter._media_model_resolver,  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
-                )
-                ptu_estimate = {"input_tokens": ptu_input, "output_tokens": ptu_output}
+            if reserves
+            else {}
+        )
+        if reserves:
             reserved: Final = await self._call(
                 Hook.pre_call,
-                {**facts, "phase": "tokens", "estimated_tokens": estimated_tokens, "ptu_estimate": ptu_estimate},
+                {**facts, **token_estimates, "phase": "tokens"},
                 ctx,
                 state=state,
                 request=pre_call_request(),
@@ -459,13 +452,49 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         self._apply_output_cap(data, min_otpm_limit, call_type, endpoint_type)
         outcome: Final = await self._call(
             Hook.pre_call,
-            {**facts, "phase": "io", "estimated_tokens": estimated_tokens, "io_estimate": io_estimate},
+            {**facts, **token_estimates, "phase": "io", "io_estimate": io_estimate},
             ctx,
             state=state,
             request=pre_call_request(),
         )
         mirror_rate_limit_response(self.bridge, state)
         return outcome
+
+    async def _token_estimates(
+        self,
+        data: Mapping[str, object],
+        requested_model: str | None,
+        min_configured_tpm_limit: int,
+        call_type: str,
+        configured_output_tokens: int | None,
+        auth: UserAPIKeyAuth,
+        ceiling: "PTUTeamCeiling | None",
+    ) -> Mapping[str, object]:
+        from litellm.litellm_core_utils.token_counter import offload_token_count
+
+        limiter: Final = self.limiter
+        estimated_tokens: Final = await offload_token_count(limiter._estimate_tokens_for_request)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+            data=data,
+            model=requested_model,
+            min_configured_tpm_limit=min_configured_tpm_limit,
+            call_type=call_type,
+            configured_output_tokens=configured_output_tokens,
+            team_id=auth.team_id,
+        )
+        if ceiling is None:
+            return {"estimated_tokens": estimated_tokens}
+        ptu_input, ptu_output = await offload_token_count(limiter._estimate_input_and_output_tokens)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+            data=data,
+            min_configured_tpm_limit=min_configured_tpm_limit,
+            call_type=call_type,
+            configured_output_tokens=configured_output_tokens,
+            team_id=auth.team_id,
+            media_model_resolver=limiter._media_model_resolver,  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+        )
+        return {
+            "estimated_tokens": estimated_tokens,
+            "ptu_estimate": {"input_tokens": ptu_input, "output_tokens": ptu_output},
+        }
 
     def _auth_descriptors(self, auth: UserAPIKeyAuth) -> "AuthDescriptors":
         from litellm.proxy.hooks.parallel_request_limiter_v3 import AUTH_DESCRIPTORS
@@ -523,7 +552,9 @@ def _prior(response: "RateLimitResponse | None") -> Mapping[str, object] | None:
 
 
 async def _prepared_batch(
-    batch: "PROXY_BatchRateLimiter", data: dict[str, object], auth: UserAPIKeyAuth
+    batch: "PROXY_BatchRateLimiter",
+    data: dict[str, object],  # mutable-ok: the batch counts are written into the request body
+    auth: UserAPIKeyAuth,
 ) -> Mapping[str, object] | Abort | None:
     from starlette.exceptions import HTTPException
 
@@ -545,8 +576,8 @@ async def _prepared_batch(
             data=data,
             descriptors=descriptors,
         )
-        data["_batch_token_count"] = usage.total_tokens
-        data["_batch_request_count"] = usage.request_count
+        data["_batch_token_count"] = usage.total_tokens  # rebind-ok: the batch limiter reads the counts here
+        data["_batch_request_count"] = usage.request_count  # rebind-ok: the batch limiter reads the counts here
         if enqueued_scopes:
             return {
                 "descriptors": [],
@@ -704,7 +735,7 @@ def native_parallel_request_limiter(
     manifest: Final = WireManifest.model_validate_json(bridge.manifest())
     cls: Final = type(manifest.selection.name, (ParallelRequestLimiterNativeLogger,), _namespace(bridge, manifest))  # pyright: ignore[reportArgumentType]  # the bridge takes its own state type
     logger: Final = cls(bridge, limiter)
-    limiter.native_companion = bridge
+    limiter.native_companion = bridge  # rebind-ok: the Python limiter settles through the native's bridge
     store: Final = limiter.batch_enqueued_token_store
     if not isinstance(store, NativeBatchEnqueuedTokenStore):
         native_store: Final = NativeBatchEnqueuedTokenStore(store.internal_usage_cache, bridge)

@@ -532,18 +532,18 @@ _NATIVE_WINDOWS: Final = TypeAdapter[list[_NativeWindow] | None](list[_NativeWin
 
 class _NativeSlot(TypedDict):
     slot_id: ReadOnly[str]
-    gauges: ReadOnly[list[tuple[str, str]]]
+    gauges: ReadOnly[tuple[tuple[str, str], ...]]
 
 
 class _NativeResponse(TypedDict):
     overall_code: ReadOnly[str]
-    statuses: ReadOnly[list[RateLimitStatus]]
+    statuses: ReadOnly[tuple[RateLimitStatus, ...]]
 
 
 class _NativeIo(TypedDict):
     tokens: ReadOnly[int]
-    scopes: ReadOnly[list[tuple[str, str]]]
-    windows: ReadOnly[list[_NativeWindow]]
+    scopes: ReadOnly[tuple[tuple[str, str], ...]]
+    windows: ReadOnly[tuple[_NativeWindow, ...]]
 
 
 _NativeOp: TypeAlias = tuple[
@@ -564,13 +564,13 @@ class _NativeStash(TypedDict):
     parallel_slot: ReadOnly[_NativeSlot | None]
     reserved_tokens: ReadOnly[int]
     reserved_model: ReadOnly[tuple[str, str] | None]
-    reserved_scopes: ReadOnly[list[tuple[str, str]]]
-    fallback_models: ReadOnly[list[str]]
+    reserved_scopes: ReadOnly[tuple[tuple[str, str], ...]]
+    fallback_models: ReadOnly[tuple[str, ...]]
     reservation_released: ReadOnly[bool]
     io_reservation_released: ReadOnly[bool]
-    tpm_limited_tags: ReadOnly[list[str]]
+    tpm_limited_tags: ReadOnly[tuple[str, ...]]
     ptu_reserved_tokens: ReadOnly[int]
-    ptu_windows: ReadOnly[list[_NativeWindow]]
+    ptu_windows: ReadOnly[tuple[_NativeWindow, ...]]
     itpm: ReadOnly[_NativeIo]
     otpm: ReadOnly[_NativeIo]
     batch_enqueued_reservation: ReadOnly[BatchEnqueuedTokenReservation | None]
@@ -1019,12 +1019,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         slot: Final = exported["parallel_slot"]
         model: Final = exported["reserved_model"]
         response: Final = exported["rate_limit_response"]
-        stash.rate_limit_response = (
+        reserved_model: Final = None if model is None else RateLimitedModel(requested=model[0], group=model[1])
+        stash.rate_limit_response = (  # rebind-ok: the adopted stash takes the native's state
             None
             if response is None
-            else RateLimitResponse(overall_code=response["overall_code"], statuses=response["statuses"])
+            else RateLimitResponse(overall_code=response["overall_code"], statuses=list(response["statuses"]))
         )
-        stash.parallel_slot = (
+        stash.parallel_slot = (  # rebind-ok: the adopted stash takes the native's state
             None
             if slot is None
             else ParallelSlotAcquisition(
@@ -1032,26 +1033,31 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 gauges=tuple(RateLimitScope(key, value) for key, value in slot["gauges"]),
             )
         )
-        stash.reserved_tokens = exported["reserved_tokens"]
-        stash.reserved_model = None if model is None else RateLimitedModel(requested=model[0], group=model[1])
-        stash.reserved_scopes = frozenset(exported["reserved_scopes"])
-        stash.fallback_models = frozenset(exported["fallback_models"])
-        stash.reservation_released = exported["reservation_released"]
-        stash.io_reservation_released = exported["io_reservation_released"]
-        stash.tpm_limited_tags = frozenset(exported["tpm_limited_tags"])
-        stash.ptu_reserved_tokens = exported["ptu_reserved_tokens"]
-        stash.ptu_reserved_window_identities = _window_identities(exported["ptu_windows"])
-        stash.itpm_reserved_tokens = exported["itpm"]["tokens"]
-        stash.itpm_reserved_scopes = frozenset(exported["itpm"]["scopes"])
-        stash.itpm_reserved_window_identities = _window_identities(exported["itpm"]["windows"])
-        stash.otpm_reserved_tokens = exported["otpm"]["tokens"]
-        stash.otpm_reserved_scopes = frozenset(exported["otpm"]["scopes"])
-        stash.otpm_reserved_window_identities = _window_identities(exported["otpm"]["windows"])
+        stash.reserved_tokens = exported["reserved_tokens"]  # rebind-ok: adopted from the native
+        stash.reserved_model = reserved_model  # rebind-ok: adopted from the native
+        stash.reserved_scopes = frozenset(exported["reserved_scopes"])  # rebind-ok: adopted from the native
+        stash.fallback_models = frozenset(exported["fallback_models"])  # rebind-ok: adopted from the native
+        stash.reservation_released = exported["reservation_released"]  # rebind-ok: adopted from the native
+        stash.io_reservation_released = exported["io_reservation_released"]  # rebind-ok: adopted from the native
+        stash.tpm_limited_tags = frozenset(exported["tpm_limited_tags"])  # rebind-ok: adopted from the native
+        stash.ptu_reserved_tokens = exported["ptu_reserved_tokens"]  # rebind-ok: adopted from the native
+        ptu_windows: Final = _window_identities(exported["ptu_windows"])
+        stash.ptu_reserved_window_identities = ptu_windows  # rebind-ok: adopted from the native
+        itpm: Final = exported["itpm"]
+        otpm: Final = exported["otpm"]
+        stash.itpm_reserved_tokens = itpm["tokens"]  # rebind-ok: adopted from the native
+        stash.itpm_reserved_scopes = frozenset(itpm["scopes"])  # rebind-ok: adopted from the native
+        itpm_windows: Final = _window_identities(itpm["windows"])
+        stash.itpm_reserved_window_identities = itpm_windows  # rebind-ok: adopted from the native
+        stash.otpm_reserved_tokens = otpm["tokens"]  # rebind-ok: adopted from the native
+        stash.otpm_reserved_scopes = frozenset(otpm["scopes"])  # rebind-ok: adopted from the native
+        otpm_windows: Final = _window_identities(otpm["windows"])
+        stash.otpm_reserved_window_identities = otpm_windows  # rebind-ok: adopted from the native
         enqueued: Final = exported["batch_enqueued_reservation"]
         stash.batch_enqueued_reservation = enqueued  # rebind-ok: the adopted stash takes the native's reservation
         refunds: Final = tuple(_reservation_operation(op) for op in exported["batch_tpd_refunds"])
         stash.batch_tpd_refund_ops = refunds  # rebind-ok: the adopted stash takes the native's daily-token refunds
-        stash.native_state = None
+        stash.native_state = None  # rebind-ok: adopted from the native
         return True
 
     def _native_state(self, stash: RequestRateLimiterStash | None) -> "NativeParallelRequestLimiterState | None":
@@ -2174,7 +2180,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     if isinstance(raw_value, dict):
                         if slot_id not in raw_value:
                             continue
-                        new_value: dict[str, float] | int = {key: ts for key, ts in raw_value.items() if key != slot_id}
+                        new_value: dict[str, float] | int = {  # mutable-ok: the memory gauge keeps its slots as a dict
+                            key: ts for key, ts in raw_value.items() if key != slot_id
+                        }
                     elif raw_value is None:
                         continue
                     else:
@@ -5346,7 +5354,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         return pipeline_operations
 
     @staticmethod
-    def _success_usage(kwargs: Mapping[str, object], response_obj: object) -> Usage | dict[str, object] | None:
+    def _success_usage(kwargs: Mapping[str, object], response_obj: object) -> Usage | Mapping[str, object] | None:
         return (
             getattr(response_obj, "usage", None)
             if isinstance(
@@ -5364,7 +5372,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         )
 
     def _success_total_tokens(
-        self, usage: Usage | dict[str, object] | None, rate_limit_type: Literal["output", "input", "total"]
+        self, usage: Usage | Mapping[str, object] | None, rate_limit_type: Literal["output", "input", "total"]
     ) -> int:
         total_tokens: Final = self._get_total_tokens_from_usage(usage=usage, rate_limit_type=rate_limit_type)
         return total_tokens if total_tokens != 0 else self._aggregate_only_total_tokens(usage=usage)
