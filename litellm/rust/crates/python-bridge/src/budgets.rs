@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use litellm_callbacks_budgets::{Budgets, Reservation, Shared};
+use litellm_callbacks_budgets::{Budgets, Check, Reservation, Shared, decide};
 use litellm_callbacks_python::NativeCallback;
-use litellm_host_python::{Pythonized, from_py_argument, run_async_value};
+use litellm_host_python::{Pythonized, from_py_argument, run_async_value, to_py};
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use crate::redis::store::spend_counters::NativeSpendCounters;
@@ -45,4 +45,12 @@ impl NativeBudgets {
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))
         })
     }
+}
+
+#[pyfunction]
+pub(crate) fn budget_check_decision(
+    py: Python<'_>,
+    #[pyo3(from_py_with = from_py_argument)] check: Check,
+) -> PyResult<Py<PyAny>> {
+    to_py(py, &decide(&check))
 }

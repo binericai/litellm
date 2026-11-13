@@ -3329,7 +3329,18 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
                                 fallback_spend=team_member_spend,
                                 max_budget=team_member_budget,
                             )
-                        if team_member_spend >= team_member_budget:
+                        from litellm.proxy.spend_tracking.native_budgets import native_budget_decision
+
+                        native: Final = native_budget_decision(
+                            {
+                                "check": "team_member_positive",
+                                "spend": team_member_spend,
+                                "max_budget": team_member_budget,
+                                "user_id": valid_token.user_id,
+                                "team_id": valid_token.team_id,
+                            }
+                        )
+                        if native.refused if native is not None else team_member_spend >= team_member_budget:
                             # common_checks sends this alert on requests that get past here, so only the
                             # request rejected here sends it from the builder.
                             team_member_max_budget_alert_check(
@@ -3343,6 +3354,8 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
                                 spend=team_member_spend,
                                 max_budget=team_member_budget,
                             )
+                            if native is not None:
+                                raise native.error()
                             _entity_id: Final = f"{valid_token.user_id}:{valid_token.team_id}"
                             raise litellm.BudgetExceededError(
                                 current_cost=team_member_spend,

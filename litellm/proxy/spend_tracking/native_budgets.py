@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import os
 from collections.abc import Mapping
-from typing import Final
+from typing import TYPE_CHECKING, Final, Literal
 
 from fastapi import HTTPException, status
 from pydantic import BaseModel, ConfigDict, TypeAdapter
@@ -20,8 +22,10 @@ from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_fo
 from litellm.litellm_core_utils.core_helpers import budget_reservation_from_metadata
 from litellm.proxy._types import ProxyErrorTypes, ProxyException
 from litellm.redis.stores.spend_counters import SpendCounterStore
-from litellm.rust_bridge._native import NativeBudgets
 from litellm.types.utils import CallTypes
+
+if TYPE_CHECKING:
+    from litellm.rust_bridge._native import NativeBudgets
 
 NATIVE_BUDGETS_ENV: Final = "LITELLM_NATIVE_BUDGETS"
 NATIVE_PLAN_KEY: Final = "native_plan"
@@ -205,6 +209,8 @@ def native_budgets() -> NativeBudgets | None:
 def install_native_budgets(store: SpendCounterStore, callbacks: list[object]) -> None:  # mutable-ok: litellm.callbacks
     if _installed or not native_budgets_requested():
         return
+    from litellm.rust_bridge._native import NativeBudgets
+
     budgets: Final = NativeBudgets(store.handle)
     logger: Final = native_logger(budgets.callback(), _PROJECTIONS)
     logger.__class__ = type(type(logger).__name__, (NativeBudgetsLogger, type(logger)), {"budgets": budgets})
@@ -230,3 +236,44 @@ async def settle_native_reservation(
 
 def is_native_reservation(reservation: Mapping[str, object] | None) -> bool:
     return reservation is not None and (NATIVE_CALL_ID_KEY in reservation or NATIVE_PLAN_KEY in reservation)
+
+
+class BudgetDecision(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    decision: Literal["skip", "pass", "alert", "throttle", "refuse"]
+    pct: int | float | None = None
+    current_cost: int | float | None = None
+    max_budget: int | float | None = None
+    message: str | None = None
+    entity_type: str | None = None
+    entity_id: str | None = None
+
+    @property
+    def skipped(self) -> bool:
+        return self.decision == "skip"
+
+    @property
+    def alerts(self) -> bool:
+        return self.decision == "alert"
+
+    @property
+    def refused(self) -> bool:
+        return self.decision in ("refuse", "throttle")
+
+    def error(self) -> litellm.BudgetExceededError:
+        return litellm.BudgetExceededError(
+            current_cost=self.current_cost if self.current_cost is not None else 0.0,
+            max_budget=self.max_budget if self.max_budget is not None else 0.0,
+            message=self.message,
+            entity_type=self.entity_type,
+            entity_id=self.entity_id,
+        )
+
+
+def native_budget_decision(check: Mapping[str, object]) -> BudgetDecision | None:
+    if native_budgets() is None:
+        return None
+    from litellm.rust_bridge._native import budget_check_decision
+
+    return BudgetDecision.model_validate(budget_check_decision(check))

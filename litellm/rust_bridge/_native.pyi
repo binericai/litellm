@@ -458,8 +458,10 @@ class PostCallSettlement:
 class NativeBudgets:
     def __new__(cls, spend_counters: NativeSpendCounters) -> NativeBudgets: ...
     def callback(self) -> NativeHandle: ...
-    def take(self, call_id: str, /) -> Future[JsonValue]: ...
-    def settle(self, reservation: JsonValue, actual: float, finalize: bool, /) -> Future[JsonValue]: ...
+    def take(self, call_id: str) -> Future[JsonValue]: ...
+    def settle(self, reservation: JsonValue, actual: float, finalize: bool) -> Future[JsonValue]: ...
+
+def budget_check_decision(check: Mapping[str, object]) -> JsonValue: ...
 
 @final
 class NativeSpendCounters:
@@ -684,6 +686,7 @@ __all__ = [
     "LocalSizes",
     "NativeAdmission",
     "NativeAuthCache",
+    "NativeBudgets",
     "NativeClickHouseSpendConfig",
     "NativeClickHouseSpendStorage",
     "NativeCostMapSource",
@@ -727,6 +730,7 @@ __all__ = [
     "aocr",
     "aresponses",
     "atranscription",
+    "budget_check_decision",
     "bundled_model_cost_map",
     "completion",
     "embedding",

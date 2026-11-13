@@ -29,6 +29,8 @@ mod _native {
     #[pymodule_export]
     use crate::budgets::NativeBudgets;
     #[pymodule_export]
+    use crate::budgets::budget_check_decision;
+    #[pymodule_export]
     use crate::db::NativeDatabase;
     #[cfg(feature = "panic-test")]
     #[pymodule_export]
@@ -198,6 +200,7 @@ mod tests {
                 "reserve_process_for_forking",
                 "unsupported_tls_settings",
                 "NativeBudgets",
+                "budget_check_decision",
             ];
             #[cfg(feature = "huggingface")]
             expected.push("HuggingFaceEncoding");
