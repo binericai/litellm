@@ -169,7 +169,7 @@ class RateLimitedModel:
 
 
 def dynamic_rate_limiter_covers(model_group: str) -> bool:
-    from litellm.proxy.hooks.dynamic_rate_limiter_v3 import PROXY_DynamicRateLimitHandlerV3
+    from litellm.proxy.hooks.model_capacity_native import is_dynamic_rate_limiter
     from litellm.proxy.proxy_server import llm_router
 
     if llm_router is None:
@@ -178,8 +178,7 @@ def dynamic_rate_limiter_covers(model_group: str) -> bool:
     if group is None or (group.tpm is None and group.rpm is None):
         return False
     return any(
-        callback == "dynamic_rate_limiter_v3" or isinstance(callback, PROXY_DynamicRateLimitHandlerV3)
-        for callback in litellm.callbacks
+        callback == "dynamic_rate_limiter_v3" or is_dynamic_rate_limiter(callback) for callback in litellm.callbacks
     )
 
 

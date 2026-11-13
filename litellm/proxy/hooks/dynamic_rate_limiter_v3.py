@@ -332,6 +332,50 @@ def _reservation_covers(
     return reserved <= frozenset(access_groups)
 
 
+def steerable(
+    llm_router: Router,
+    model: str,
+    alternate: str,
+    data: Mapping[str, object],
+    call_type: CallTypesLiteral,
+    team_id: str | None,
+) -> bool:
+    """Whether ``alternate`` may serve a request that already passed auth and the guardrail walk as ``model``: a
+    zero-cost ``model`` waived the aggregate budget checks, so only another zero-cost alternate may take it, an
+    unpriced alternate is blocked when unpriced models are, the alternate has to serve this endpoint, and an
+    alternate with a model-level guardrail the request has not run would reach it unchecked."""
+    from litellm.proxy.auth.auth_checks import (
+        _unpriced_models_in_request,  # pyright: ignore[reportPrivateUsage]  # steering shares the fallback contract
+        is_model_cost_zero,
+    )
+    from litellm.proxy.route_llm_request import endpoint_unsupported_by_model
+
+    if is_model_cost_zero(model=model, llm_router=llm_router) and not is_model_cost_zero(
+        model=alternate, llm_router=llm_router
+    ):
+        verbose_proxy_logger.info("Not steering zero-cost %s to priced %s", model, alternate)
+        return False
+    if litellm.block_requests_for_models_without_pricing and _unpriced_models_in_request(
+        model=alternate, llm_router=llm_router
+    ):
+        verbose_proxy_logger.info("Not steering %s to unpriced %s", model, alternate)
+        return False
+    if endpoint_unsupported_by_model(call_type, dict(data, model=alternate), llm_router, team_id):
+        verbose_proxy_logger.info("Not steering %s to %s, the alternate does not serve %s", model, alternate, call_type)
+        return False
+    probe: Final = REQUEST_BUCKET.validate_python(
+        check_and_merge_model_level_guardrails(
+            data=dict(data, model=alternate, metadata=_metadata_bucket(data, "metadata") or {}),
+            llm_router=llm_router,
+            trust_client_model_info=False,
+        )
+    )
+    if _guardrail_entries(probe) != _guardrail_entries(data):
+        verbose_proxy_logger.info("Not steering %s to %s, the alternate adds model-level guardrails", model, alternate)
+        return False
+    return True
+
+
 def alternates_for(user_api_key_dict: UserAPIKeyAuth, model: str) -> tuple[str, ...]:
     """The team's opt-in alternates for ``model`` from ``team_metadata.model_preferences``, or none."""
     raw: Final = (user_api_key_dict.team_metadata or {}).get("model_preferences")
@@ -1666,44 +1710,7 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
     def _steerable(
         self, model: str, alternate: str, data: Mapping[str, object], call_type: CallTypesLiteral, team_id: str | None
     ) -> bool:
-        """Whether ``alternate`` may serve a request that already passed auth and the guardrail walk as ``model``: a
-        zero-cost ``model`` waived the aggregate budget checks, so only another zero-cost alternate may take it, an
-        unpriced alternate is blocked when unpriced models are, the alternate has to serve this endpoint, and an
-        alternate with a model-level guardrail the request has not run would reach it unchecked."""
-        from litellm.proxy.auth.auth_checks import (
-            _unpriced_models_in_request,  # pyright: ignore[reportPrivateUsage]  # steering shares the fallback contract
-            is_model_cost_zero,
-        )
-        from litellm.proxy.route_llm_request import endpoint_unsupported_by_model
-
-        if is_model_cost_zero(model=model, llm_router=self.llm_router) and not is_model_cost_zero(
-            model=alternate, llm_router=self.llm_router
-        ):
-            verbose_proxy_logger.info("Not steering zero-cost %s to priced %s", model, alternate)
-            return False
-        if litellm.block_requests_for_models_without_pricing and _unpriced_models_in_request(
-            model=alternate, llm_router=self.llm_router
-        ):
-            verbose_proxy_logger.info("Not steering %s to unpriced %s", model, alternate)
-            return False
-        if endpoint_unsupported_by_model(call_type, dict(data, model=alternate), self.llm_router, team_id):
-            verbose_proxy_logger.info(
-                "Not steering %s to %s, the alternate does not serve %s", model, alternate, call_type
-            )
-            return False
-        probe: Final = REQUEST_BUCKET.validate_python(
-            check_and_merge_model_level_guardrails(
-                data=dict(data, model=alternate, metadata=_metadata_bucket(data, "metadata") or {}),
-                llm_router=self.llm_router,
-                trust_client_model_info=False,
-            )
-        )
-        if _guardrail_entries(probe) != _guardrail_entries(data):
-            verbose_proxy_logger.info(
-                "Not steering %s to %s, the alternate adds model-level guardrails", model, alternate
-            )
-            return False
-        return True
+        return steerable(self.llm_router, model, alternate, data, call_type, team_id)
 
     async def _idle_permitted_alternate(
         self, alternate: str, user_api_key_dict: UserAPIKeyAuth, threshold: float, preferred: ModelGroupInfo

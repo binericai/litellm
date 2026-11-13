@@ -1,0 +1,747 @@
+import os
+from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from itertools import count
+from typing import Final, Literal
+
+from fastapi import HTTPException
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from redis.exceptions import RedisError
+from typing_extensions import TypeIs  # noqa: TID251  # tells the legacy and native dynamic limiters apart
+
+import litellm
+from litellm import Router
+from litellm._internal_context import with_service_target
+from litellm.caching.caching import DualCache
+from litellm.caching.redis_cache import RedisCircuitBreakerOpenError
+from litellm.integrations.custom_logger_v2.call import CallContext
+from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.native import (
+    NativeLogger,
+    NativeState,
+    WireAbort,
+    WireManifest,
+    _namespace,  # pyright: ignore[reportPrivateUsage]  # the generated class needs this port's base
+    register_abort_error,
+)
+from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
+from litellm.litellm_core_utils.add_retry_fallback_headers import (
+    ensure_response_additional_headers,
+    response_has_hidden_params,
+)
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
+from litellm.litellm_core_utils.token_counter import offload_token_count
+from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError, map_v3_rate_limit_type
+from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
+    AlternateAuthorizer,
+    _PROXY_DynamicRateLimitHandlerV3,  # pyright: ignore[reportPrivateUsage]  # the class behind the public alias, usable in a type
+    _SettlementLoggingObject,  # pyright: ignore[reportPrivateUsage]  # settlement shares the handler's metadata slice
+    _usage_of,  # pyright: ignore[reportPrivateUsage]  # settlement shares the handler's usage rule
+    _with_access_groups,  # pyright: ignore[reportPrivateUsage]  # steering stamps the same groups
+    alternate_grant_for,
+    steerable,
+)
+from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+    PROXY_MaxParallelRequestsHandler_v3,
+    RateLimitDescriptor,
+    RateLimitedModel,
+    RateLimitResponse,
+    RequestRateLimiterStash,
+    ReservationOperation,
+    WindowGuardedIncrement,
+    _request_stash,  # pyright: ignore[reportPrivateUsage]  # a v2 handler runs in a copied context, so the request's stash is rebound there
+    borrowing_team_model_limits,
+    callback_kwargs_mapping,
+    claim_request_stash_for_data,
+    get_or_create_request_stash,
+)
+from litellm.proxy.hooks.priority_class_share import ActiveTeamRegistry
+from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
+from litellm.proxy.utils import InternalUsageCache
+from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, CounterIncrement, RateLimitCounter, RateLimitScope
+from litellm.types.utils import Usage
+
+NATIVE_FLAG: Final = "LITELLM_NATIVE_DYNAMIC_RATE_LIMITER_V3"
+_METADATA_BUCKETS: Final = ("metadata", "litellm_metadata")
+_TOKENS: Final = count(1)
+
+
+def native_enabled() -> bool:
+    return os.getenv(NATIVE_FLAG, "").strip().lower() == "true"
+
+
+@dataclass(slots=True)
+class LiveRequest:
+    hook: Hook | None = None
+    data: Mapping[str, object] | None = None
+    auth: UserAPIKeyAuth | None = None
+    response: object = None
+    kwargs: Mapping[str, object] | None = None
+    raised: dict[int, BaseException] = field(default_factory=dict)  # mutable-ok: exceptions the seam re-raises
+    responses: dict[int, RateLimitResponse] = field(default_factory=dict)  # mutable-ok: limiter replies by id
+
+
+_LIVE: Final[ContextVar[LiveRequest | None]] = ContextVar("native_model_capacity_live", default=None)
+
+
+def _live() -> LiveRequest:
+    live: Final = _LIVE.get()
+    if live is None:
+        raise RuntimeError("the model capacity seam was called outside a live request")
+    return live
+
+
+def auth_from_request(data: object) -> UserAPIKeyAuth | None:
+    request: Final = as_str_mapping(data)
+    if request is None:
+        return None
+    for bucket_name in _METADATA_BUCKETS:
+        bucket = as_str_mapping(request.get(bucket_name))
+        auth = None if bucket is None else bucket.get("user_api_key_auth")
+        if isinstance(auth, UserAPIKeyAuth):
+            return auth
+        if as_str_mapping(auth) is not None:
+            try:
+                return UserAPIKeyAuth.model_validate(auth)
+            except ValidationError:
+                continue
+    return None
+
+
+def key_facts(auth: UserAPIKeyAuth | None) -> Mapping[str, object]:
+    if auth is None:
+        return {}
+    team_metadata: Final = as_str_mapping(auth.team_metadata) or {}
+    key_metadata: Final = as_str_mapping(auth.metadata) or {}  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # the key's untyped metadata dict
+    team_priority: Final = team_metadata.get("priority")
+    return {
+        "team_id": auth.team_id,
+        "team_alias": auth.team_alias,
+        "priority": team_priority if team_priority is not None else key_metadata.get("priority"),
+        "model_preferences": team_metadata.get("model_preferences"),
+        "budget_reservation": auth.budget_reservation,
+    }
+
+
+def _usage_tokens(usage: Usage | None) -> Mapping[str, int] | None:
+    if usage is None:
+        return None
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
+def _logged_usage(kwargs: Mapping[str, object]) -> Mapping[str, int] | None:
+    combined: Final = kwargs.get("combined_usage_object")
+    if isinstance(combined, Usage):
+        return _usage_tokens(combined)
+    payload: Final = as_str_mapping(kwargs.get("standard_logging_object"))
+    if payload is None:
+        return None
+    return {name: _count(payload.get(name)) for name in ("prompt_tokens", "completion_tokens", "total_tokens")}
+
+
+def _count(value: object) -> int:
+    return int(value) if isinstance(value, int | float) else 0
+
+
+def _settlement(kwargs: Mapping[str, object]) -> Mapping[str, object]:
+    try:
+        logged: Final = _SettlementLoggingObject.model_validate(kwargs.get("standard_logging_object") or {})
+    except ValidationError:
+        return {"valid": False}
+    metadata: Final = logged.metadata
+    if metadata is None:
+        return {"valid": True}
+    return {
+        "valid": True,
+        "priority": metadata.priority,
+        "team_id": metadata.user_api_key_team_id,
+        "team_alias": metadata.user_api_key_team_alias,
+    }
+
+
+def _attempt_facts(raw: object) -> Mapping[str, object]:
+    from litellm.proxy.common_utils.callback_utils import (
+        get_model_group_from_litellm_kwargs,  # pyright: ignore[reportUnknownVariableType]  # takes a bare dict
+    )
+
+    kwargs: Final = callback_kwargs_mapping(raw)
+    payload: Final = as_str_mapping(kwargs.get("standard_logging_object"))
+    failed: Final = (payload is not None and payload.get("status") == "failure") or "exception" in kwargs
+    call_id: Final = kwargs.get("litellm_call_id")
+    try:
+        model_group: Final = get_model_group_from_litellm_kwargs(dict(kwargs))
+    except Exception:  # noqa: BLE001  # an unreadable group settles nothing, as the handler's own guard does
+        return {"call_id": call_id if isinstance(call_id, str) else None, "failed": failed}
+    return {
+        "call_id": call_id if isinstance(call_id, str) else None,
+        "failed": failed,
+        "model_group_known": True,
+        "model_group": model_group,
+        "usage": _usage_tokens(_usage_of(kwargs, None)) if failed else _logged_usage(kwargs),
+        "settlement": _settlement(kwargs),
+    }
+
+
+def _request_facts(raw: object) -> Mapping[str, object]:
+    live: Final = _LIVE.get()
+    data: Final = as_str_mapping(raw) or {}
+    call_id: Final = data.get("litellm_call_id")
+    return {
+        "call_id": call_id if isinstance(call_id, str) else None,
+        "key": key_facts(live.auth if live is not None else auth_from_request(data)),
+    }
+
+
+def _project_kwargs(raw: object) -> object:
+    live: Final = _LIVE.get()
+    if live is not None and live.hook is Hook.attempt_ended:
+        return _attempt_facts(raw)
+    return _request_facts(raw)
+
+
+PROJECTIONS: Final[Mapping[Field, Callable[[object], object]]] = {
+    Field.deprecated_kwargs: _project_kwargs,
+    Field.deprecated_response_obj: lambda _response: None,
+}
+
+
+class _Counter(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    value: str
+    kind: Literal["requests", "tokens"]
+
+    def counter(self) -> RateLimitCounter:
+        return RateLimitScope(self.key, self.value).counter(self.kind)
+
+
+class _Operation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    op: Literal["increment", "guarded"]
+    counter: _Counter
+    amount: int
+    ttl: int | None
+    expected_window_start: str | None = None
+    backend: Literal["redis", "local"] | None = None
+
+    def operation(self) -> ReservationOperation:
+        increment: Final = CounterIncrement(counter=self.counter.counter(), amount=self.amount, ttl=self.ttl)
+        if self.op == "increment" or self.expected_window_start is None or self.backend is None:
+            return increment
+        return WindowGuardedIncrement(
+            increment=increment, expected_window_start=self.expected_window_start, reservation_backend=self.backend
+        )
+
+
+_ARGS: Final = TypeAdapter(dict[str, object])
+_DESCRIPTORS: Final = TypeAdapter(list[RateLimitDescriptor])
+_INCREMENTS: Final = TypeAdapter(list[dict[Literal["requests", "tokens"], int]])
+_OPERATIONS: Final = TypeAdapter(tuple[_Operation, ...])
+_PAIRS: Final = TypeAdapter(tuple[tuple[str, object], ...])
+_STRINGS: Final = TypeAdapter(tuple[str, ...])
+_TOKEN_LIST: Final = TypeAdapter(tuple[int, ...])
+
+
+def _wire_response(live: LiveRequest, response: RateLimitResponse) -> Mapping[str, object]:
+    token: Final = next(_TOKENS)
+    live.responses[token] = response  # rebind-ok: the reply is kept by id so publish can stash the same object
+    return {
+        "id": token,
+        "overall_code": response["overall_code"],
+        "statuses": [
+            {
+                "code": status["code"],
+                "current_limit": status["current_limit"],
+                "limit_remaining": status["limit_remaining"],
+                "rate_limit_type": status["rate_limit_type"],
+                "descriptor_key": status["descriptor_key"],
+            }
+            for status in response["statuses"]
+        ],
+        "reservation_windows": [
+            {
+                "counter": {
+                    "key": window[0].scope.descriptor_key,
+                    "value": window[0].scope.descriptor_value,
+                    "kind": window[0].kind,
+                },
+                "start": window[1],
+                "backend": window[2],
+            }
+            for window in response.get("reservation_windows", frozenset())
+        ],
+    }
+
+
+def _raised(error: Exception) -> Mapping[str, object]:
+    live: Final = _LIVE.get()
+    token: Final = next(_TOKENS)
+    if live is not None:
+        live.raised[token] = error
+    kind: Final = (
+        "http"
+        if isinstance(error, HTTPException)
+        else "registry_unavailable"
+        if isinstance(error, RedisError | RedisCircuitBreakerOpenError | ValidationError)
+        else "other"
+    )
+    return {"raised": {"token": token, "kind": kind, "message": str(error)}}
+
+
+def _seam(
+    method: Callable[["CapacityDelegate", Mapping[str, object]], Awaitable[object]],
+) -> Callable[["CapacityDelegate", object], Awaitable[Mapping[str, object]]]:
+    async def call(self: "CapacityDelegate", args: object) -> Mapping[str, object]:
+        try:
+            return {"ok": await method(self, _ARGS.validate_python(args))}
+        except Exception as error:  # noqa: BLE001  # Rust decides which errors fail open and which re-raise
+            return _raised(error)
+
+    return call
+
+
+class CapacityDelegate:
+    def __init__(
+        self,
+        internal_usage_cache: DualCache,
+        v3_limiter: PROXY_MaxParallelRequestsHandler_v3,
+        is_model_authorized: AlternateAuthorizer,
+    ) -> None:
+        self.v3_limiter: Final = v3_limiter
+        self.active_teams: Final = ActiveTeamRegistry(internal_usage_cache)
+        self._is_model_authorized: Final = is_model_authorized
+        self.llm_router: Router | None = None
+
+    def _router(self) -> Router:
+        if self.llm_router is None:
+            raise AttributeError("'CapacityDelegate' object has no attribute 'llm_router'")
+        return self.llm_router
+
+    def _auth(self) -> UserAPIKeyAuth:
+        auth: Final = _live().auth
+        if auth is None:
+            raise ValueError("the request carries no key auth")
+        return auth
+
+    @_seam
+    async def settings(self, _args: Mapping[str, object]) -> object:
+        from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
+            _get_priority_settings,  # pyright: ignore[reportPrivateUsage]  # one settings source
+        )
+
+        settings: Final = _get_priority_settings()
+        reservation: Final = litellm.priority_reservation
+        return {
+            "priority_reservation": None
+            if reservation is None
+            else [[str(name), value] for name, value in reservation.items()],
+            "default_priority": settings.default_priority,
+            "saturation_threshold": settings.saturation_threshold,
+            "class_split": settings.priority_class_share_splits_equally_among_active_teams,
+            "saturation_check_cache_ttl": settings.saturation_check_cache_ttl,
+            "window_size": self.v3_limiter.window_size,
+            "rate_limit_type": self.v3_limiter.get_rate_limit_type(),
+        }
+
+    @_seam
+    async def group(self, args: Mapping[str, object]) -> object:
+        group: Final = self._router().registry().group(str(args["model"]))
+        if group is None:
+            return None
+        return {
+            "tpm": group.tpm,
+            "rpm": group.rpm,
+            "input_cost_per_token": group.input_cost_per_token,
+            "output_cost_per_token": group.output_cost_per_token,
+        }
+
+    @_seam
+    @with_service_target(RATE_LIMITS_TARGET)
+    async def read_counter(self, args: Mapping[str, object]) -> object:
+        counter: Final = _Counter.model_validate(args["counter"]).counter()
+        value: Final = await self.v3_limiter.rate_limits.get(counter, backfill_ttl=args["backfill_ttl"])  # pyright: ignore[reportArgumentType]  # the settings value as the handler passes it
+        return None if isinstance(value, dict) else value
+
+    def _span(self) -> object:
+        auth: Final = _live().auth
+        return None if auth is None else auth.parent_otel_span
+
+    @_seam
+    @with_service_target(RATE_LIMITS_TARGET)
+    async def check_and_increment(self, args: Mapping[str, object]) -> object:
+        response: Final = await self.v3_limiter.atomic_check_and_increment_by_n(
+            descriptors=_DESCRIPTORS.validate_python(args["descriptors"]),
+            increments=_INCREMENTS.validate_python(args["increments"]),
+            parent_otel_span=self._span(),  # pyright: ignore[reportArgumentType]  # the key's span as the handler passes it
+        )
+        return _wire_response(_live(), response)
+
+    @_seam
+    @with_service_target(RATE_LIMITS_TARGET)
+    async def should_rate_limit(self, args: Mapping[str, object]) -> object:
+        response: Final = await self.v3_limiter.should_rate_limit(
+            _DESCRIPTORS.validate_python(args["descriptors"]),
+            parent_otel_span=self._span(),  # pyright: ignore[reportArgumentType]  # the key's span as the handler passes it
+            read_only=args["read_only"] is True,
+            skip_parallel_check=args["skip_parallel_check"] is True,
+        )
+        return _wire_response(_live(), response)
+
+    @_seam
+    @with_service_target(RATE_LIMITS_TARGET)
+    async def apply(self, args: Mapping[str, object]) -> object:
+        from litellm.litellm_core_utils.core_helpers import get_parent_otel_span_from_kwargs
+
+        operations: Final = tuple(
+            operation.operation() for operation in _OPERATIONS.validate_python(args["operations"])
+        )
+        live: Final = _LIVE.get()
+        if args["traced"] is True and live is not None and live.kwargs is not None:
+            await self.v3_limiter.async_increment_reservation_aware_tokens(
+                pipeline_operations=operations,
+                parent_otel_span=get_parent_otel_span_from_kwargs(dict(live.kwargs)),
+            )
+            return None
+        await self.v3_limiter.async_increment_reservation_aware_tokens(pipeline_operations=operations)
+        return None
+
+    @_seam
+    async def borrowing_limits(self, args: Mapping[str, object]) -> object:
+        model: Final = str(args["model"])
+        rate_limited: Final = self.v3_limiter.rate_limited_model(model) or RateLimitedModel(
+            requested=model, group=model
+        )
+        limits: Final = borrowing_team_model_limits(self._auth(), rate_limited)
+        if limits.tpm is None and limits.rpm is None:
+            return None
+        return {
+            "group": rate_limited.group,
+            "tpm": limits.tpm,
+            "rpm": limits.rpm,
+            "max_borrow_multiple": limits.max_borrow_multiple,
+        }
+
+    @_seam
+    async def estimate_tokens(self, args: Mapping[str, object]) -> object:
+        live: Final = _live()
+        data: Final = live.data
+        if not data:
+            return {"kind": "no_body"}
+        model: Final = str(args["model"])
+        tpm_share: Final = int(str(args["tpm_share"]))
+        call_type: Final = args["call_type"] if isinstance(args["call_type"], str) else None
+        as_dispatched: Final = dict(data, model=model)
+        if self.v3_limiter.get_rate_limit_type() != "input":
+            self.v3_limiter.bound_output_for_limit(as_dispatched, tpm_share, call_type)
+        try:
+            estimate: Final = await offload_token_count(self.v3_limiter.estimate_request_tokens)(
+                data=as_dispatched,
+                model=model,
+                min_configured_tpm_limit=tpm_share,
+                call_type=call_type,
+                team_id=None if live.auth is None else live.auth.team_id,
+                rate_limit_type=self.v3_limiter.get_rate_limit_type(),
+            )
+        except Exception:  # noqa: BLE001  # an unreadable prompt still holds the minimum so admission runs
+            return {"kind": "failed"}
+        return {"kind": "tokens", "tokens": estimate}
+
+    @_seam
+    async def cap_output(self, args: Mapping[str, object]) -> object:
+        data: Final = _live().data
+        call_type: Final = args["call_type"] if isinstance(args["call_type"], str) else None
+        self.v3_limiter.bound_output_for_limit(data, int(str(args["tpm_share"])), call_type)
+        return None
+
+    @_seam
+    async def publish(self, args: Mapping[str, object]) -> object:
+        live: Final = _live()
+        responses: Final = tuple(live.responses[token] for token in _TOKEN_LIST.validate_python(args["responses"]))
+        get_or_create_request_stash().rate_limit_response = (
+            responses[0]
+            if len(responses) == 1
+            else RateLimitResponse(
+                overall_code=responses[0]["overall_code"],
+                statuses=responses[0]["statuses"] + responses[1]["statuses"],
+            )
+        )
+        return None
+
+    @_seam
+    async def stash_call_type(self, _args: Mapping[str, object]) -> object:
+        return get_or_create_request_stash().call_type
+
+    @_seam
+    @with_service_target(RATE_LIMITS_TARGET)
+    async def post_call_success(self, _args: Mapping[str, object]) -> object:
+        live: Final = _live()
+        await self.v3_limiter.async_post_call_success_hook(  # pyright: ignore[reportUnknownMemberType]  # the legacy hook signature
+            data=dict(live.data or {}) if not isinstance(live.data, dict) else live.data,
+            user_api_key_dict=self._auth(),
+            response=live.response,  # pyright: ignore[reportArgumentType]  # the live response the proxy handed this hook
+        )
+        return None
+
+    @_seam
+    @with_service_target(RATE_LIMITS_TARGET)
+    async def touch(self, args: Mapping[str, object]) -> object:
+        members: Final = await self.active_teams.touch(
+            str(args["model"]), str(args["member"]), str(args["priority_class"]), int(str(args["window"]))
+        )
+        return [[member, priority_class] for member, priority_class in members.items()]
+
+    @_seam
+    async def steerable(self, args: Mapping[str, object]) -> object:
+        team_id: Final = args["team_id"]
+        return steerable(
+            self._router(),
+            str(args["model"]),
+            str(args["alternate"]),
+            _live().data or {},
+            str(args["call_type"]),  # pyright: ignore[reportArgumentType]  # the proxy's call type as the handler got it
+            team_id if isinstance(team_id, str) else None,
+        )
+
+    @_seam
+    async def authorize(self, args: Mapping[str, object]) -> object:
+        grant: Final = await self._is_model_authorized(self._auth(), str(args["alternate"]))
+        return None if grant is None else list(grant.access_groups)
+
+    @_seam
+    async def steer(self, args: Mapping[str, object]) -> object:
+        live: Final = _live()
+        data: Final = live.data
+        if not isinstance(data, dict):
+            return None
+        groups: Final = _STRINGS.validate_python(args["access_groups"])
+        stamped: Final = _with_access_groups(data, groups)
+        for bucket in _METADATA_BUCKETS:
+            if bucket in stamped:
+                data[bucket] = stamped[bucket]
+        return None
+
+    @_seam
+    async def add_response_headers(self, args: Mapping[str, object]) -> object:
+        response: Final = _live().response
+        if not response_has_hidden_params(response):
+            return None
+        additional_headers: Final = ensure_response_additional_headers(response)
+        for name, value in _PAIRS.validate_python(args["headers"]):
+            additional_headers[name] = value  # pyright: ignore[reportArgumentType]  # the priority value as the handler set it
+        return None
+
+    @_seam
+    async def metrics_enabled(self, _args: Mapping[str, object]) -> object:
+        from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
+            _prometheus_loggers,  # pyright: ignore[reportPrivateUsage]  # one metrics source
+        )
+
+        return bool(_prometheus_loggers())
+
+    @_seam
+    async def throttled(self, args: Mapping[str, object]) -> object:
+        from litellm._logging import verbose_proxy_logger
+        from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
+            _prometheus_loggers,  # pyright: ignore[reportPrivateUsage]  # one metrics source
+        )
+
+        for logger in _prometheus_loggers():
+            try:
+                logger.increment_dynamic_limiter_throttled(
+                    model_group=str(args["model_group"]),
+                    team=str(args["team"]),
+                    team_alias=args["team_alias"] if isinstance(args["team_alias"], str) else None,
+                    priority=str(args["priority"]),
+                    rate_limit_type=str(args["rate_limit_type"]),
+                    reason=str(args["reason"]),
+                )
+            except Exception as metrics_error:  # noqa: BLE001  # a failing metrics sink must not change the 429
+                verbose_proxy_logger.warning("Dynamic rate limiter throttle metric failed: %s", metrics_error)
+        return None
+
+    @_seam
+    async def set_share(self, args: Mapping[str, object]) -> object:
+        from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
+            _prometheus_loggers,  # pyright: ignore[reportPrivateUsage]  # one metrics source
+        )
+
+        for logger in _prometheus_loggers():
+            logger.set_dynamic_limiter_share(
+                model_group=str(args["model_group"]),
+                team=str(args["team"]),
+                team_alias=args["team_alias"] if isinstance(args["team_alias"], str) else None,
+                priority=args["priority"],  # pyright: ignore[reportArgumentType]  # the priority value as the handler passes it
+                share_tokens=int(str(args["share_tokens"])),
+                borrowed_tokens=int(str(args["borrowed_tokens"])),
+            )
+        return None
+
+
+def _rate_limit_error(wire: WireAbort) -> Exception:
+    fields: Final = (None if wire.error is None else as_str_mapping(wire.error.fields)) or {}
+    raw_type: Final = fields.get("rate_limit_type")
+    model: Final = fields.get("model")
+    resolved_model, llm_provider = resolve_llm_provider_for_rate_limit(model if isinstance(model, str) else None)
+    return ProxyRateLimitError(
+        detail=dict(_PAIRS.validate_python(fields.get("detail") or ())),
+        headers=dict(_PAIRS.validate_python(fields.get("headers") or ())),
+        rate_limit_type=map_v3_rate_limit_type(raw_type if isinstance(raw_type, str) else None),
+        model=resolved_model,
+        llm_provider=llm_provider,
+    )
+
+
+def _reraise(wire: WireAbort) -> Exception:
+    live: Final = _LIVE.get()
+    token: Final = ((None if wire.error is None else as_str_mapping(wire.error.fields)) or {}).get("token")
+    raised: Final = None if live is None or not isinstance(token, int) else live.raised.pop(token, None)
+    if isinstance(raised, Exception):
+        return raised
+    return HTTPException(status_code=wire.status, detail={"error": wire.message}, headers=dict(wire.headers))
+
+
+register_abort_error("proxy_rate_limit", _rate_limit_error)
+register_abort_error("reraise", _reraise)
+
+
+class _StashedState(NativeState):
+    __slots__ = ("request_stash",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_stash: RequestRateLimiterStash | None = None
+
+
+class NativeDynamicRateLimiter(NativeLogger):
+    delegate: CapacityDelegate
+    capacity: object
+
+    @property
+    def v3_limiter(self) -> PROXY_MaxParallelRequestsHandler_v3:
+        return self.delegate.v3_limiter
+
+    def update_variables(self, llm_router: Router) -> None:
+        self.delegate.llm_router = llm_router
+
+    async def run_native(
+        self, hook: Hook, reads: frozenset[Field], view: object, ctx: CallContext[object]
+    ) -> Patch | Abort | None:
+        data: Final = as_str_mapping(getattr(view, Field.deprecated_kwargs.value, None))
+        state: Final = ctx.state if isinstance(ctx.state, _StashedState) else None
+        if hook is Hook.pre_call and state is not None and data is not None and "model" in data:
+            state.request_stash = claim_request_stash_for_data(data)
+        stash_token: Final = (
+            None if state is None or state.request_stash is None else _request_stash.set(state.request_stash)
+        )
+        live: Final = LiveRequest(
+            hook=hook,
+            data=data if hook is not Hook.attempt_ended else None,
+            auth=auth_from_request(data) if hook is not Hook.attempt_ended else None,
+            response=getattr(view, Field.deprecated_response_obj.value, None),
+            kwargs=data if hook is Hook.attempt_ended else None,
+        )
+        token: Final = _LIVE.set(live)
+        try:
+            return await super().run_native(hook, reads, view, ctx)
+        finally:
+            _LIVE.reset(token)
+            if stash_token is not None:
+                _request_stash.reset(stash_token)
+
+    async def async_fallback_target_allowed(
+        self, user_api_key_dict: UserAPIKeyAuth, model: str, request_data: Mapping[str, object], *, commit: bool = True
+    ) -> bool:
+        call_id: Final = request_data.get("litellm_call_id")
+        live: Final = LiveRequest(data={**request_data, "model": model}, auth=user_api_key_dict)
+        token: Final = _LIVE.set(live)
+        try:
+            answer: Final = await self.capacity.fallback_target_allowed(  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # the native handle
+                call_id if isinstance(call_id, str) else None, key_facts(user_api_key_dict), model, commit
+            )
+        finally:
+            _LIVE.reset(token)
+        raised_token: Final = answer.get("raised")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # the native handle's answer
+        if isinstance(raised_token, int) and raised_token in live.raised:
+            raise live.raised[raised_token]
+        if "failed" in answer:
+            raise RuntimeError(str(answer["failed"]))  # pyright: ignore[reportUnknownArgumentType]  # the native handle's answer
+        return answer.get("allowed") is True  # pyright: ignore[reportUnknownMemberType]  # the native handle's answer
+
+
+def build_native_dynamic_rate_limiter(
+    internal_usage_cache: DualCache,
+    is_model_authorized: AlternateAuthorizer = alternate_grant_for,
+    time_provider: Callable[[], object] | None = None,
+) -> NativeDynamicRateLimiter:
+    from litellm.rust_bridge._native import (
+        NativeModelCapacity,  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]  # added by this port
+    )
+
+    v3_limiter: Final = PROXY_MaxParallelRequestsHandler_v3(
+        InternalUsageCache(dual_cache=internal_usage_cache),
+        time_provider=time_provider,  # pyright: ignore[reportArgumentType]  # the handler's clock
+    )
+    delegate: Final = CapacityDelegate(internal_usage_cache, v3_limiter, is_model_authorized)
+    capacity: Final = NativeModelCapacity(delegate)  # pyright: ignore[reportUnknownVariableType]  # the native handle
+    native: Final = capacity.callback()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # the native handle
+    manifest: Final = WireManifest.model_validate_json(native.manifest())  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # the native handle
+    namespace: Final = _namespace(native, manifest)  # pyright: ignore[reportUnknownArgumentType]  # the native handle
+    namespace["request_state"] = type(
+        f"{manifest.selection.name}_state",
+        (_StashedState,),
+        {"native": native, "__slots__": ()},  # pyright: ignore[reportUnknownArgumentType]  # the native handle
+    )
+    cls: Final = type(manifest.selection.name, (NativeDynamicRateLimiter,), namespace)
+    logger: Final = cls(native, PROJECTIONS)  # pyright: ignore[reportUnknownArgumentType]  # the native handle
+    logger.delegate = delegate
+    logger.capacity = capacity
+    return logger
+
+
+@dataclass(slots=True)
+class _Registered:
+    logger: NativeDynamicRateLimiter | None = None
+    enabled: bool | None = None
+
+
+_REGISTERED: Final = _Registered()
+
+
+def registered_native_dynamic_rate_limiter() -> NativeDynamicRateLimiter | None:
+    return _REGISTERED.logger
+
+
+def native_dynamic_rate_limiter(internal_usage_cache: DualCache, llm_router: object) -> NativeDynamicRateLimiter | None:
+    if _REGISTERED.enabled is None:
+        _REGISTERED.enabled = native_enabled()
+    if not _REGISTERED.enabled:
+        return None
+    if _REGISTERED.logger is None:
+        _REGISTERED.logger = build_native_dynamic_rate_limiter(internal_usage_cache)
+    if isinstance(llm_router, Router):
+        _REGISTERED.logger.update_variables(llm_router)
+    return _REGISTERED.logger
+
+
+def is_dynamic_rate_limiter(callback: object) -> TypeIs[_PROXY_DynamicRateLimitHandlerV3 | NativeDynamicRateLimiter]:
+    return isinstance(callback, _PROXY_DynamicRateLimitHandlerV3 | NativeDynamicRateLimiter)
+
+
+__all__ = [
+    "NATIVE_FLAG",
+    "CapacityDelegate",
+    "NativeDynamicRateLimiter",
+    "build_native_dynamic_rate_limiter",
+    "is_dynamic_rate_limiter",
+    "native_dynamic_rate_limiter",
+    "native_enabled",
+    "registered_native_dynamic_rate_limiter",
+]
