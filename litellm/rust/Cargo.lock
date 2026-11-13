@@ -4691,6 +4691,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "http 1.4.2",
+ "hyper 1.12.0",
  "litellm-auth-aws",
  "litellm-http",
  "reqwest",

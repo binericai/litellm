@@ -234,20 +234,25 @@ impl Uploader {
                 .and_then(|region| region),
         };
         let region = self.settings.signing_region(|| from_environment)?;
-        let sent = send(
-            &self.client,
-            SignedRequest {
-                method: Method::PUT,
-                url,
-                headers,
-                body: body.clone(),
-                region: &region,
-                credentials: &credentials,
-                time: (self.clock)(),
-                read_timeout: Some(self.settings.attempt_timeout),
-            },
-        )
-        .await;
+        let put = || {
+            send(
+                &self.client,
+                SignedRequest {
+                    method: Method::PUT,
+                    url,
+                    headers,
+                    body: body.clone(),
+                    region: &region,
+                    credentials: &credentials,
+                    time: (self.clock)(),
+                    read_timeout: Some(self.settings.attempt_timeout),
+                },
+            )
+        };
+        let sent = match put().await {
+            Err(error) if error.is_reconnectable() => put().await,
+            sent => sent,
+        };
         match sent {
             Ok(reply) => Ok(Attempt::Reply(reply)),
             Err(error) if error.is_transient() => Ok(Attempt::Failed(error)),

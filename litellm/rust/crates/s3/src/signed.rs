@@ -41,6 +41,16 @@ impl SendError {
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::Transport { .. })
     }
+
+    pub fn is_reconnectable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport {
+                kind: "ConnectError" | "RemoteProtocolError",
+                ..
+            }
+        )
+    }
 }
 
 pub fn signature_headers(request: &SignedRequest<'_>) -> Result<Vec<(String, String)>, SendError> {
@@ -107,8 +117,21 @@ fn transport(error: reqwest::Error) -> SendError {
         "Timeout"
     } else if error.is_connect() {
         "ConnectError"
+    } else if remote_protocol(&error) {
+        "RemoteProtocolError"
     } else {
         "TransportError"
     };
     SendError::Transport { kind, message }
+}
+
+fn remote_protocol(error: &reqwest::Error) -> bool {
+    let mut cause = std::error::Error::source(error);
+    while let Some(current) = cause {
+        if let Some(hyper) = current.downcast_ref::<hyper::Error>() {
+            return hyper.is_incomplete_message() || hyper.is_parse();
+        }
+        cause = current.source();
+    }
+    false
 }
