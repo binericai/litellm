@@ -1586,7 +1586,7 @@ class PrometheusLogger(CustomLogger):
     def _create_metric_factory(self, metric_class, shares_overflow_series: bool = True):
         """Create a factory function that returns either a real metric or a no-op metric"""
         if self._native_store is not None:
-            return self._native_store.factory(metric_class, self, shares_overflow_series)
+            return self._native_store.factory(metric_class, self, shares_overflow_series)  # pyright: ignore[reportUnknownArgumentType]  # the factory parameter is untyped, as before
 
         def factory(*args, **kwargs):
             # Extract metric name from the first argument or 'name' keyword argument
@@ -2776,14 +2776,14 @@ class PrometheusLogger(CustomLogger):
             enum_values=enum_values,
             label_context=label_context,
         )
-        self.litellm_remaining_api_key_requests_for_model.labels(**requests_labels).set(remaining_requests)
+        self.litellm_remaining_api_key_requests_for_model.labels(**requests_labels).set(remaining_requests)  # pyright: ignore[reportUnknownArgumentType]  # the value comes from untyped request kwargs, as before
 
         tokens_labels: Final = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric("litellm_remaining_api_key_tokens_for_model"),
             enum_values=enum_values,
             label_context=label_context,
         )
-        self.litellm_remaining_api_key_tokens_for_model.labels(**tokens_labels).set(remaining_tokens)
+        self.litellm_remaining_api_key_tokens_for_model.labels(**tokens_labels).set(remaining_tokens)  # pyright: ignore[reportUnknownArgumentType]  # the value comes from untyped request kwargs, as before
 
     @staticmethod
     def _get_input_sequence_length(
@@ -2907,7 +2907,7 @@ class PrometheusLogger(CustomLogger):
                 enum_values=latency_enum_values,
                 label_context=latency_label_context,
             )
-            self.litellm_request_total_latency_metric.labels(**_labels).observe(_observed_total_time_seconds)
+            self.litellm_request_total_latency_metric.labels(**_labels).observe(_observed_total_time_seconds)  # pyright: ignore[reportUnknownArgumentType]  # the value comes from untyped request kwargs, as before
             self._track_end_user_metric_series(
                 self.litellm_request_total_latency_metric,
                 "litellm_request_total_latency_metric",
@@ -2920,7 +2920,7 @@ class PrometheusLogger(CustomLogger):
                 enum_values=enum_values,
                 label_context=label_context,
             )
-            self.litellm_request_queue_time_metric.labels(**_labels).observe(queue_time_seconds)
+            self.litellm_request_queue_time_metric.labels(**_labels).observe(queue_time_seconds)  # pyright: ignore[reportUnknownArgumentType]  # the value comes from untyped request kwargs, as before
             self._track_end_user_metric_series(
                 self.litellm_request_queue_time_metric,
                 "litellm_request_queue_time_seconds",
@@ -3613,7 +3613,7 @@ class PrometheusLogger(CustomLogger):
                     model_group=model_group,
                 ),
             )
-            self.litellm_deployment_tpm_limit.labels(**_labels).set(tpm)
+            self.litellm_deployment_tpm_limit.labels(**_labels).set(tpm)  # pyright: ignore[reportUnknownArgumentType]  # the value comes from untyped request kwargs, as before
 
         if rpm is not None:
             _labels = prometheus_label_factory(
@@ -3626,7 +3626,7 @@ class PrometheusLogger(CustomLogger):
                     model_group=model_group,
                 ),
             )
-            self.litellm_deployment_rpm_limit.labels(**_labels).set(rpm)
+            self.litellm_deployment_rpm_limit.labels(**_labels).set(rpm)  # pyright: ignore[reportUnknownArgumentType]  # the value comes from untyped request kwargs, as before
 
     async def _async_set_router_remaining_metrics(
         self,
@@ -3759,7 +3759,7 @@ class PrometheusLogger(CustomLogger):
                     label_context=label_context,
                 )
                 self.litellm_overhead_latency_metric.labels(**_labels).observe(
-                    litellm_overhead_time_ms / 1000
+                    litellm_overhead_time_ms / 1000  # pyright: ignore[reportUnknownArgumentType]  # the value comes from untyped request kwargs, as before
                 )  # set as seconds
 
             self._set_overhead_with_guardrails_metric(
@@ -3841,7 +3841,7 @@ class PrometheusLogger(CustomLogger):
                     enum_values=enum_values,
                     label_context=label_context,
                 )
-                self.litellm_deployment_latency_per_output_token.labels(**_labels).observe(latency_per_token)
+                self.litellm_deployment_latency_per_output_token.labels(**_labels).observe(latency_per_token)  # pyright: ignore[reportUnknownArgumentType]  # the value comes from untyped request kwargs, as before
 
         except Exception as e:
             verbose_logger.exception("Prometheus Error: set_llm_deployment_success_metrics. Exception occured - %s", e)
