@@ -11,7 +11,6 @@ import litellm
 from litellm.caching import DualCache
 from litellm.integrations.custom_logger_v2.call import CallContext
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
-from litellm.integrations.custom_logger_v2.native import WireManifest
 from litellm.integrations.custom_logger_v2.outcomes import Abort
 from litellm.proxy import proxy_server
 from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable, UserAPIKeyAuth
@@ -26,13 +25,14 @@ from litellm.proxy.spend_tracking.budget_reservation import (
     release_unbound_budget_reservation,
     reserve_budget_for_request,
 )
-from litellm.proxy.utils import ProxyLogging
+from litellm.proxy.utils import ProxyLogging, hash_token
 from litellm.redis.stores.connection import connect
 from litellm.redis.stores.spend_counters import SpendCounterStore
 
 ROUTE: Final = "/chat/completions"
 BODY: Final = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 1000}
-TOKEN: Final = "hashed-native"
+API_KEY: Final = "sk-native"
+TOKEN: Final = hash_token(API_KEY)
 ESTIMATE: Final = estimate_request_max_cost(request_body=BODY, route=ROUTE, llm_router=None, input_token_counts={})
 KEY: Final = f"spend:key:{TOKEN}"
 TEAM: Final = "spend:team:team-1"
@@ -52,7 +52,7 @@ class Identity:
 
     def token(self) -> UserAPIKeyAuth:
         return UserAPIKeyAuth(
-            api_key="sk-native",
+            api_key=API_KEY,
             token=TOKEN,
             max_budget=self.key_budget,
             spend=0.0,
@@ -76,7 +76,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> Iterator[SpendCounterStore]:
     spend_counter_store: Final = SpendCounterStore(connect(None).spend_counters())
     monkeypatch.setattr(proxy_server, "spend_counter_store", spend_counter_store)
     monkeypatch.setattr(proxy_server, "prisma_client", None)
-    monkeypatch.setattr(litellm, "budget_throttle_pct", 50, raising=False)
+    monkeypatch.setattr(litellm, "budget_exceeded_throttle_percentage", 0.5)
     yield spend_counter_store
     native_budgets._installed.clear()  # pyright: ignore[reportPrivateUsage]  # later tests run without a native owner
 
@@ -106,16 +106,11 @@ def _arguments(identity: Identity) -> Mapping[str, object]:
     }
 
 
-async def _no_attempt_line(_status: str, _response_cost: float) -> None:
-    return None
-
-
 @dataclass(frozen=True, slots=True)
 class Admitted:
     reservation: dict[str, object] | None  # mutable-ok: settlement stamps finalized on the shared reservation
     refusal: Exception | None
     counters: Mapping[str, float]
-    attempt_ended: Callable[[str, float], Awaitable[None]] = _no_attempt_line
 
 
 def _install_native_owner(store: SpendCounterStore) -> native_budgets.NativeBudgetsLogger:
@@ -145,34 +140,15 @@ async def _native_admit(store: SpendCounterStore, identity: Identity, call_id: s
     plan: Final = await reserve_budget_for_request(**_arguments(identity))  # pyright: ignore[reportArgumentType]  # the shared argument table is typed per key above
     data: Final = {**BODY, "litellm_call_id": call_id}
     view: Final = type("View", (), {Field.deprecated_kwargs.value: data})()
-    state_type: Final = type(logger).request_state
-    assert state_type is not None
-    state: Final = state_type()
     outcome: Final = await logger.run_native(
         Hook.pre_call,
         frozenset({Field.deprecated_kwargs}),
         view,
-        CallContext[object](hook=Hook.pre_call, call=None, state=state),
+        CallContext[object](hook=Hook.pre_call, call=None, state=None),
     )
-
-    subscribed: Final = frozenset(
-        subscription.hook for subscription in WireManifest.model_validate_json(logger.native.manifest()).subscriptions
-    )
-
-    async def attempt_ended(status: str, response_cost: float) -> None:
-        if Hook.attempt_ended not in subscribed:
-            return
-        payload: Final = {"status": status, "response_cost": response_cost, "id": call_id}
-        _ = await logger.run_native(
-            Hook.attempt_ended,
-            frozenset({Field.standard_logging_payload}),
-            type("View", (), {Field.standard_logging_payload.value: payload})(),
-            CallContext[object](hook=Hook.attempt_ended, call=None, state=state),
-        )
-
     refusal: Final = outcome.exception if isinstance(outcome, Abort) else None
     reservation: Final = plan if plan is not None and plan.get("native_call_id") is not None else None
-    return Admitted(reservation=reservation, refusal=refusal, counters=_snapshot(store), attempt_ended=attempt_ended)
+    return Admitted(reservation=reservation, refusal=refusal, counters=_snapshot(store))
 
 
 def _refusal_fields(error: Exception | None) -> object:
@@ -265,37 +241,29 @@ async def _db_logger_success(reservation: dict[str, object]) -> None:  # mutable
     )
 
 
-@dataclass(frozen=True, slots=True)
-class Exit:
-    attempt_status: str | None
-    settle: Settle
-
-
-EXITS: Final = {
-    "db_logger_charges_the_row": Exit("success", _db_logger_success),
-    "db_logger_releases_an_uncharged_row": Exit("success", release_budget_reservation),
-    "db_logger_releases_after_a_failed_write": Exit("success", release_or_invalidate_budget_reservation),
-    "failure_hook_releases": Exit("failure", release_or_invalidate_budget_reservation),
-    "client_disconnect_keeps_the_input_cost": Exit(None, release_budget_reservation_on_cancel),
-    "request_end_releases_an_unbound_hold": Exit(None, release_unbound_budget_reservation),
+EXITS: Final[Mapping[str, Settle]] = {
+    "db_logger_charges_the_row": _db_logger_success,
+    "db_logger_releases_an_uncharged_row": release_budget_reservation,
+    "db_logger_releases_after_a_failed_write": release_or_invalidate_budget_reservation,
+    "failure_hook_releases": release_or_invalidate_budget_reservation,
+    "client_disconnect_keeps_the_input_cost": release_budget_reservation_on_cancel,
+    "request_end_releases_an_unbound_hold": release_unbound_budget_reservation,
 }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_path", EXITS.values(), ids=EXITS.keys())
-async def test_every_exit_settles_the_native_hold_like_python(store: SpendCounterStore, exit_path: Exit) -> None:
+async def test_every_exit_settles_the_native_hold_like_python(store: SpendCounterStore, exit_path: Settle) -> None:
     identity: Final = Identity(team_budget=100.0, user_budget=100.0, spend={KEY: 1.0, TEAM: 2.0, USER: 0.5})
     python: Final = await _python_admit(store, identity)
     assert python.reservation is not None
-    await exit_path.settle(python.reservation)
+    await exit_path(python.reservation)
     settled_python: Final = _snapshot(store)
     store.flush_local()
 
     native: Final = await _native_admit(store, identity, "call-exit")
     assert native.reservation is not None
-    if exit_path.attempt_status is not None:
-        await native.attempt_ended(exit_path.attempt_status, 0.002)
-    await exit_path.settle(native.reservation)
+    await exit_path(native.reservation)
 
     assert _snapshot(store) == settled_python
     assert native.reservation.get("finalized") == python.reservation.get("finalized")
@@ -344,3 +312,50 @@ async def test_a_native_module_without_budgets_leaves_the_flag_off_proxy_reservi
     assert {entry["counter_key"]: held[entry["counter_key"]] for entry in entries} == {
         entry["counter_key"]: pytest.approx(reservation["reserved_cost"]) for entry in entries
     }
+
+
+DB_FLOOR: Final = 0.25
+DISTURBANCES: Final[Mapping[str, float | None]] = {"counter_expired": None, "counter_would_go_negative": 1e-9}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disturbance", DISTURBANCES.values(), ids=DISTURBANCES.keys())
+@pytest.mark.parametrize("exit_path", EXITS.values(), ids=EXITS.keys())
+async def test_settling_a_counter_that_went_inconsistent_reseeds_it_like_python(
+    store: SpendCounterStore, monkeypatch: pytest.MonkeyPatch, disturbance: float | None, exit_path: Settle
+) -> None:
+    async def reseed_from_db(counter_key: str) -> bool:
+        store.set_local(counter_key, DB_FLOOR)
+        return True
+
+    monkeypatch.setattr(proxy_server, "reseed_spend_counter_from_db", reseed_from_db)
+    identity: Final = Identity(team_budget=100.0, spend={KEY: 1.0, TEAM: 2.0})
+    settled: Final[list[Mapping[str, float]]] = []  # mutable-ok: one snapshot per side
+    for native in (False, True):
+        store.flush_local()
+        admitted = await (_native_admit(store, identity, "call-reseed") if native else _python_admit(store, identity))
+        assert admitted.reservation is not None
+        if disturbance is None:
+            store.flush_local()
+            _seed(store, Identity(spend={TEAM: identity.spend[TEAM] + ESTIMATE}))
+        else:
+            store.set_local(KEY, disturbance)
+        await exit_path(admitted.reservation)
+        settled.append(_snapshot(store))
+
+    assert settled[1] == settled[0]
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_key_holds_only_its_other_counters_on_both_sides(store: SpendCounterStore) -> None:
+    identity: Final = CASES["throttled_key_releases_its_hold"]
+    python: Final = await _python_admit(store, identity)
+    store.flush_local()
+    native: Final = await _native_admit(store, identity, "call-throttle")
+
+    held: Final = [
+        None if admitted.reservation is None else [entry["counter_key"] for entry in admitted.reservation["entries"]]  # pyright: ignore[reportGeneralTypeIssues]  # the entries list the reservation carries
+        for admitted in (python, native)
+    ]
+    assert held == [[TEAM], [TEAM]]
+    assert native.counters == python.counters

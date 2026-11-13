@@ -1285,11 +1285,15 @@ async def _reseed_reserved_entry(item: _EntryAdjustment, actual_cost: float) -> 
     reconcile: the optimistic delta no longer applies, so reseed from the DB floor and add the settled cost, since
     increment_spend_counters skips reserved keys. The reconcile runs before this request's spend is enqueued to the
     DB, so the reseeded floor excludes it."""
+    await reseed_reserved_counter(item.counter_key, actual_cost)
+
+
+async def reseed_reserved_counter(counter_key: str, actual_cost: float) -> None:
     from litellm.proxy.proxy_server import increment_spend_counter_cache, reseed_spend_counter_from_db
 
-    reseeded: Final = await reseed_spend_counter_from_db(counter_key=item.counter_key)
+    reseeded: Final = await reseed_spend_counter_from_db(counter_key=counter_key)
     if reseeded and actual_cost > 0:
-        await increment_spend_counter_cache(counter_key=item.counter_key, increment=actual_cost)
+        await increment_spend_counter_cache(counter_key=counter_key, increment=actual_cost)
 
 
 async def _counter_can_apply_adjustment(

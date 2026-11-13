@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, TypeAdapter
@@ -96,10 +96,11 @@ def pending_native_reservation(
     return reservation
 
 
-_admissions: Final[dict[int, asyncio.Future[Patch | Abort | None]]] = {}  # mutable-ok: in-flight admissions by reservation
+_Admission: TypeAlias = "asyncio.Future[Patch | Abort | None]"
+_admissions: Final[dict[int, _Admission]] = {}  # mutable-ok: in-flight admissions by reservation
 
 
-def native_admission(reservation: Mapping[str, object] | None) -> asyncio.Future[Patch | Abort | None] | None:
+def native_admission(reservation: Mapping[str, object] | None) -> _Admission | None:
     return None if reservation is None else _admissions.get(id(reservation))
 
 
@@ -194,8 +195,13 @@ class _MessageFields(BaseModel):
     message: str
 
 
+class _Settled(_Reservation):
+    reseed: tuple[str, ...]
+
+
 _RESERVATION: Final = TypeAdapter(_Reservation | None)
-_SETTLED: Final = TypeAdapter(_Reservation)
+_HELD: Final = TypeAdapter(_Reservation)
+_SETTLED: Final = TypeAdapter(_Settled)
 _STR_MAPPING: Final = TypeAdapter(Mapping[str, object])
 
 
@@ -333,8 +339,12 @@ async def settle_native_reservation(
     budgets: Final = native_budgets()
     if budgets is None or NATIVE_CALL_ID_KEY not in reservation:
         return
-    held: Final = _SETTLED.validate_python(reservation)
+    held: Final = _HELD.validate_python(reservation)
     settled: Final = _SETTLED.validate_python(await budgets.settle(held.model_dump(), actual_cost, finalize))
+    from litellm.proxy.spend_tracking.budget_reservation import reseed_reserved_counter
+
+    for counter_key in settled.reseed:
+        await reseed_reserved_counter(counter_key, actual_cost)
     reservation.update({"entries": [entry.model_dump() for entry in settled.entries], "finalized": settled.finalized})
 
 

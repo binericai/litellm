@@ -6,10 +6,10 @@ use std::{
 use futures_util::future::BoxFuture;
 use litellm_callbacks::{
     Abort, AbortError, Activation, Callback, CallbackError, Field, FieldSet, Hook, HookInput,
-    HookOutput, Manifest, OptOutBy, RequestState, Selection, Subscription, Verdict,
+    HookOutput, Manifest, OptOutBy, Selection, Subscription, Verdict,
 };
 use litellm_redis_store::spend_counters::SpendCounters;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -19,24 +19,16 @@ use crate::{
 
 pub const NAME: &str = "budgets";
 
-pub struct Held {
+struct Held {
     call_id: String,
-    reservation: tokio::sync::Mutex<Reservation>,
+    reservation: Reservation,
 }
 
-impl Held {
-    pub async fn snapshot(&self) -> Reservation {
-        self.reservation.lock().await.clone()
-    }
-}
-
-#[derive(Default)]
-pub struct BudgetState(Mutex<Option<Arc<Held>>>);
-
-impl BudgetState {
-    fn set(&self, held: Arc<Held>) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(held);
-    }
+#[derive(Debug, Serialize)]
+pub struct Settled {
+    #[serde(flatten)]
+    pub reservation: Reservation,
+    pub reseed: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -64,7 +56,7 @@ fn manifest() -> Manifest {
             may_abort: true,
             ..Subscription::on(Hook::PreCall)
         }],
-        has_request_state: true,
+        has_request_state: false,
     }
 }
 
@@ -124,7 +116,7 @@ impl Budgets {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn held(&self, call_id: &str) -> Option<Arc<Held>> {
+    fn held(&self, call_id: &str) -> Option<Arc<Held>> {
         self.registry().get(call_id).cloned()
     }
 
@@ -141,7 +133,7 @@ impl Budgets {
     pub async fn take(&self, call_id: &str) -> Option<Reservation> {
         let held = self.held(call_id)?;
         self.forget(&held);
-        Some(held.snapshot().await)
+        Some(held.reservation.clone())
     }
 
     pub async fn settle(
@@ -149,9 +141,12 @@ impl Budgets {
         mut reservation: Reservation,
         actual: f64,
         finalize: bool,
-    ) -> Result<Reservation, EngineError> {
-        engine::settle(&self.store, &mut reservation, actual, finalize).await?;
-        Ok(reservation)
+    ) -> Result<Settled, EngineError> {
+        let reseed = engine::settle(&self.store, &mut reservation, actual, finalize).await?;
+        Ok(Settled {
+            reservation,
+            reseed,
+        })
     }
 
     async fn admit(self: &Arc<Self>, input: &HookInput) -> HookOutput {
@@ -173,12 +168,9 @@ impl Budgets {
             Ok(Some(reservation)) => {
                 let held = Arc::new(Held {
                     call_id: call_id.clone(),
-                    reservation: tokio::sync::Mutex::new(reservation),
+                    reservation,
                 });
-                if let Some(state) = input.state::<BudgetState>() {
-                    state.set(Arc::clone(&held));
-                }
-                self.registry().insert(call_id, Arc::clone(&held));
+                self.registry().insert(call_id, held);
                 Ok(None)
             }
             Err(error) => Ok(Some(Verdict::Abort(abort(
@@ -195,10 +187,6 @@ pub struct Shared(pub Arc<Budgets>);
 impl Callback for Shared {
     fn manifest(&self) -> &Manifest {
         &self.0.manifest
-    }
-
-    fn request_state(&self) -> Option<RequestState> {
-        Some(Arc::new(BudgetState::default()))
     }
 
     fn handle<'a>(&'a self, input: &'a HookInput) -> BoxFuture<'a, HookOutput> {

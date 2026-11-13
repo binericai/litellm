@@ -166,6 +166,7 @@ async fn can_apply(
 pub(crate) enum Inconsistent {
     Drop,
     Refuse,
+    Report,
 }
 
 pub(crate) async fn apply_actual(
@@ -173,7 +174,7 @@ pub(crate) async fn apply_actual(
     entries: &mut [Entry],
     actual: f64,
     inconsistent: Inconsistent,
-) -> Result<(), EngineError> {
+) -> Result<Vec<String>, EngineError> {
     let mut adjustments = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let target = actual - entry.reserved_cost;
@@ -212,19 +213,24 @@ pub(crate) async fn apply_actual(
         store.invalidate(&counters).await;
         return Err(error.into());
     }
+    let mut reported = Vec::new();
     for ((index, _, _), _) in adjustments
         .iter()
         .zip(&consistent)
         .filter(|(_, consistent)| !**consistent)
     {
-        store
-            .invalidate(std::slice::from_ref(&entries[*index].counter))
-            .await;
+        if inconsistent == Inconsistent::Report {
+            reported.push(entries[*index].counter_key.clone());
+        } else {
+            store
+                .invalidate(std::slice::from_ref(&entries[*index].counter))
+                .await;
+        }
     }
     for (index, target, _) in adjustments {
         entries[index].applied_adjustment = target;
     }
-    Ok(())
+    Ok(reported)
 }
 
 pub(crate) async fn release_best_effort(store: &SpendCounters, entries: &mut [Entry]) {
@@ -324,7 +330,7 @@ impl Admission<'_> {
         if self.plan.fail_closed && current - counter.planned.max_budget > EPSILON {
             return Err(exceeded(counter, current - self.cost, Some(self.cost)));
         }
-        apply_actual(
+        let _ = apply_actual(
             self.store,
             &mut self.applied,
             remaining,
@@ -372,15 +378,21 @@ pub async fn settle(
     reservation: &mut Reservation,
     actual: f64,
     finalize: bool,
-) -> Result<(), EngineError> {
+) -> Result<Vec<String>, EngineError> {
     if reservation.finalized {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    apply_actual(store, &mut reservation.entries, actual, Inconsistent::Drop).await?;
+    let reseed = apply_actual(
+        store,
+        &mut reservation.entries,
+        actual,
+        Inconsistent::Report,
+    )
+    .await?;
     if finalize {
         reservation.finalized = true;
     }
-    Ok(())
+    Ok(reseed)
 }
 
 #[cfg(test)]
@@ -564,5 +576,42 @@ mod tests {
             .unwrap();
         settle(&store, &mut reservation, 5.0, true).await.unwrap();
         assert_eq!(value(&store, KEY), Some(after));
+    }
+
+    #[rstest]
+    #[case::missing(None, 0.4, None)]
+    #[case::would_go_negative(Some(0.5), 0.0, Some(0.5))]
+    #[tokio::test]
+    async fn settling_an_inconsistent_counter_reports_it_and_leaves_it_alone(
+        #[case] before_settle: Option<f64>,
+        #[case] actual: f64,
+        #[case] after: Option<f64>,
+    ) {
+        let store = store(&[(KEY, 1.0), (TEAM, 0.0)]);
+        let plan = plan(
+            vec![
+                counter(KEY, 10.0, "Key", "hashed"),
+                counter(TEAM, 10.0, "Team", "t1"),
+            ],
+            2.0,
+        );
+        let mut reservation = reserve(&store, &plan).await.unwrap().unwrap();
+        let key = SpendCounter::parse(KEY).unwrap();
+        match before_settle {
+            Some(spend) => store.set_local(&key, Number::Float(spend), None).unwrap(),
+            None => store.invalidate(std::slice::from_ref(&key)).await,
+        }
+        let reseed = settle(&store, &mut reservation, actual, true)
+            .await
+            .unwrap();
+        assert_eq!(reseed, vec![KEY.to_owned()]);
+        assert_eq!(value(&store, KEY), after);
+        assert_eq!(value(&store, TEAM), Some(2.0 + (actual - 2.0)));
+        assert!(
+            reservation
+                .entries
+                .iter()
+                .all(|entry| entry.applied_adjustment == actual - 2.0)
+        );
     }
 }

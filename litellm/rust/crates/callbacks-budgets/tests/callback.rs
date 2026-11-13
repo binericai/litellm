@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use litellm_callbacks::{Callback, Field, FieldSet, FieldValues, Hook, HookInput, Verdict};
-use litellm_callbacks_budgets::{BudgetState, Budgets, Plan, PlannedCounter, Shared};
+use litellm_callbacks_budgets::{Budgets, Plan, PlannedCounter, Shared};
 use litellm_redis_store::{
     Number,
     spend_counters::{SpendCounter, SpendCounters},
@@ -56,7 +56,7 @@ fn value(store: &SpendCounters, key: &str) -> Option<f64> {
 
 const KEY: &str = "spend:key:hashed";
 
-fn pre_call(plan: &Plan, state: &Arc<BudgetState>) -> HookInput {
+fn pre_call(plan: &Plan) -> HookInput {
     HookInput {
         hook: Hook::PreCall,
         fields: FieldValues::new(FieldSet::of(&[Field::DeprecatedKwargs])).with(
@@ -64,7 +64,7 @@ fn pre_call(plan: &Plan, state: &Arc<BudgetState>) -> HookInput {
             json!({"plan": plan, "call_id": "call-1", "model": "gpt"}),
         ),
         call: None,
-        state: Some(Arc::clone(state) as _),
+        state: None,
     }
 }
 
@@ -74,20 +74,20 @@ async fn the_callback_holds_at_pre_call_and_hands_the_hold_over_once() {
     let store = store(&[(KEY, 1.0)]);
     let budgets = Arc::new(Budgets::new(Arc::clone(&store)));
     let callback = Shared(Arc::clone(&budgets));
-    let state = Arc::new(BudgetState::default());
     let plan = plan(vec![counter(KEY, 10.0, "Key", "hashed")], 2.0);
-    assert_eq!(
-        callback.handle(&pre_call(&plan, &state)).await.unwrap(),
-        None
-    );
+    assert_eq!(callback.handle(&pre_call(&plan)).await.unwrap(), None);
     assert_eq!(value(&store, KEY), Some(3.0));
     let reservation = budgets.take("call-1").await.unwrap();
     assert!(budgets.take("call-1").await.is_none());
     let settled = budgets.settle(reservation, 0.5, true).await.unwrap();
-    assert!(settled.finalized);
+    assert!(settled.reservation.finalized);
+    assert!(settled.reseed.is_empty());
     assert_eq!(value(&store, KEY), Some(1.5));
-    let again = budgets.settle(settled, 0.0, true).await.unwrap();
-    assert!(again.finalized);
+    let again = budgets
+        .settle(settled.reservation, 0.0, true)
+        .await
+        .unwrap();
+    assert!(again.reservation.finalized);
     assert_eq!(value(&store, KEY), Some(1.5));
 }
 
@@ -100,9 +100,8 @@ async fn a_settlement_through_the_reservation_dict_lands_on_the_last_cost(#[case
     let store = store(&[(KEY, 1.0)]);
     let budgets = Arc::new(Budgets::new(Arc::clone(&store)));
     let callback = Shared(Arc::clone(&budgets));
-    let state = Arc::new(BudgetState::default());
     let plan = plan(vec![counter(KEY, 10.0, "Key", "hashed")], 2.0);
-    callback.handle(&pre_call(&plan, &state)).await.unwrap();
+    callback.handle(&pre_call(&plan)).await.unwrap();
     let mut wire = serde_json::to_value(budgets.take("call-1").await.unwrap()).unwrap();
     for cost in costs {
         let reservation = serde_json::from_value(wire).unwrap();
@@ -118,10 +117,8 @@ async fn a_settlement_through_the_reservation_dict_lands_on_the_last_cost(#[case
 async fn a_refusal_aborts_with_the_typed_budget_error() {
     let store = store(&[(KEY, 10.0)]);
     let callback = Shared(Arc::new(Budgets::new(Arc::clone(&store))));
-    let state = Arc::new(BudgetState::default());
     let plan = plan(vec![counter(KEY, 10.0, "Key", "hashed")], 2.0);
-    let Some(Verdict::Abort(abort)) = callback.handle(&pre_call(&plan, &state)).await.unwrap()
-    else {
+    let Some(Verdict::Abort(abort)) = callback.handle(&pre_call(&plan)).await.unwrap() else {
         panic!("expected an abort");
     };
     assert_eq!(abort.status, 400);
