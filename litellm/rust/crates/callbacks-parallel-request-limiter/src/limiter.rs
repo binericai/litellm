@@ -8,11 +8,15 @@ use litellm_callbacks::{
     Abort, Activation, Callback, CallbackError, Field, FieldSet, Hook, HookInput, HookOutput,
     Manifest, Patch, RequestState, Selection, Subscription, Verdict,
 };
-use litellm_redis_store::{RequestRedis, rate_limits::Increment};
+use litellm_redis_store::{
+    RequestRedis,
+    rate_limits::{Entry, Increment, Scope},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 use crate::{
+    batch::{self, BatchFacts},
     descriptor::{Descriptor, PROJECT_ITPM, PROJECT_OTPM, PTU_TEAM},
     engine::{Ctx, Engine, Op, Policy, Settlement, SlotAcquisition, Unverifiable},
     ptu::{Ceiling, Usage, settlement_tokens},
@@ -74,6 +78,8 @@ pub struct PreCallFacts {
     pub reuses_request_slot: bool,
     #[serde(default)]
     pub prior_response: Option<PriorResponse>,
+    #[serde(default)]
+    pub batch: Option<BatchFacts>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +334,9 @@ impl ParallelRequestLimiter {
                 .map(|descriptor| descriptor.value.clone())
                 .collect();
         }
+        if let Some(batch) = &facts.batch {
+            return self.admit_batch(state, batch, facts, ctx).await;
+        }
         if descriptors.is_empty() {
             return Ok(None);
         }
@@ -420,6 +429,51 @@ impl ParallelRequestLimiter {
             reservation_amount = estimated;
         }
         self.reserve_io(state, facts, reservation_amount, ctx).await
+    }
+
+    async fn admit_batch(
+        &self,
+        state: &LimiterState,
+        batch: &BatchFacts,
+        facts: &PreCallFacts,
+        ctx: Ctx<'_>,
+    ) -> Result<Option<Abort>, Unverifiable> {
+        state.stash().batch_tpd_refunds.clear();
+        let response = self
+            .engine
+            .atomic_check_and_increment(&batch.descriptors, &batch.increments, ctx)
+            .await?;
+        if response.is_over()
+            && let Some(over) = response
+                .statuses
+                .iter()
+                .find(|status| status.code == Code::OverLimit)
+        {
+            let window_start = if over.descriptor_key.ends_with(batch::TPD_SUFFIX) {
+                let scope = Scope {
+                    descriptor: over.descriptor_key.clone(),
+                    value: over.descriptor_value.clone().unwrap_or_default(),
+                };
+                match self.engine.read(Entry::Window(scope), ctx).await {
+                    Ok(stored) => batch::window_start(stored),
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                None
+            };
+            let refusal = batch.refusal(
+                over,
+                self.engine.now(),
+                self.engine.settings().window_size,
+                window_start,
+            );
+            return Ok(Some(refusal::batch_rate_limited(
+                refusal,
+                facts.requested_model.as_deref(),
+            )));
+        }
+        state.stash().batch_tpd_refunds = batch.tpd_refunds(response.windows());
+        Ok(None)
     }
 
     async fn reserve_io(
@@ -563,6 +617,10 @@ impl ParallelRequestLimiter {
             request: None,
         };
         self.release_stashed(state, false, ctx).await;
+        let refunds = std::mem::take(&mut state.stash().batch_tpd_refunds);
+        if !refunds.is_empty() {
+            self.engine.reservation_aware(&refunds).await;
+        }
         let settlements = {
             let mut stash = state.stash();
             let (reserved, itpm, otpm) = Self::open_reservations(&stash);

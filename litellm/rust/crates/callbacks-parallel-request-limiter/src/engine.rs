@@ -203,6 +203,17 @@ impl Engine {
         }
     }
 
+    pub async fn read(&self, entry: Entry, ctx: Ctx<'_>) -> Result<Option<Local>, Unverifiable> {
+        let local = self.local(entry.clone());
+        if local.is_some() || !self.store.has_redis() {
+            return Ok(local);
+        }
+        self.store
+            .get(ctx.request, &entry, None)
+            .await
+            .map_err(|_| Unverifiable)
+    }
+
     pub fn memory_updates(&self) -> &UpdateLock {
         self.store.memory_updates()
     }

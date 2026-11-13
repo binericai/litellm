@@ -5,6 +5,7 @@ use litellm_callbacks::{Abort, AbortError};
 use serde_json::{Map, Value, json};
 
 use crate::{
+    batch::Refusal,
     descriptor::Descriptor,
     ptu::Ceiling,
     status::{Code, Response},
@@ -13,6 +14,7 @@ use crate::{
 pub const RATE_LIMITED: &str = "proxy_rate_limit";
 pub const UNVERIFIABLE: &str = "rate_limit_unverifiable";
 pub const PTU_SHARE_EXCEEDED: &str = "ptu_share_exceeded";
+pub const BATCH_RATE_LIMITED: &str = "batch_rate_limit";
 
 pub fn reset_at(now: f64, window_size: i64) -> String {
     let reset = now + window_size as f64;
@@ -77,6 +79,33 @@ pub fn rate_limited(
             ]),
         }),
     })
+}
+
+pub fn batch_rate_limited(refusal: Refusal, requested_model: Option<&str>) -> Abort {
+    let headers = BTreeMap::from([
+        ("retry-after".to_owned(), refusal.retry_after.to_string()),
+        ("rate_limit_type".to_owned(), refusal.limit_type.to_owned()),
+        ("reset_at".to_owned(), refusal.reset_at),
+    ]);
+    let header_values: Map<String, Value> = headers
+        .iter()
+        .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+        .collect();
+    Abort {
+        status: 429,
+        message: refusal.detail.clone(),
+        code: None,
+        headers,
+        error: Some(AbortError {
+            kind: BATCH_RATE_LIMITED.to_owned(),
+            fields: Map::from_iter([
+                ("detail".to_owned(), Value::String(refusal.detail)),
+                ("headers".to_owned(), Value::Object(header_values)),
+                ("rate_limit_type".to_owned(), json!(refusal.limit_type)),
+                ("requested_model".to_owned(), json!(requested_model)),
+            ]),
+        }),
+    }
 }
 
 pub fn unverifiable() -> Abort {

@@ -871,3 +871,48 @@ async def test_python_and_rust_callers_racing_on_the_memory_tier_lose_no_update(
     final: Final = limiter.rate_limits.local((counter,))[0]
     assert isinstance(final, int | float)
     assert final == 1 + 3 * rounds
+
+
+def _batch_usage(monkeypatch: pytest.MonkeyPatch, total_tokens: int, request_count: int) -> None:
+    from litellm.proxy.hooks.batch_rate_limiter import PROXY_BatchRateLimiter, BatchFileUsage
+
+    async def counted(*_: object, **__: object) -> BatchFileUsage:
+        return BatchFileUsage(
+            total_tokens=total_tokens,
+            request_count=request_count,
+            output_tokens=total_tokens // 6,
+            per_model_usage={"gpt-4o": {"total_tokens": total_tokens, "output_tokens": total_tokens // 6}},
+        )
+
+    monkeypatch.setattr(PROXY_BatchRateLimiter, "count_input_file_usage", counted)
+
+
+_BATCH: Final = {"model": "gpt-4o", "input_file_id": "file-abc", "endpoint": "/v1/chat/completions"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "failure", "proxy_failure"))
+@pytest.mark.parametrize(
+    "limits",
+    (
+        {"tpd_limit": 1500, "rpm_limit": 100},
+        {"rpm_limit": 15, "tpm_limit": 100000},
+        {"tpm_limit": 1300},
+        {"project_id": "proj", "project_metadata": {"model_itpm_limit": {"gpt-4o": 1300}}},
+    ),
+)
+async def test_a_batch_is_charged_and_refused_like_python(
+    end: str,
+    limits: dict[str, object],
+    backend: tuple[int | None, int | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _batch_usage(monkeypatch, total_tokens=600, request_count=6)
+    auth: Final = _auth(**limits)
+    observed: Final = await _differential(
+        [Request(auth, _BATCH, end=end, call_type="acreate_batch") for _ in range(3)],
+        [("api_key", _KEY), ("api_key_tpd", _KEY), ("model_per_project_itpm", "proj:gpt-4o")],
+        backend,
+    )
+    assert observed[0] is None
+    assert observed[2] is not None or end == "proxy_failure"

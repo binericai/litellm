@@ -7,7 +7,7 @@ use litellm_redis_store::RequestRedis;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    engine::SlotAcquisition,
+    engine::{Op, SlotAcquisition},
     ptu::Ceiling,
     status::{Response, WindowIdentity},
 };
@@ -38,6 +38,7 @@ pub struct Stash {
     pub itpm: IoReservation,
     pub otpm: IoReservation,
     pub io_reservation_released: bool,
+    pub batch_tpd_refunds: Vec<Op>,
 }
 
 #[derive(Clone, Debug, Default)]

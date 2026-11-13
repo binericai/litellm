@@ -31,7 +31,8 @@ PROJECT_OTPM_DESCRIPTOR_KEY: Final = "model_per_project_otpm"
 PTU_TEAM_DESCRIPTOR_KEY: Final = "model_per_team_ptu"
 
 if TYPE_CHECKING:
-    from litellm.proxy.hooks.parallel_request_limiter_v3 import PROXY_MaxParallelRequestsHandler_v3
+    from litellm.proxy.hooks.batch_rate_limiter import PROXY_BatchRateLimiter
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import PROXY_MaxParallelRequestsHandler_v3, RateLimitResponse
     from litellm.rust_bridge._native import (
         NativeParallelRequestLimiter,
         NativeParallelRequestLimiterState,
@@ -42,6 +43,7 @@ NATIVE_PARALLEL_REQUEST_LIMITER_ENV: Final = "LITELLM_NATIVE_PARALLEL_REQUEST_LI
 RATE_LIMITED_KIND: Final = "proxy_rate_limit"
 UNVERIFIABLE_KIND: Final = "rate_limit_unverifiable"
 PTU_SHARE_EXCEEDED_KIND: Final = "ptu_share_exceeded"
+BATCH_RATE_LIMITED_KIND: Final = "batch_rate_limit"
 _UNSUPPORTED_CALL_TYPES: Final = frozenset(
     {
         CallTypes.aresponses_websocket.value,
@@ -96,7 +98,27 @@ def _ptu_share_exceeded(wire: WireAbort) -> Exception:
     return PTUShareExceededError(ceiling, int(fields["needed_tokens"]))
 
 
+def _batch_rate_limited(wire: WireAbort) -> Exception:
+    from litellm.exceptions import RateLimitErrorCategory
+
+    fields: Final[Mapping[str, object]] = wire.error.fields if wire.error is not None else MappingProxyType({})
+    requested_model: Final = fields.get("requested_model")
+    resolved_model, llm_provider = resolve_llm_provider_for_rate_limit(
+        requested_model if isinstance(requested_model, str) else None
+    )
+    rate_limit_type: Final = fields.get("rate_limit_type")
+    return ProxyRateLimitError(
+        detail=str(fields.get("detail", wire.message)),
+        headers=_HEADERS.validate_python(fields.get("headers") or {}),
+        category=RateLimitErrorCategory.LITELLM_BATCH_RATE_LIMIT,
+        rate_limit_type=map_v3_rate_limit_type(rate_limit_type if isinstance(rate_limit_type, str) else None),
+        model=resolved_model,
+        llm_provider=llm_provider,
+    )
+
+
 register_abort_error(RATE_LIMITED_KIND, _rate_limited)
+register_abort_error(BATCH_RATE_LIMITED_KIND, _batch_rate_limited)
 register_abort_error(UNVERIFIABLE_KIND, _unverifiable)
 register_abort_error(PTU_SHARE_EXCEEDED_KIND, _ptu_share_exceeded)
 
@@ -195,13 +217,14 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         return await self._call(Hook.post_call_failure, failure_facts(self.limiter, data), ctx)
 
     def _declines(self, data: Mapping[str, object], call_type: str, auth: UserAPIKeyAuth | None) -> bool:
+        from litellm.proxy.hooks.batch_enqueued_tokens import resolve_batch_enqueued_token_scopes
         from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash
 
         stash: Final = get_request_stash()
         return (
             auth is None
             or call_type in _UNSUPPORTED_CALL_TYPES
-            or self.limiter.get_rate_limiter_for_call_type(call_type) is not None
+            or (call_type == CallTypes.acreate_batch.value and bool(resolve_batch_enqueued_token_scopes(auth)))
             or (stash is not None and stash.native_state is None and stash.call_type is not None)
             or not isinstance(data.get("litellm_call_id"), str)
         )
@@ -232,6 +255,29 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         )
         if reuses_request_slot:
             stash.parallel_slot_reused_at = limiter._get_current_time()  # pyright: ignore[reportPrivateUsage]  # the reuse time is the Python limiter's clock
+        batch_limiter: Final = limiter.get_rate_limiter_for_call_type(call_type)
+        if batch_limiter is not None:
+            stash.call_type = call_type
+            stash.native_state = state
+            prepared: Final = await _prepared_batch(batch_limiter, data, auth)  # pyright: ignore[reportArgumentType]  # only the batch limiter is keyed by call type
+            if isinstance(prepared, Abort):
+                return prepared
+            batch_model: Final = data.get("model")
+            batch_outcome: Final = await self._call(
+                Hook.pre_call,
+                {
+                    "call_id": data.get("litellm_call_id"),
+                    "requested_model": batch_model if isinstance(batch_model, str) else None,
+                    "policy": policy(limiter),
+                    "prior_response": _prior(prior_response),
+                    "batch": prepared,
+                },
+                ctx,
+                state=state,
+                request=pre_call_request(),
+            )
+            mirror_rate_limit_response(self.bridge, state)
+            return batch_outcome
         descriptors: Final = await limiter._build_request_rate_limit_descriptors(  # pyright: ignore[reportPrivateUsage]  # the descriptors are the Python limiter's
             user_api_key_dict=auth, data=data, call_type=call_type
         )
@@ -315,9 +361,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             "ptu_estimate": ptu_estimate,
             "io_estimate": io_estimate,
             "reuses_request_slot": reuses_request_slot,
-            "prior_response": None
-            if prior_response is None
-            else {"overall_code": prior_response["overall_code"], "statuses": list(prior_response["statuses"])},
+            "prior_response": _prior(prior_response),
         }
         outcome: Final = await self._call(Hook.pre_call, facts, ctx, state=state, request=pre_call_request())
         if reserves and self.bridge.first_pass_admitted(state):
@@ -333,6 +377,61 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             )
         mirror_rate_limit_response(self.bridge, state)
         return outcome
+
+
+def _prior(response: "RateLimitResponse | None") -> Mapping[str, object] | None:
+    if response is None:
+        return None
+    return {"overall_code": response["overall_code"], "statuses": list(response["statuses"])}
+
+
+async def _prepared_batch(
+    batch: "PROXY_BatchRateLimiter", data: dict[str, object], auth: UserAPIKeyAuth
+) -> Mapping[str, object] | Abort | None:
+    from starlette.exceptions import HTTPException
+
+    try:
+        input_file_id: Final = data.get("input_file_id")
+        if not input_file_id:
+            return None
+        should_skip, descriptors = batch._should_skip_batch_input_file_processing(  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the batch limiter's own skip decision over the untyped body
+            data=data, user_api_key_dict=auth, has_enqueued_scopes=False
+        )
+        if should_skip:
+            return None
+        provider: Final = data.get("custom_llm_provider", "openai")
+        usage: Final = await batch.count_input_file_usage(  # pyright: ignore[reportUnknownMemberType]  # the batch limiter reads the untyped body
+            file_id=input_file_id,  # pyright: ignore[reportArgumentType]  # passed through as the Python limiter does
+            custom_llm_provider=provider,  # pyright: ignore[reportArgumentType]  # passed through as the Python limiter does
+            user_api_key_dict=auth,
+            data=data,
+            descriptors=descriptors,
+        )
+        data["_batch_token_count"] = usage.total_tokens
+        data["_batch_request_count"] = usage.request_count
+        charged: Final = (
+            descriptors
+            if descriptors is not None
+            else batch._create_batch_rate_limit_descriptors(user_api_key_dict=auth, data=data)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the batch limiter's own descriptors over the untyped body
+        )
+        io_descriptors, io_increments = batch._create_project_io_descriptors_for_models(  # pyright: ignore[reportPrivateUsage]  # the batch limiter's own descriptors
+            user_api_key_dict=auth, per_model_usage=usage.per_model_usage
+        )
+    except HTTPException as error:
+        return Abort(status=error.status_code, message=str(error.detail), exception=error)
+    except Exception:  # noqa: BLE001  # the Python batch limiter lets the request through when its preparation fails
+        return None
+    return {
+        "descriptors": [dict(descriptor) for descriptor in (*charged, *io_descriptors)],
+        "increments": [
+            *((usage.request_count, usage.total_tokens) for _ in charged),
+            *((increment["requests"], increment["tokens"]) for increment in io_increments),
+        ],
+        "request_count": usage.request_count,
+        "total_tokens": usage.total_tokens,
+        "output_tokens": usage.output_tokens,
+        "per_model_usage": usage.per_model_usage,
+    }
 
 
 def mirror_rate_limit_response(
