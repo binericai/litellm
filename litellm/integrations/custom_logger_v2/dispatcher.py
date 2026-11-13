@@ -4,6 +4,7 @@ import logging
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import reduce
 from itertools import chain
 from operator import itemgetter
 from types import TracebackType
@@ -67,7 +68,23 @@ async def _awaited(returned: object) -> object:
     return await returned if inspect.isawaitable(returned) else returned
 
 
-def _decides(hook: Hook, result: object) -> bool:
+def _contained(hook: Hook, entry: Entry, result: object) -> bool:
+    if entry.subscription.legacy or HOOK_SPECS[hook].request_path:
+        return False
+    match result:
+        case Abort() | Respond():
+            return True
+        case ContractViolation():
+            return False
+        case Exception():
+            return True
+        case _:
+            return False
+
+
+def _decides(hook: Hook, entry: Entry, result: object) -> bool:
+    if _contained(hook, entry, result):
+        return False
     match result:
         case Abort() | Respond():
             return True
@@ -79,6 +96,14 @@ def _decides(hook: Hook, result: object) -> bool:
             return True
         case _:
             return False
+
+
+def _loop_running() -> bool:
+    try:
+        _ = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 def _fatal(error: BaseException) -> bool:
@@ -179,7 +204,7 @@ class Dispatcher:
     def open_scope(self, selection: RequestSelection) -> "RequestScope":
         return RequestScope(self, self.registry.snapshot, selection)
 
-    def record_failure(self, entry: Entry, hook: Hook, error: BaseException) -> None:
+    def record_failure(self, entry: Entry, hook: Hook, error: BaseException | Abort | Respond) -> None:
         self.failures[(entry.manifest.selection.name, hook)] += 1
         _LOGGER.warning("custom logger v2 %s failed on %s: %r", entry.manifest.selection.name, hook.value, error)
 
@@ -278,14 +303,50 @@ class RequestScope:
         call: CallFacts | None,
         binding: SyncBinding,
     ) -> Mapping[Field, object]:
-        v2_entries: Final = tuple(entry for entry in chain.from_iterable(plan.stages) if not entry.subscription.legacy)
-        if v2_entries or plan.awaited:
-            raise ContractViolation(
-                f"{hook.value} runs synchronously here, so only off-path V2 callbacks may subscribe"
+        staged: Final = tuple(chain.from_iterable(plan.stages))
+        if not plan.awaited and all(entry.subscription.legacy for entry in staged):
+            result: Final = run_legacy_plan_sync(plan, fields, binding)
+            self._submit_off_path(hook, plan.off_path, result, call)
+            return result
+        if any(entry.subscription.parallel for entry in staged):
+            raise ContractViolation("a synchronous hook cannot run parallel legacy entries")
+        blocking: Final = not _loop_running()
+        ran: Final = reduce(
+            lambda done, entry: self._run_sync_entry(hook, entry, done, call, binding, blocking),
+            (*staged, *plan.inline),
+            _Chain(fields=fields),
+        )
+        deferred: Final = tuple(entry for entry in staged if not (blocking or entry.subscription.legacy))
+        if blocking and plan.awaited:
+            awaited: Final = plan.awaited
+            self._swallow(
+                hook,
+                awaited,
+                asyncio.run(self._gather(hook, awaited, ran.fields, call, self._states_of(awaited))),
             )
-        result: Final = run_legacy_plan_sync(plan, fields, binding)
-        self._submit_off_path(hook, plan.off_path, result, call)
-        return result
+        self._submit_off_path(hook, (*deferred, *(() if blocking else plan.awaited), *plan.off_path), ran.fields, call)
+        return ran.fields
+
+    def _run_sync_entry(
+        self,
+        hook: Hook,
+        entry: Entry,
+        done: _Chain,
+        call: CallFacts | None,
+        binding: SyncBinding,
+        blocking: bool,
+    ) -> _Chain:
+        if entry.subscription.legacy:
+            return self._fold(hook, (entry,), (_legacy_start(entry, binding, done.fields),), done)
+        if not blocking:
+            return done
+        settled: Final = asyncio.run(
+            _gather_started((self._invoke(hook, entry, done.fields, call, self._state(entry)),), False)
+        )
+        folded: Final = self._fold(hook, (entry,), settled, done)
+        if folded.terminal is not None:
+            raise ContractViolation(f"{hook.value} runs synchronously here, so it cannot end the hook")
+        return folded
 
     def _state(self, entry: Entry) -> object:
         factory: Final = entry.manifest.request_state
@@ -362,7 +423,7 @@ class RequestScope:
 
     def _fold(self, hook: Hook, stage: tuple[Entry, ...], results: tuple[object, ...], chain: _Chain) -> _Chain:
         pairs: Final = tuple(zip(stage, results, strict=True))
-        decisive: Final = next((pair for pair in pairs if _decides(hook, pair[1])), None)
+        decisive: Final = next((pair for pair in pairs if _decides(hook, pair[0], pair[1])), None)
         self._count_failures(hook, tuple(pair for pair in pairs if pair is not decisive))
         match decisive:
             case (_, BaseException() as error):
@@ -383,8 +444,13 @@ class RequestScope:
 
     def _count_failures(self, hook: Hook, pairs: Sequence[tuple[Entry, object]]) -> None:
         for entry, result in pairs:
-            if isinstance(result, BaseException) and not entry.subscription.legacy:
-                self._dispatcher.record_failure(entry, hook, result)
+            match result:
+                case BaseException() if not entry.subscription.legacy:
+                    self._dispatcher.record_failure(entry, hook, result)
+                case Abort() | Respond() if _contained(hook, entry, result):
+                    self._dispatcher.record_failure(entry, hook, result)
+                case _:
+                    pass
 
     def _swallow(self, hook: Hook, entries: Sequence[Entry], results: tuple[object, ...]) -> None:
         pairs: Final = tuple(zip(entries, results, strict=True))
