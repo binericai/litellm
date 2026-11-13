@@ -13,11 +13,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 use crate::{
-    descriptor::{Descriptor, PTU_TEAM},
-    engine::{Ctx, Engine, Op, Policy, SlotAcquisition, Unverifiable},
+    descriptor::{Descriptor, PROJECT_ITPM, PROJECT_OTPM, PTU_TEAM},
+    engine::{Ctx, Engine, Op, Policy, Settlement, SlotAcquisition, Unverifiable},
+    ptu::{Ceiling, Usage, settlement_tokens},
     refusal,
-    state::{LimiterState, RateLimitedModel, Stash},
-    status::header_map,
+    state::{IoReservation, LimiterState, RateLimitedModel, Stash},
+    status::{WindowIdentity, header_map},
 };
 
 pub const NAME: &str = "parallel_request_limiter_v3";
@@ -49,7 +50,7 @@ impl From<PolicyFacts> for Policy {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PreCallFacts {
     #[serde(default)]
     pub call_id: Option<String>,
@@ -63,6 +64,30 @@ pub struct PreCallFacts {
     pub reserved_model: Option<RateLimitedModel>,
     #[serde(default)]
     pub policy: PolicyFacts,
+    #[serde(default)]
+    pub ptu_ceiling: Option<Ceiling>,
+    #[serde(default)]
+    pub ptu_estimate: Option<Estimate>,
+    #[serde(default)]
+    pub io_estimate: Option<Estimate>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Estimate {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    #[serde(default)]
+    pub explicit_output_cap: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoUsage {
+    #[serde(default)]
+    pub response: Option<Usage>,
+    #[serde(default)]
+    pub combined: Option<Usage>,
+    #[serde(default)]
+    pub aggregate_total: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +100,8 @@ pub struct CallIdFacts {
 pub struct PostCallFailureFacts {
     #[serde(default)]
     pub tpm_actual: i64,
+    #[serde(default)]
+    pub partial_usage: Option<Usage>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +153,10 @@ pub struct SuccessFacts {
     pub team_label: String,
     #[serde(default)]
     pub policy: PolicyFacts,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+    #[serde(default)]
+    pub io_usage: IoUsage,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +165,24 @@ pub struct FailureFacts {
     pub call_id: Option<String>,
     #[serde(default)]
     pub tpm_actual: i64,
+    #[serde(default)]
+    pub partial_usage: Option<Usage>,
+}
+
+fn scopes_keyed(descriptors: &[Descriptor], key: &str) -> BTreeSet<(String, String)> {
+    descriptors
+        .iter()
+        .filter(|descriptor| descriptor.key == key)
+        .map(|descriptor| (descriptor.key.clone(), descriptor.value.clone()))
+        .collect()
+}
+
+fn windows_keyed(windows: &[WindowIdentity], key: &str) -> Vec<WindowIdentity> {
+    windows
+        .iter()
+        .filter(|identity| identity.counter.scope.descriptor == key)
+        .cloned()
+        .collect()
 }
 
 pub struct ParallelRequestLimiter {
@@ -238,6 +287,7 @@ impl ParallelRequestLimiter {
         {
             let mut stash = state.stash();
             stash.owned = true;
+            stash.ptu_ceiling = facts.ptu_ceiling.clone();
             if let Some(call_id) = &facts.call_id {
                 stash.owner_call_id = Some(call_id.clone());
             }
@@ -296,31 +346,125 @@ impl ParallelRequestLimiter {
         let has_tpm_limits = descriptors.iter().any(|descriptor| {
             !descriptor.is_project_io() && descriptor.limits().tokens_per_unit.is_some()
         });
-        if !(has_tpm_limits && settings.tpm_reservation_enabled) {
+        let mut reservation_amount = 0;
+        if has_tpm_limits && settings.tpm_reservation_enabled {
+            let estimated = facts.estimated_tokens.unwrap_or(0).max(1);
+            let ptu_estimated = match (&facts.ptu_ceiling, facts.ptu_estimate) {
+                (Some(ceiling), Some(estimate)) => {
+                    ceiling.estimate(estimate.input_tokens, estimate.output_tokens)
+                }
+                _ => estimated,
+            };
+            if let Some(ceiling) = &facts.ptu_ceiling
+                && ptu_estimated > ceiling.tpm_limit
+            {
+                self.release_stashed(state, false, ctx).await;
+                return Ok(Some(refusal::ptu_share_exceeded(ceiling, ptu_estimated)));
+            }
+            let tpm_response = self
+                .engine
+                .reserve_tpm_tokens(descriptors, estimated, &[(PTU_TEAM, ptu_estimated)], ctx)
+                .await?;
+            if tpm_response.is_over() {
+                self.release_stashed(state, false, ctx).await;
+                return Ok(self.refuse(&tpm_response, facts));
+            }
+            let mut stash = state.stash();
+            stash.discard_released_tpm_reservation();
+            stash.reserved_tokens = estimated;
+            stash.ptu_reserved_tokens = ptu_estimated;
+            stash.ptu_windows = windows_keyed(tpm_response.windows(), PTU_TEAM);
+            stash.reserved_model = facts.reserved_model.clone();
+            stash.reserved_scopes = descriptors
+                .iter()
+                .filter(|descriptor| {
+                    !descriptor.is_project_io() && descriptor.limits().tokens_per_unit.is_some()
+                })
+                .map(|descriptor| (descriptor.key.clone(), descriptor.value.clone()))
+                .collect();
+            if let Some(stored) = stash.rate_limit_response.as_mut() {
+                stored.statuses.extend(tpm_response.statuses);
+            }
+            reservation_amount = estimated;
+        }
+        self.reserve_io(state, facts, reservation_amount, ctx).await
+    }
+
+    async fn reserve_io(
+        &self,
+        state: &LimiterState,
+        facts: &PreCallFacts,
+        reservation_amount: i64,
+        ctx: Ctx<'_>,
+    ) -> Result<Option<Abort>, Unverifiable> {
+        let descriptors: Vec<Descriptor> = facts
+            .descriptors
+            .iter()
+            .filter(|descriptor| descriptor.is_project_io())
+            .cloned()
+            .collect();
+        if descriptors.is_empty() {
             return Ok(None);
         }
-        let estimated = facts.estimated_tokens.unwrap_or(0).max(1);
-        let tpm_response = self
+        state.stash().io_reached = true;
+        let estimate = facts.io_estimate.unwrap_or_default();
+        let input_tokens = estimate.input_tokens.max(1);
+        let output_tokens = if estimate.explicit_output_cap {
+            estimate.output_tokens
+        } else {
+            estimate.output_tokens.max(1)
+        };
+        let (response, itpm_reserved, otpm_reserved) = self
             .engine
-            .reserve_tpm_tokens(descriptors, estimated, ctx)
+            .reserve_io_tokens(&descriptors, input_tokens, output_tokens, ctx)
             .await?;
-        if tpm_response.is_over() {
+        if response.is_over() {
+            if reservation_amount > 0 {
+                let (scopes, ptu_scopes, ptu_tokens, ptu_windows) = {
+                    let stash = state.stash();
+                    let (ptu, other): (Vec<_>, Vec<_>) = stash
+                        .reserved_scopes
+                        .iter()
+                        .cloned()
+                        .partition(|scope| scope.0 == PTU_TEAM);
+                    (
+                        other,
+                        ptu,
+                        stash.ptu_reserved_tokens,
+                        stash.ptu_windows.clone(),
+                    )
+                };
+                self.engine
+                    .refund_reserved(&scopes, reservation_amount, &[], ctx)
+                    .await;
+                self.engine
+                    .refund_reserved(&ptu_scopes, ptu_tokens, &ptu_windows, ctx)
+                    .await;
+                state.stash().reservation_released = true;
+            }
             self.release_stashed(state, false, ctx).await;
-            return Ok(self.refuse(&tpm_response, facts));
+            return Ok(self.refuse(&response, facts));
         }
         let mut stash = state.stash();
-        stash.discard_released_tpm_reservation();
-        stash.reserved_tokens = estimated;
-        stash.reserved_model = facts.reserved_model.clone();
-        stash.reserved_scopes = descriptors
-            .iter()
-            .filter(|descriptor| {
-                !descriptor.is_project_io() && descriptor.limits().tokens_per_unit.is_some()
-            })
-            .map(|descriptor| (descriptor.key.clone(), descriptor.value.clone()))
-            .collect();
-        if let Some(stored) = stash.rate_limit_response.as_mut() {
-            stored.statuses.extend(tpm_response.statuses);
+        stash.discard_released_io_reservation();
+        if itpm_reserved > 0 {
+            stash.itpm = IoReservation {
+                tokens: itpm_reserved,
+                scopes: scopes_keyed(&descriptors, PROJECT_ITPM),
+                windows: windows_keyed(response.windows(), PROJECT_ITPM),
+            };
+        }
+        if otpm_reserved > 0 {
+            stash.otpm = IoReservation {
+                tokens: otpm_reserved,
+                scopes: scopes_keyed(&descriptors, PROJECT_OTPM),
+                windows: windows_keyed(response.windows(), PROJECT_OTPM),
+            };
+        }
+        match stash.rate_limit_response.as_mut() {
+            Some(stored) => stored.statuses.extend(response.statuses),
+            None if !response.statuses.is_empty() => stash.rate_limit_response = Some(response),
+            None => {}
         }
         Ok(None)
     }
@@ -371,71 +515,129 @@ impl ParallelRequestLimiter {
         if !state.stash().owned {
             return;
         }
-        self.release_stashed(
-            state,
-            false,
-            Ctx {
-                policy: Policy::default(),
-                request: None,
-            },
-        )
-        .await;
-        let operations = {
+        let ctx = Ctx {
+            policy: Policy::default(),
+            request: None,
+        };
+        self.release_stashed(state, false, ctx).await;
+        let settlements = {
             let mut stash = state.stash();
-            let reserved = if stash.reservation_released {
-                0
-            } else {
-                stash.reserved_tokens
-            };
-            if reserved <= 0 {
+            let (reserved, itpm, otpm) = Self::open_reservations(&stash);
+            if reserved <= 0 && itpm <= 0 && otpm <= 0 {
                 return;
             }
-            let operations = self.failure_operations(&stash, facts.tpm_actual, reserved);
-            stash.reservation_released = true;
-            operations
+            let settlements = self.failure_settlements(
+                &stash,
+                facts.tpm_actual,
+                facts.partial_usage.as_ref(),
+                (reserved, itpm, otpm),
+            );
+            stash.mark_reservation_released();
+            settlements
         };
-        if !operations.is_empty() {
-            self.engine.increment_many(&operations).await;
+        for settlement in settlements {
+            self.engine.settle(settlement, ctx, false).await;
         }
     }
 
-    fn failure_operations(&self, stash: &Stash, actual: i64, reserved: i64) -> Vec<Increment> {
+    fn open_reservations(stash: &Stash) -> (i64, i64, i64) {
+        let reserved = if stash.reservation_released {
+            0
+        } else {
+            stash.reserved_tokens
+        };
+        let (itpm, otpm) = if stash.io_reservation_released {
+            (0, 0)
+        } else {
+            (stash.itpm.tokens, stash.otpm.tokens)
+        };
+        (reserved, itpm, otpm)
+    }
+
+    fn failure_settlements(
+        &self,
+        stash: &Stash,
+        tpm_actual: i64,
+        partial_usage: Option<&Usage>,
+        (reserved, itpm, otpm): (i64, i64, i64),
+    ) -> Vec<Settlement> {
+        let combined = if reserved > 0 {
+            let targets: Vec<(String, String)> = stash
+                .reserved_scopes
+                .iter()
+                .filter(|scope| scope.0 != PTU_TEAM)
+                .cloned()
+                .collect();
+            self.engine
+                .reservation_ops(&targets, &stash.reserved_scopes, tpm_actual, reserved)
+        } else {
+            Vec::new()
+        };
+        let ptu = if reserved > 0 {
+            self.ptu_failure_ops(stash, tpm_actual, partial_usage)
+        } else {
+            Vec::new()
+        };
+        vec![
+            Settlement::Plain(combined),
+            self.io_failure_settlement(
+                &stash.itpm,
+                partial_usage.map_or(0, Usage::billable_input_tokens),
+                itpm,
+            ),
+            self.io_failure_settlement(
+                &stash.otpm,
+                partial_usage.map_or(0, |usage| usage.completion_tokens),
+                otpm,
+            ),
+            Settlement::Project(ptu),
+        ]
+    }
+
+    fn io_failure_settlement(
+        &self,
+        reservation: &IoReservation,
+        actual: i64,
+        reserved: i64,
+    ) -> Settlement {
+        let targets: Vec<(String, String)> = reservation.scopes.iter().cloned().collect();
+        if reserved <= 0 {
+            return Settlement::Project(Vec::new());
+        }
+        if reservation.windows.is_empty() {
+            return Settlement::Plain(self.engine.reservation_ops(
+                &targets,
+                &reservation.scopes,
+                actual,
+                reserved,
+            ));
+        }
+        Settlement::Project(self.engine.project_ops(
+            &targets,
+            &reservation.scopes,
+            actual,
+            reserved,
+            &reservation.windows,
+        ))
+    }
+
+    fn ptu_failure_ops(&self, stash: &Stash, tpm_actual: i64, usage: Option<&Usage>) -> Vec<Op> {
         let targets: Vec<(String, String)> = stash
             .reserved_scopes
             .iter()
-            .filter(|scope| scope.0 != PTU_TEAM)
+            .filter(|scope| scope.0 == PTU_TEAM)
             .cloned()
             .collect();
-        self.tpm_operations(&targets, &stash.reserved_scopes, actual, reserved)
-    }
-
-    fn tpm_operations(
-        &self,
-        targets: &[(String, String)],
-        reserved_scopes: &BTreeSet<(String, String)>,
-        actual: i64,
-        reserved: i64,
-    ) -> Vec<Increment> {
-        targets
-            .iter()
-            .filter_map(|(key, value)| {
-                let target = (key.clone(), value.clone());
-                let amount = if reserved_scopes.contains(&target) {
-                    actual - reserved
-                } else {
-                    actual
-                };
-                (amount != 0).then(|| {
-                    self.engine.tokens_increment(
-                        &litellm_redis_store::rate_limits::Scope {
-                            descriptor: key.clone(),
-                            value: value.clone(),
-                        },
-                        amount,
-                    )
-                })
-            })
-            .collect()
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        self.engine.project_ops(
+            &targets,
+            &stash.reserved_scopes,
+            settlement_tokens(stash.ptu_ceiling.as_ref(), usage, tpm_actual),
+            stash.ptu_reserved_tokens,
+            &stash.ptu_windows,
+        )
     }
 
     pub async fn settle_failure(
@@ -455,24 +657,34 @@ impl ParallelRequestLimiter {
             }
         }
         self.release_stashed(state, true, ctx).await;
-        let operations = {
+        let settlements = {
             let mut stash = state.stash();
-            let reserved = if stash.reservation_released {
-                0
-            } else {
-                stash.reserved_tokens
-            };
-            if reserved <= 0 {
-                Vec::new()
-            } else {
-                let operations = self.failure_operations(&stash, facts.tpm_actual, reserved);
-                stash.reservation_released = true;
-                operations
+            let open = Self::open_reservations(&stash);
+            let settlements = self.failure_settlements(
+                &stash,
+                facts.tpm_actual,
+                facts.partial_usage.as_ref(),
+                open,
+            );
+            if open.0 > 0 || open.1 > 0 || open.2 > 0 {
+                stash.mark_reservation_released();
             }
+            settlements
         };
-        if !operations.is_empty() {
-            self.engine.increment_many_post_call(&operations, ctx).await;
+        for settlement in settlements {
+            self.engine.settle(settlement, ctx, true).await;
         }
+    }
+
+    fn tpm_ops(
+        &self,
+        targets: &[(String, String)],
+        reserved_scopes: &BTreeSet<(String, String)>,
+        actual: i64,
+        reserved: i64,
+    ) -> Vec<Increment> {
+        self.engine
+            .reservation_ops(targets, reserved_scopes, actual, reserved)
     }
 
     pub async fn settle_success(
@@ -492,17 +704,92 @@ impl ParallelRequestLimiter {
             }
         }
         self.release_stashed(state, true, ctx).await;
-        let operations = {
+        let (operations, io) = {
             let mut stash = state.stash();
             let operations = if facts.exempt {
                 Vec::new()
             } else {
                 self.success_operations(&stash, &facts)
             };
-            stash.reserved_tokens = 0;
-            operations
+            let io = self.io_success_settlement(&stash, &facts.io_usage);
+            stash.clear_reserved_tokens();
+            (operations, io)
         };
         self.engine.apply_usage(&operations, ctx).await;
+        match io {
+            Some(Settlement::Plain(operations)) if !operations.is_empty() => {
+                self.engine
+                    .increment_with_ttl_preservation(&operations, ctx)
+                    .await;
+            }
+            Some(Settlement::Project(operations)) if !operations.is_empty() => {
+                self.engine.reservation_aware(&operations).await;
+            }
+            _ => {}
+        }
+    }
+
+    fn io_success_settlement(&self, stash: &Stash, usage: &IoUsage) -> Option<Settlement> {
+        let (itpm, otpm) = (stash.itpm.tokens, stash.otpm.tokens);
+        if itpm <= 0 && otpm <= 0 {
+            return None;
+        }
+        let released = stash.io_reservation_released;
+        if usage.response.is_none()
+            && usage.combined.is_none()
+            && usage.aggregate_total <= 0
+            && !released
+        {
+            return None;
+        }
+        let (billable, completion) = match usage.response.or(usage.combined) {
+            Some(resolved) => (resolved.billable_input_tokens(), resolved.completion_tokens),
+            None if usage.aggregate_total > 0 => (usage.aggregate_total, usage.aggregate_total),
+            None => (itpm, otpm),
+        };
+        let empty = BTreeSet::new();
+        let reserved_scopes = |reservation: &IoReservation| {
+            if released {
+                empty.clone()
+            } else {
+                reservation.scopes.clone()
+            }
+        };
+        let targets = |reservation: &IoReservation| -> Vec<(String, String)> {
+            reservation.scopes.iter().cloned().collect()
+        };
+        if released || (stash.itpm.windows.is_empty() && stash.otpm.windows.is_empty()) {
+            let reserved = |amount: i64| if released { 0 } else { amount };
+            let mut operations = self.engine.reservation_ops(
+                &targets(&stash.itpm),
+                &reserved_scopes(&stash.itpm),
+                billable,
+                reserved(itpm),
+            );
+            operations.extend(self.engine.reservation_ops(
+                &targets(&stash.otpm),
+                &reserved_scopes(&stash.otpm),
+                completion,
+                reserved(otpm),
+            ));
+            return Some(Settlement::Plain(operations));
+        }
+        let mut operations = Vec::new();
+        for (reservation, actual, reserved) in [
+            (&stash.itpm, billable, itpm),
+            (&stash.otpm, completion, otpm),
+        ] {
+            if reserved > 0 {
+                operations.extend(self.engine.project_ops(
+                    &targets(reservation),
+                    &reserved_scopes(reservation),
+                    actual,
+                    reserved,
+                    &reservation.windows,
+                ));
+            }
+        }
+        Some(Settlement::Project(operations))
     }
 
     fn success_operations(&self, stash: &Stash, facts: &SuccessFacts) -> Vec<Op> {
@@ -576,26 +863,62 @@ impl ParallelRequestLimiter {
             Vec::new()
         };
         let mut operations: Vec<Op> = self
-            .tpm_operations(
+            .tpm_ops(
                 &charged,
                 &stash.reserved_scopes,
                 facts.total_tokens,
                 reserved_tokens,
             )
             .into_iter()
-            .chain(self.tpm_operations(&abandoned, &stash.reserved_scopes, 0, reserved_tokens))
+            .chain(self.tpm_ops(&abandoned, &stash.reserved_scopes, 0, reserved_tokens))
             .map(Op::Plain)
             .collect();
-        if let Some(ptu) = reconcile_facts.and_then(|facts| facts.ptu.as_ref()) {
+        let reserved_ptu: Vec<(String, String)> = stash
+            .reserved_scopes
+            .iter()
+            .filter(|scope| scope.0 == PTU_TEAM)
+            .cloned()
+            .collect();
+        if !reserved_ptu.is_empty() {
+            operations.extend(self.engine.project_ops(
+                &reserved_ptu,
+                &stash.reserved_scopes,
+                settlement_tokens(
+                    stash.ptu_ceiling.as_ref(),
+                    facts.usage.as_ref(),
+                    facts.total_tokens,
+                ),
+                if stash.reservation_released {
+                    0
+                } else {
+                    stash.ptu_reserved_tokens
+                },
+                &stash.ptu_windows,
+            ));
+            return operations;
+        }
+        let team = truthy(&facts.targets.user_api_key_team_id);
+        let ptu = match (&stash.ptu_ceiling, team, reconcile) {
+            (Some(ceiling), Some(team), Some(_)) => Some((
+                format!("{team}:{}", ceiling.model_group),
+                settlement_tokens(Some(ceiling), facts.usage.as_ref(), facts.total_tokens),
+            )),
+            (None, Some(_), Some(_)) => reconcile_facts
+                .and_then(|facts| facts.ptu.as_ref())
+                .map(|ptu| (ptu.value.clone(), ptu.actual_tokens)),
+            _ => None,
+        };
+        if let Some((value, actual)) = ptu {
             operations.extend(
-                self.tpm_operations(
-                    &[(PTU_TEAM.to_owned(), ptu.value.clone())],
-                    &stash.reserved_scopes,
-                    ptu.actual_tokens,
-                    0,
-                )
-                .into_iter()
-                .map(Op::Plain),
+                self.engine
+                    .reservation_ops(
+                        &[(PTU_TEAM.to_owned(), value)],
+                        &stash.reserved_scopes,
+                        actual,
+                        0,
+                    )
+                    .into_iter()
+                    .map(Op::Plain),
             );
         }
         operations

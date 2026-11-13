@@ -142,6 +142,10 @@ impl NativeParallelRequestLimiter {
         state.0.stash().first_pass_admitted
     }
 
+    fn io_reached(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> bool {
+        state.0.stash().io_reached
+    }
+
     fn rate_limit_response(
         &self,
         state: PyRef<'_, NativeParallelRequestLimiterState>,

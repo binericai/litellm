@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use futures_util::future::join_all;
 use litellm_redis_store::{
@@ -10,7 +10,7 @@ use litellm_redis_store::{
 };
 
 use crate::{
-    descriptor::{Descriptor, Limits},
+    descriptor::{Descriptor, Limits, PROJECT_ITPM, PROJECT_OTPM},
     status::{Backend, Code, LimitKind, Response, Status, WindowIdentity, identities},
 };
 
@@ -57,6 +57,12 @@ pub struct GuardedOp {
 pub enum Op {
     Plain(Increment),
     Guarded(GuardedOp),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Settlement {
+    Plain(Vec<Increment>),
+    Project(Vec<Op>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +156,13 @@ fn scalar_text(local: &Local) -> Option<String> {
         Local::Number(number) => Some(python_str(*number)),
         Local::Text(text) => Some(text.clone()),
         Local::Slots(_) => None,
+    }
+}
+
+fn scope_of((descriptor, value): &(String, String)) -> Scope {
+    Scope {
+        descriptor: descriptor.clone(),
+        value: value.clone(),
     }
 }
 
@@ -1252,15 +1265,194 @@ impl Engine {
         &self,
         descriptors: &[Descriptor],
         estimated: i64,
+        scope_estimates: &[(&str, i64)],
         ctx: Ctx<'_>,
     ) -> Result<Response, Unverifiable> {
         let tpm = Self::tpm_descriptors(descriptors);
         if tpm.is_empty() {
             return Ok(Response::ok(Vec::new()));
         }
-        let increments: Vec<(i64, i64)> = tpm.iter().map(|_| (0, estimated)).collect();
+        let increments: Vec<(i64, i64)> = tpm
+            .iter()
+            .map(|descriptor| {
+                let amount = scope_estimates
+                    .iter()
+                    .find(|(key, _)| *key == descriptor.key)
+                    .map_or(estimated, |(_, amount)| *amount);
+                (0, amount)
+            })
+            .collect();
         self.atomic_check_and_increment(&tpm, &increments, ctx)
             .await
+    }
+
+    pub async fn reserve_io_tokens(
+        &self,
+        descriptors: &[Descriptor],
+        input_tokens: i64,
+        output_tokens: i64,
+        ctx: Ctx<'_>,
+    ) -> Result<(Response, i64, i64), Unverifiable> {
+        let itpm: Vec<Descriptor> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.key == PROJECT_ITPM)
+            .cloned()
+            .collect();
+        let otpm: Vec<Descriptor> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.key == PROJECT_OTPM)
+            .cloned()
+            .collect();
+        if itpm.is_empty() && otpm.is_empty() {
+            return Ok((Response::ok(Vec::new()), 0, 0));
+        }
+        let itpm_response = if itpm.is_empty() {
+            None
+        } else {
+            let increments: Vec<(i64, i64)> = itpm.iter().map(|_| (0, input_tokens)).collect();
+            Some(
+                self.atomic_check_and_increment(&itpm, &increments, ctx)
+                    .await?,
+            )
+        };
+        if let Some(response) = &itpm_response
+            && response.is_over()
+        {
+            return Ok((response.clone(), 0, 0));
+        }
+        let itpm_reserved = if itpm_response.is_some() {
+            input_tokens
+        } else {
+            0
+        };
+        if otpm.is_empty() {
+            let response = itpm_response.unwrap_or_else(|| Response::ok(Vec::new()));
+            return Ok((response, itpm_reserved, 0));
+        }
+        let increments: Vec<(i64, i64)> = otpm.iter().map(|_| (0, output_tokens)).collect();
+        let otpm_response = self
+            .atomic_check_and_increment(&otpm, &increments, ctx)
+            .await?;
+        if otpm_response.is_over() {
+            if itpm_reserved > 0 {
+                let scopes: Vec<(String, String)> = itpm
+                    .iter()
+                    .map(|descriptor| (descriptor.key.clone(), descriptor.value.clone()))
+                    .collect();
+                let windows = itpm_response
+                    .as_ref()
+                    .map(|response| response.windows().to_vec())
+                    .unwrap_or_default();
+                self.refund_reserved(&scopes, itpm_reserved, &windows, ctx)
+                    .await;
+            }
+            return Ok((otpm_response, 0, 0));
+        }
+        let mut statuses = Vec::new();
+        let mut windows = Vec::new();
+        if let Some(response) = itpm_response {
+            windows.extend(response.windows().iter().cloned());
+            statuses.extend(response.statuses);
+        }
+        windows.extend(otpm_response.windows().iter().cloned());
+        statuses.extend(otpm_response.statuses);
+        Ok((
+            Response {
+                overall: Code::Ok,
+                statuses,
+                windows: Some(identities(windows)),
+            },
+            itpm_reserved,
+            output_tokens,
+        ))
+    }
+
+    pub async fn refund_reserved(
+        &self,
+        scopes: &[(String, String)],
+        amount: i64,
+        windows: &[WindowIdentity],
+        ctx: Ctx<'_>,
+    ) {
+        if amount <= 0 || scopes.is_empty() {
+            return;
+        }
+        let reserved: BTreeSet<(String, String)> = scopes.iter().cloned().collect();
+        if windows.is_empty() {
+            let operations = self.reservation_ops(scopes, &reserved, 0, amount);
+            self.increment_with_ttl_preservation(&operations, ctx).await;
+            return;
+        }
+        let operations = self.project_ops(scopes, &reserved, 0, amount, windows);
+        self.reservation_aware(&operations).await;
+    }
+
+    pub fn reservation_ops(
+        &self,
+        targets: &[(String, String)],
+        reserved_scopes: &BTreeSet<(String, String)>,
+        actual: i64,
+        reserved: i64,
+    ) -> Vec<Increment> {
+        targets
+            .iter()
+            .filter_map(|target| {
+                let amount = if reserved_scopes.contains(target) {
+                    actual - reserved
+                } else {
+                    actual
+                };
+                (amount != 0).then(|| self.tokens_increment(&scope_of(target), amount))
+            })
+            .collect()
+    }
+
+    pub fn project_ops(
+        &self,
+        targets: &[(String, String)],
+        reserved_scopes: &BTreeSet<(String, String)>,
+        actual: i64,
+        reserved: i64,
+        windows: &[WindowIdentity],
+    ) -> Vec<Op> {
+        targets
+            .iter()
+            .filter_map(|target| {
+                let is_reserved = reserved_scopes.contains(target);
+                let amount = if is_reserved {
+                    actual - reserved
+                } else {
+                    actual
+                };
+                if amount == 0 {
+                    return None;
+                }
+                let increment = self.tokens_increment(&scope_of(target), amount);
+                let identity = windows
+                    .iter()
+                    .find(|identity| identity.counter == increment.counter);
+                Some(match identity {
+                    Some(identity) if is_reserved => Op::Guarded(GuardedOp {
+                        expected_window_start: identity.window_start.clone(),
+                        backend: identity.backend,
+                        increment,
+                    }),
+                    _ => Op::Plain(increment),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn settle(&self, settlement: Settlement, ctx: Ctx<'_>, post_call: bool) {
+        match settlement {
+            Settlement::Plain(operations) if operations.is_empty() => {}
+            Settlement::Plain(operations) if post_call => {
+                self.increment_many_post_call(&operations, ctx).await;
+            }
+            Settlement::Plain(operations) => self.increment_many(&operations).await,
+            Settlement::Project(operations) if operations.is_empty() => {}
+            Settlement::Project(operations) => self.reservation_aware(&operations).await,
+        }
     }
 
     pub fn tokens_increment(&self, scope: &Scope, amount: i64) -> Increment {

@@ -5110,12 +5110,11 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         kwargs: Mapping[str, object],
         response_obj: object,
         rate_limit_type: Literal["output", "input", "total"],
-        parent_otel_span: Span | None,
     ) -> None:
         from litellm.litellm_core_utils.core_helpers import (
             get_litellm_metadata_from_kwargs,  # pyright: ignore[reportUnknownVariableType]  # the helper is untyped
         )
-        from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, post_call_request
+        from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, post_call_request, usage_facts
 
         empty: Final[Mapping[str, object]] = MappingProxyType({})
         standard_logging_object: Final = as_str_mapping(kwargs.get("standard_logging_object")) or empty
@@ -5158,21 +5157,19 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             },
             "team_label": f"{_callback_kwargs_mapping(metadata).get('user_api_key_team_id')}",
             "policy": policy(self),
+            "usage": usage_facts(self._resolve_reconciled_usage(usage_source)),
+            "io_usage": {
+                "response": usage_facts(self._resolve_reconciled_usage(response_obj)),
+                "combined": usage_facts(self._resolve_reconciled_usage(kwargs.get("combined_usage_object"))),
+                "aggregate_total": self._aggregate_only_total_tokens(self._response_usage(response_obj))
+                or self._aggregate_only_total_tokens(self._response_usage(kwargs.get("combined_usage_object"))),
+            },
         }
-        io_token_operations: Final = self._build_io_token_reservation_ops(kwargs=kwargs, response_obj=response_obj)
         await native.settle_success(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
             native_state,
             json.dumps(facts, default=str),
             post_call_request() if self.rate_limits.has_redis else None,
         )
-        if isinstance(io_token_operations, list):
-            await self.async_increment_tokens_with_ttl_preservation(
-                pipeline_operations=io_token_operations, parent_otel_span=parent_otel_span
-            )
-        elif io_token_operations:
-            await self.async_increment_reservation_aware_tokens(
-                pipeline_operations=io_token_operations, parent_otel_span=parent_otel_span
-            )
 
     def _build_team_ptu_tpm_ops(
         self,
@@ -5262,7 +5259,6 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     callback_kwargs,
                     response_obj,  # pyright: ignore[reportUnknownArgumentType]  # hook arguments are unannotated
                     rate_limit_type,
-                    litellm_parent_otel_span,
                 )
                 return
             await self._release_stashed_parallel_slot(
@@ -5442,15 +5438,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             stash: Final = get_request_stash_for_call(_call_id_from_callback_kwargs(failed_call))
             native_state: Final = self._native_state(stash)
             if self.native_companion is not None and native_state is not None:
-                from litellm.proxy.hooks.parallel_request_limiter_v3_native import post_call_request
+                from litellm.proxy.hooks.parallel_request_limiter_v3_native import failure_facts, post_call_request
 
                 await self.native_companion.settle_failure(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
                     native_state,
                     json.dumps(
-                        {
-                            "call_id": _call_id_from_callback_kwargs(failed_call),
-                            "tpm_actual": self._recovered_partial_usage_tokens(failed_call)[0],
-                        }
+                        {**failure_facts(self, failed_call), "call_id": _call_id_from_callback_kwargs(failed_call)}
                     ),
                     post_call_request() if self.rate_limits.has_redis else None,
                 )

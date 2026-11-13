@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 from collections.abc import Mapping
@@ -25,6 +26,10 @@ from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitErro
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.types.utils import CallTypes
 
+_IO_KEYS: Final = frozenset({"model_per_project_itpm", "model_per_project_otpm"})
+PROJECT_OTPM_DESCRIPTOR_KEY: Final = "model_per_project_otpm"
+PTU_TEAM_DESCRIPTOR_KEY: Final = "model_per_team_ptu"
+
 if TYPE_CHECKING:
     from litellm.proxy.hooks.parallel_request_limiter_v3 import PROXY_MaxParallelRequestsHandler_v3
     from litellm.rust_bridge._native import (
@@ -36,6 +41,7 @@ if TYPE_CHECKING:
 NATIVE_PARALLEL_REQUEST_LIMITER_ENV: Final = "LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER"
 RATE_LIMITED_KIND: Final = "proxy_rate_limit"
 UNVERIFIABLE_KIND: Final = "rate_limit_unverifiable"
+PTU_SHARE_EXCEEDED_KIND: Final = "ptu_share_exceeded"
 _UNSUPPORTED_CALL_TYPES: Final = frozenset(
     {
         CallTypes.call_mcp_tool.value,
@@ -44,8 +50,8 @@ _UNSUPPORTED_CALL_TYPES: Final = frozenset(
         "_arealtime",
     }
 )
-_DECLINED_KEYS: Final = frozenset({"model_per_team_ptu", "model_per_project_itpm", "model_per_project_otpm"})
 _HEADERS: Final = TypeAdapter(dict[str, str])
+_PTU_FIELDS: Final = TypeAdapter(dict[str, str | int | float])
 
 
 def native_parallel_request_limiter_enabled() -> bool:
@@ -77,8 +83,23 @@ def _unverifiable(wire: WireAbort) -> Exception:
     return RateLimitUnverifiableError()
 
 
+def _ptu_share_exceeded(wire: WireAbort) -> Exception:
+    from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import PTUShareExceededError
+
+    fields: Final = _PTU_FIELDS.validate_python(wire.error.fields if wire.error is not None else {})
+    ceiling: Final = PTUTeamCeiling(
+        model_group=str(fields["model_group"]),
+        tpm_limit=int(fields["tpm_limit"]),
+        output_to_input_ratio=float(fields["output_to_input_ratio"]),
+        cached_input_ratio=float(fields["cached_input_ratio"]),
+    )
+    return PTUShareExceededError(ceiling, int(fields["needed_tokens"]))
+
+
 register_abort_error(RATE_LIMITED_KIND, _rate_limited)
 register_abort_error(UNVERIFIABLE_KIND, _unverifiable)
+register_abort_error(PTU_SHARE_EXCEEDED_KIND, _ptu_share_exceeded)
 
 
 def raise_wire_abort(returned: object) -> None:
@@ -181,8 +202,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         return verdict(returned)
 
     async def _post_call_failure(self, data: dict[str, object], ctx: CallContext[object]) -> Patch | Abort | None:
-        tpm_actual, _, _ = self.limiter._recovered_partial_usage_tokens(data)  # pyright: ignore[reportPrivateUsage]  # the native settles with the limiter's usage recovery
-        return await self._call(Hook.post_call_failure, {"tpm_actual": tpm_actual}, ctx)
+        return await self._call(Hook.post_call_failure, failure_facts(self.limiter, data), ctx)
 
     def _declines(self, data: Mapping[str, object], call_type: str, auth: UserAPIKeyAuth | None) -> bool:
         from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash
@@ -221,24 +241,35 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         descriptors: Final = await limiter._build_request_rate_limit_descriptors(  # pyright: ignore[reportPrivateUsage]  # the descriptors are the Python limiter's
             user_api_key_dict=auth, data=data, call_type=call_type
         )
-        if stash.ptu_ceiling is not None or any(descriptor["key"] in _DECLINED_KEYS for descriptor in descriptors):
-            return None
         stash.call_type = call_type
         stash.native_state = state
         model_value: Final = data.get("model")
         requested_model: Final = model_value if isinstance(model_value, str) else None
+        ceiling: Final = stash.ptu_ceiling
         configured_tpm_limits: Final = tuple(
+            ceiling.raw_output_token_limit()
+            if descriptor["key"] == PTU_TEAM_DESCRIPTOR_KEY and ceiling is not None
+            else int(limit)
+            for descriptor in descriptors
+            if descriptor["key"] not in _IO_KEYS
+            and (limit := (descriptor["rate_limit"] or {}).get("tokens_per_unit")) is not None
+        )
+        configured_otpm_limits: Final = tuple(
             int(limit)
             for descriptor in descriptors
-            if (limit := (descriptor["rate_limit"] or {}).get("tokens_per_unit")) is not None
+            if descriptor["key"] == PROJECT_OTPM_DESCRIPTOR_KEY
+            and (limit := (descriptor["rate_limit"] or {}).get("tokens_per_unit")) is not None
         )
+        min_otpm_limit: Final = min(configured_otpm_limits) if configured_otpm_limits else None
+        has_io: Final = any(descriptor["key"] in _IO_KEYS for descriptor in descriptors)
         reserves: Final = bool(configured_tpm_limits) and limiter.tpm_reservation_enabled
         configured_output_tokens: Final = (
             get_estimated_output_tokens(user_api_key_dict=auth, model_name=requested_model) if reserves else None
         )
+        probe: Final = dict(data)
         estimated_tokens: int | None = None  # rebind-ok: set only when the request reserves tokens
+        ptu_estimate: Mapping[str, object] | None = None  # rebind-ok: set only for a team PTU reservation
         if reserves:
-            probe: Final = dict(data)
             limiter._apply_implicit_output_cap(  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
                 data=probe,
                 min_configured_limit=min(configured_tpm_limits),
@@ -253,6 +284,29 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
                 configured_output_tokens=configured_output_tokens,
                 team_id=auth.team_id,
             )
+            if ceiling is not None:
+                ptu_input, ptu_output = await offload_token_count(limiter._estimate_input_and_output_tokens)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+                    data=probe,
+                    min_configured_tpm_limit=min(configured_tpm_limits),
+                    call_type=call_type,
+                    configured_output_tokens=configured_output_tokens,
+                    team_id=auth.team_id,
+                    media_model_resolver=limiter._media_model_resolver,  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+                )
+                ptu_estimate = {"input_tokens": ptu_input, "output_tokens": ptu_output}
+        io_estimate: Mapping[str, object] | None = None  # rebind-ok: set only for project ITPM/OTPM limits
+        if has_io:
+            _, io_output = limiter._estimate_input_and_output_tokens(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+                data=probe, min_configured_tpm_limit=min_otpm_limit, call_type=call_type, include_media=False
+            )
+            io_input: Final = await offload_token_count(limiter._estimate_precise_input_tokens)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+                data=probe, model=requested_model, call_type=call_type, team_id=auth.team_id
+            )
+            io_estimate = {
+                "input_tokens": io_input,
+                "output_tokens": io_output,
+                "explicit_output_cap": limiter._has_explicit_output_cap(probe, call_type),  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
+            }
         reserved_model: Final = limiter.rate_limited_model(requested_model)
         facts: Final = {
             "call_id": data.get("litellm_call_id"),
@@ -263,6 +317,9 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             if reserved_model is None
             else {"requested": reserved_model.requested, "group": reserved_model.group},
             "policy": policy(limiter),
+            "ptu_ceiling": None if ceiling is None else dataclasses.asdict(ceiling),
+            "ptu_estimate": ptu_estimate,
+            "io_estimate": io_estimate,
         }
         outcome: Final = await self._call(Hook.pre_call, facts, ctx, state=state, request=pre_call_request())
         if reserves and self.bridge.first_pass_admitted(state):
@@ -271,6 +328,10 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
                 min_configured_limit=min(configured_tpm_limits),
                 call_type=call_type,
                 configured_output_tokens=configured_output_tokens,
+            )
+        if self.bridge.io_reached(state):
+            limiter._apply_implicit_output_cap(  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
+                data=data, min_configured_limit=min_otpm_limit, call_type=call_type
             )
         mirror_rate_limit_response(self.bridge, state)
         return outcome
@@ -286,6 +347,29 @@ def mirror_rate_limit_response(
     if stash is None or response is None:
         return
     stash.rate_limit_response = json.loads(response)
+
+
+def usage_facts(usage: object) -> Mapping[str, int] | None:
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+        _ReconciledUsage,  # pyright: ignore[reportPrivateUsage]  # the limiter's usage shape
+    )
+
+    if not isinstance(usage, _ReconciledUsage):
+        return None
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "cached_tokens": usage.cached_tokens,
+    }
+
+
+def failure_facts(limiter: "PROXY_MaxParallelRequestsHandler_v3", source: Mapping[str, object]) -> Mapping[str, object]:
+    recovered: Final = limiter._recovered_partial_usage(source)  # pyright: ignore[reportPrivateUsage]  # the native settles with the limiter's usage recovery
+    return {
+        "call_id": _call_id(source),
+        "tpm_actual": limiter._recovered_partial_usage_tokens(source)[0],  # pyright: ignore[reportPrivateUsage]  # the native settles with the limiter's usage recovery
+        "partial_usage": None if recovered is None else usage_facts(limiter._resolve_reconciled_usage(recovered)),  # pyright: ignore[reportPrivateUsage]  # the native settles with the limiter's usage recovery
+    }
 
 
 def policy(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> Mapping[str, bool]:
@@ -322,6 +406,7 @@ def native_parallel_request_limiter(
 __all__ = [
     "NATIVE_PARALLEL_REQUEST_LIMITER_ENV",
     "ParallelRequestLimiterNativeLogger",
+    "failure_facts",
     "limiter_state",
     "mirror_rate_limit_response",
     "native_parallel_request_limiter",
@@ -330,4 +415,5 @@ __all__ = [
     "post_call_request",
     "pre_call_request",
     "raise_wire_abort",
+    "usage_facts",
 ]

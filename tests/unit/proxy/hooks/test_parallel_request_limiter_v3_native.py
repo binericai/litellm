@@ -20,6 +20,7 @@ from litellm.integrations.custom_logger_v2.call import CallContext, CallFacts, C
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.native import NativeState
 from litellm.integrations.custom_logger_v2.outcomes import Abort
+from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PARALLEL_REQUEST_SLOT_TTL_SECONDS,
@@ -115,10 +116,12 @@ def backend(request: pytest.FixtureRequest) -> Iterator[tuple[int | None, int | 
         yield (python_port, native_port)
 
 
-def _side(clock: Clock, native: bool, port: int | None = None) -> Side:
+def _side(clock: Clock, native: bool, port: int | None = None, ceiling: PTUTeamCeiling | None = None) -> Side:
     cache: Final = DualCache() if port is None else DualCache(redis_cache=RedisCache(host="127.0.0.1", port=port))
     limiter: Final = PROXY_MaxParallelRequestsHandler_v3(
-        internal_usage_cache=InternalUsageCache(cache), time_provider=clock.now
+        internal_usage_cache=InternalUsageCache(cache),
+        time_provider=clock.now,
+        ptu_team_ceiling_resolver=lambda team_id, group: ceiling,
     )
     assert limiter.rate_limits.has_redis == (port is not None)
     return Side(
@@ -205,11 +208,13 @@ def _logging_kwargs(index: int, request: Request) -> dict[str, object]:
                 "user_api_key_user_id": auth.user_id,
                 "user_api_key_team_id": auth.team_id,
                 "user_api_key_org_id": auth.org_id,
+                "user_api_key_project_id": auth.project_id,
                 "user_api_key_end_user_id": auth.end_user_id,
             },
             "hidden_params": {},
         },
         "litellm_params": {"metadata": {"model_group": request.fallback or request.body.get("model")}},
+        **({"combined_usage_object": request.usage} if request.end == "partial_failure" else {}),
     }
 
 
@@ -239,7 +244,7 @@ async def _end(side: Side, index: int, request: Request) -> object:
                 )
             await side.limiter.async_logging_hook(kwargs, response, request.call_type)
             await side.limiter.async_log_success_event(kwargs, response, None, None)
-        case "failure":
+        case "failure" | "partial_failure":
             await side.limiter.async_log_failure_event(kwargs, None, None, None)
         case "proxy_failure":
             if side.native is not None:
@@ -282,7 +287,7 @@ def _snapshot(side: Side, scopes: Sequence[tuple[str, str]]) -> object:
                 side.remote.get(f"{{{key}:{value}}}:requests"),
                 side.remote.get(f"{{{key}:{value}}}:tokens"),
                 side.remote.zcard(f"{{{key}:{value}}}:max_parallel_requests"),
-                side.remote.get(f"{{{key}:{value}}}:window"),
+                side.remote.exists(f"{{{key}:{value}}}:window"),
             )
         )
         rows.append(
@@ -304,10 +309,11 @@ async def _differential(
     scopes: Sequence[tuple[str, str]],
     backend: tuple[int | None, int | None],
     between: Callable[[Clock], None] | None = None,
+    ceiling: PTUTeamCeiling | None = None,
 ) -> list[object]:
     clock: Final = Clock()
-    python: Final = _side(clock, native=False, port=backend[0])
-    native: Final = _side(clock, native=True, port=backend[1])
+    python: Final = _side(clock, native=False, port=backend[0], ceiling=ceiling)
+    native: Final = _side(clock, native=True, port=backend[1], ceiling=ceiling)
     observed: Final[list[object]] = []
     held: Final[list[tuple[int, Request]]] = []
     for index, request in enumerate(requests):
@@ -484,5 +490,123 @@ async def test_post_call_charging_without_reservation_matches_python(
     await _differential(
         [Request(_auth(tpm_limit=30, rpm_limit=10), _CHAT) for _ in range(5)],
         [("api_key", _KEY)],
+        backend,
+    )
+
+
+_CEILING: Final = PTUTeamCeiling(
+    model_group="gpt-4o", tpm_limit=900, output_to_input_ratio=4.0, cached_input_ratio=0.25
+)
+_CACHED_USAGE: Final = Usage(
+    prompt_tokens=30,
+    completion_tokens=9,
+    total_tokens=39,
+    prompt_tokens_details={"cached_tokens": 12},  # pyright: ignore[reportArgumentType]  # pydantic coerces the details
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "failure", "partial_failure", "proxy_failure"))
+async def test_team_ptu_reservation_settles_in_normalized_tokens_like_python(
+    end: str, backend: tuple[int | None, int | None]
+) -> None:
+    auth: Final = _auth(team_id="t1", tpm_limit=5000)
+    observed: Final = await _differential(
+        [Request(auth, {**_CHAT, "max_tokens": 60}, end=end, usage=_CACHED_USAGE, held=True) for _ in range(5)],
+        [("api_key", _KEY), ("model_per_team_ptu", "t1:gpt-4o")],
+        backend,
+        ceiling=_CEILING,
+    )
+    assert observed[0] is None
+    assert observed[-1] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_request_over_the_team_ptu_share_is_refused_like_python(
+    backend: tuple[int | None, int | None],
+) -> None:
+    observed: Final = await _differential(
+        [Request(_auth(team_id="t1", max_parallel_requests=1), {**_CHAT, "max_tokens": 400}) for _ in range(2)],
+        [("api_key", _KEY), ("model_per_team_ptu", "t1:gpt-4o")],
+        backend,
+        ceiling=_CEILING,
+    )
+    assert isinstance(observed[0], tuple) and observed[0][1] == 400
+    assert observed[1] == observed[0]
+
+
+@pytest.mark.asyncio
+async def test_team_ptu_charges_after_the_call_without_reservation_like_python(
+    backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LITELLM_TPM_TOKEN_RESERVATION_ENABLED", "false")
+    await _differential(
+        [Request(_auth(team_id="t1"), _CHAT, usage=_CACHED_USAGE) for _ in range(4)],
+        [("model_per_team_ptu", "t1:gpt-4o")],
+        backend,
+        ceiling=_CEILING,
+    )
+
+
+def _project_auth(itpm: int | None, otpm: int | None, **limits: object) -> UserAPIKeyAuth:
+    metadata: Final = {
+        **({} if itpm is None else {"model_itpm_limit": {"gpt-4o": itpm}}),
+        **({} if otpm is None else {"model_otpm_limit": {"gpt-4o": otpm}}),
+        "model_tpm_limit": {"gpt-4o": 4000},
+    }
+    return _auth(project_id="p1", project_metadata=metadata, **limits)
+
+
+_PROJECT_SCOPES: Final = (
+    ("model_per_project", "p1:gpt-4o"),
+    ("model_per_project_itpm", "p1:gpt-4o"),
+    ("model_per_project_otpm", "p1:gpt-4o"),
+    ("api_key", _KEY),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "failure", "partial_failure", "proxy_failure"))
+@pytest.mark.parametrize(("itpm", "otpm"), ((60, 120), (60, None), (None, 70), (500, 25)))
+async def test_project_io_reservations_match_python(
+    end: str, itpm: int | None, otpm: int | None, backend: tuple[int | None, int | None]
+) -> None:
+    await _differential(
+        [
+            Request(
+                _project_auth(itpm, otpm, max_parallel_requests=3),
+                {**_CHAT, "max_tokens": 20},
+                end=end,
+                usage=_CACHED_USAGE,
+            )
+            for _ in range(6)
+        ],
+        _PROJECT_SCOPES,
+        backend,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_otpm_refusal_refunds_the_tpm_and_ptu_reservations_like_python(
+    backend: tuple[int | None, int | None],
+) -> None:
+    auth: Final = _project_auth(500, 10, team_id="t1", tpm_limit=5000)
+    observed: Final = await _differential(
+        [Request(auth, {**_CHAT, "max_tokens": 30}) for _ in range(2)],
+        (*_PROJECT_SCOPES, ("model_per_team_ptu", "t1:gpt-4o")),
+        backend,
+        ceiling=_CEILING,
+    )
+    assert isinstance(observed[0], tuple) and observed[0][1] == 429
+
+
+@pytest.mark.asyncio
+async def test_project_io_without_reservation_still_reserves_like_python(
+    backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LITELLM_TPM_TOKEN_RESERVATION_ENABLED", "false")
+    await _differential(
+        [Request(_project_auth(80, 40), _CHAT, usage=_CACHED_USAGE) for _ in range(5)],
+        _PROJECT_SCOPES,
         backend,
     )

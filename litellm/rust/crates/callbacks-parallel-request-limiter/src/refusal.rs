@@ -6,11 +6,13 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     descriptor::Descriptor,
+    ptu::Ceiling,
     status::{Code, Response},
 };
 
 pub const RATE_LIMITED: &str = "proxy_rate_limit";
 pub const UNVERIFIABLE: &str = "rate_limit_unverifiable";
+pub const PTU_SHARE_EXCEEDED: &str = "ptu_share_exceeded";
 
 pub fn reset_at(now: f64, window_size: i64) -> String {
     let reset = now + window_size as f64;
@@ -84,6 +86,28 @@ pub fn unverifiable() -> Abort {
             fields: Map::new(),
         }),
         ..Abort::new(503, "rate limit unverifiable")
+    }
+}
+
+pub fn ptu_share_exceeded(ceiling: &Ceiling, needed_tokens: i64) -> Abort {
+    Abort {
+        error: Some(AbortError {
+            kind: PTU_SHARE_EXCEEDED.to_owned(),
+            fields: Map::from_iter([
+                ("model_group".to_owned(), json!(ceiling.model_group)),
+                ("tpm_limit".to_owned(), json!(ceiling.tpm_limit)),
+                (
+                    "output_to_input_ratio".to_owned(),
+                    json!(ceiling.output_to_input_ratio),
+                ),
+                (
+                    "cached_input_ratio".to_owned(),
+                    json!(ceiling.cached_input_ratio),
+                ),
+                ("needed_tokens".to_owned(), json!(needed_tokens)),
+            ]),
+        }),
+        ..Abort::new(400, ceiling.exceeded(needed_tokens))
     }
 }
 

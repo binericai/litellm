@@ -1,6 +1,7 @@
 mod descriptor;
 mod engine;
 mod limiter;
+mod ptu;
 mod refusal;
 mod state;
 mod status;
@@ -13,6 +14,7 @@ pub use limiter::{
     CallIdFacts, Candidate, FailureFacts, ModelFacts, NAME, ParallelRequestLimiter, PolicyFacts,
     PostCallFailureFacts, PreCallFacts, PtuFacts, SuccessFacts, TargetFacts, manifest,
 };
-pub use refusal::{RATE_LIMITED, UNVERIFIABLE};
-pub use state::{LimiterState, RateLimitedModel, Stash};
+pub use ptu::{Ceiling, Usage, settlement_tokens};
+pub use refusal::{PTU_SHARE_EXCEEDED, RATE_LIMITED, UNVERIFIABLE};
+pub use state::{IoReservation, LimiterState, RateLimitedModel, Stash};
 pub use status::{Backend, Code, LimitKind, Response, Status, WindowIdentity, header_map};

@@ -6,7 +6,11 @@ use std::{
 use litellm_redis_store::RequestRedis;
 use serde::{Deserialize, Serialize};
 
-use crate::{engine::SlotAcquisition, status::Response};
+use crate::{
+    engine::SlotAcquisition,
+    ptu::Ceiling,
+    status::{Response, WindowIdentity},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitedModel {
@@ -18,6 +22,7 @@ pub struct RateLimitedModel {
 pub struct Stash {
     pub owned: bool,
     pub first_pass_admitted: bool,
+    pub io_reached: bool,
     pub owner_call_id: Option<String>,
     pub rate_limit_response: Option<Response>,
     pub parallel_slot: Option<SlotAcquisition>,
@@ -27,14 +32,48 @@ pub struct Stash {
     pub fallback_models: BTreeSet<String>,
     pub reservation_released: bool,
     pub tpm_limited_tags: BTreeSet<String>,
+    pub ptu_ceiling: Option<Ceiling>,
+    pub ptu_reserved_tokens: i64,
+    pub ptu_windows: Vec<WindowIdentity>,
+    pub itpm: IoReservation,
+    pub otpm: IoReservation,
+    pub io_reservation_released: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IoReservation {
+    pub tokens: i64,
+    pub scopes: BTreeSet<(String, String)>,
+    pub windows: Vec<WindowIdentity>,
 }
 
 impl Stash {
     pub fn discard_released_tpm_reservation(&mut self) {
         if self.reservation_released {
             self.reserved_tokens = 0;
+            self.ptu_reserved_tokens = 0;
             self.reservation_released = false;
         }
+    }
+
+    pub fn discard_released_io_reservation(&mut self) {
+        if self.io_reservation_released {
+            self.itpm.tokens = 0;
+            self.otpm.tokens = 0;
+            self.io_reservation_released = false;
+        }
+    }
+
+    pub fn clear_reserved_tokens(&mut self) {
+        self.reserved_tokens = 0;
+        self.ptu_reserved_tokens = 0;
+        self.itpm.tokens = 0;
+        self.otpm.tokens = 0;
+    }
+
+    pub fn mark_reservation_released(&mut self) {
+        self.reservation_released = true;
+        self.io_reservation_released = true;
     }
 
     pub fn for_call(&self, call_id: Option<&str>) -> bool {

@@ -5,8 +5,8 @@ use std::sync::{
 
 use litellm_callbacks::Abort;
 use litellm_callbacks_parallel_request_limiter::{
-    Code, Descriptor, Engine, LimiterState, ParallelRequestLimiter, PolicyFacts,
-    PostCallFailureFacts, PreCallFacts, Settings, SuccessFacts, TargetFacts,
+    Code, Descriptor, Engine, LimiterState, ParallelRequestLimiter, PostCallFailureFacts,
+    PreCallFacts, Settings, SuccessFacts, TargetFacts,
 };
 use litellm_redis_store::{
     Number,
@@ -53,7 +53,7 @@ fn facts(descriptors: Vec<Descriptor>, estimated: Option<i64>) -> PreCallFacts {
         requested_model: Some("gpt".into()),
         estimated_tokens: estimated,
         reserved_model: None,
-        policy: PolicyFacts::default(),
+        ..PreCallFacts::default()
     }
 }
 
@@ -172,7 +172,7 @@ async fn a_reservation_is_settled_to_actual_usage_and_refunded_on_failure() {
         None
     );
     limiter
-        .post_call_failure(&failed, PostCallFailureFacts { tpm_actual: 0 })
+        .post_call_failure(&failed, PostCallFailureFacts::default())
         .await;
     assert_eq!(
         count(&store, "api_key", "k", Kind::Tokens),
