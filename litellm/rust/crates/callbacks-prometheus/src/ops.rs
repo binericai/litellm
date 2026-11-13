@@ -30,6 +30,21 @@ impl OpError {
             message: message.into(),
         }
     }
+
+    pub fn text(&self) -> String {
+        match self.kind {
+            ErrorKind::Key => format!("'{}'", self.message),
+            _ => self.message.clone(),
+        }
+    }
+
+    pub fn prefixed(&self) -> String {
+        match self.kind {
+            ErrorKind::Key => format!("KeyError: '{}'", self.message),
+            ErrorKind::Type => format!("TypeError: {}", self.message),
+            _ => self.message.clone(),
+        }
+    }
 }
 
 impl From<StoreError> for OpError {
@@ -104,11 +119,6 @@ fn or_empty(value: &Value) -> Value {
     }
 }
 
-fn swallow(result: OpResult) -> OpResult {
-    let _ = result;
-    Ok(())
-}
-
 fn hours_until(reset_at: Moment, now: Moment) -> Result<f64, OpError> {
     if reset_at.aware != now.aware {
         return Err(OpError {
@@ -174,6 +184,24 @@ impl Ops<'_> {
         Ok(py_float(field(self.facts, key))?)
     }
 
+    fn present(&self, metric: &str) -> bool {
+        self.store.family(metric).is_some()
+    }
+
+    fn observed(&self, key: &str) -> Result<f64, OpError> {
+        let value = field(self.facts, key);
+        match value {
+            Value::Number(_) | Value::Bool(_) => self.number(key),
+            other => Err(OpError {
+                kind: ErrorKind::Type,
+                message: format!(
+                    "unsupported operand type(s) for +=: 'float' and '{}'",
+                    crate::pyfmt::py_type_name(other)
+                ),
+            }),
+        }
+    }
+
     fn deployment_state(&self) -> OpResult {
         let values = LabelValues::default()
             .with(
@@ -208,7 +236,7 @@ impl Ops<'_> {
         let status = field(self.facts, "status").clone();
         let error_type = field(self.facts, "error_type").clone();
         let hook_type = field(self.facts, "hook_type").clone();
-        swallow((|| {
+        if self.present("litellm_guardrail_latency_seconds") {
             self.named(
                 "litellm_guardrail_latency_seconds",
                 &[
@@ -219,32 +247,32 @@ impl Ops<'_> {
                 ],
                 Op::Observe(self.number("latency_seconds")?),
             )?;
+        }
+        self.named(
+            "litellm_guardrail_requests_total",
+            &[
+                ("guardrail_name", name.clone()),
+                ("status", status.clone()),
+                ("hook_type", hook_type.clone()),
+            ],
+            Op::Inc(1.0),
+        )?;
+        if status.as_str() == Some("error") && crate::pyfmt::py_truthy(&error_type) {
             self.named(
-                "litellm_guardrail_requests_total",
+                "litellm_guardrail_errors_total",
                 &[
-                    ("guardrail_name", name.clone()),
-                    ("status", status.clone()),
-                    ("hook_type", hook_type.clone()),
+                    ("guardrail_name", name),
+                    ("error_type", error_type),
+                    ("hook_type", hook_type),
                 ],
                 Op::Inc(1.0),
             )?;
-            if status.as_str() == Some("error") && crate::pyfmt::py_truthy(&error_type) {
-                self.named(
-                    "litellm_guardrail_errors_total",
-                    &[
-                        ("guardrail_name", name),
-                        ("error_type", error_type),
-                        ("hook_type", hook_type),
-                    ],
-                    Op::Inc(1.0),
-                )?;
-            }
-            Ok(())
-        })())
+        }
+        Ok(())
     }
 
     fn identity(&self, metric: &str) -> OpResult {
-        swallow(self.named(
+        self.named(
             metric,
             &[
                 ("model", field(self.facts, "model").clone()),
@@ -254,84 +282,88 @@ impl Ops<'_> {
                 ("api_key_alias", field(self.facts, "api_key_alias").clone()),
             ],
             Op::Inc(1.0),
-        ))
+        )
     }
 
     fn file_size(&self) -> OpResult {
-        swallow((|| {
-            self.named(
-                "litellm_managed_file_size_bytes",
-                &[
-                    ("purpose", field(self.facts, "purpose").clone()),
-                    ("file_type", field(self.facts, "file_type").clone()),
-                    ("model", or_empty(field(self.facts, "model"))),
-                    ("api_provider", or_empty(field(self.facts, "api_provider"))),
-                    ("user", or_empty(field(self.facts, "user"))),
-                ],
-                Op::Set(self.number("size_bytes")?),
-            )
-        })())
+        if !self.present("litellm_managed_file_size_bytes") {
+            return Ok(());
+        }
+        self.named(
+            "litellm_managed_file_size_bytes",
+            &[
+                ("purpose", field(self.facts, "purpose").clone()),
+                ("file_type", field(self.facts, "file_type").clone()),
+                ("model", or_empty(field(self.facts, "model"))),
+                ("api_provider", or_empty(field(self.facts, "api_provider"))),
+                ("user", or_empty(field(self.facts, "user"))),
+            ],
+            Op::Set(self.number("size_bytes")?),
+        )
     }
 
     fn batch_duration(&self) -> OpResult {
-        swallow((|| {
-            self.named(
-                "litellm_managed_batch_duration_seconds",
-                &[
-                    ("model", or_empty(field(self.facts, "model"))),
-                    ("api_provider", or_empty(field(self.facts, "api_provider"))),
-                ],
-                Op::Observe(self.number("duration_seconds")?),
-            )
-        })())
+        if !self.present("litellm_managed_batch_duration_seconds") {
+            return Ok(());
+        }
+        self.named(
+            "litellm_managed_batch_duration_seconds",
+            &[
+                ("model", or_empty(field(self.facts, "model"))),
+                ("api_provider", or_empty(field(self.facts, "api_provider"))),
+            ],
+            Op::Observe(self.observed("duration_seconds")?),
+        )
     }
 
     fn file_deleted(&self) -> OpResult {
-        swallow(self.named(
+        self.named(
             "litellm_managed_file_deleted_total",
             &[("result", field(self.facts, "result").clone())],
             Op::Inc(1.0),
-        ))
+        )
     }
 
     fn check_batch_cost_run(&self) -> OpResult {
-        swallow((|| {
+        if self.present("litellm_check_batch_cost_last_run_timestamp") {
             self.positional(
                 "litellm_check_batch_cost_last_run_timestamp",
                 &[],
                 Op::Set(self.number("now")?),
             )?;
+        }
+        if self.present("litellm_check_batch_cost_jobs_polled") {
             self.positional(
                 "litellm_check_batch_cost_jobs_polled",
                 &[],
                 Op::Set(self.number("jobs_polled")?),
             )?;
-            if let Value::Array(models) = field(self.facts, "processed_models") {
-                for pair in models {
-                    let (model, provider) = match pair {
-                        Value::Array(items) if items.len() == 2 => (&items[0], &items[1]),
-                        _ => return Err(OpError::value("not enough values to unpack")),
-                    };
-                    self.named(
-                        "litellm_check_batch_cost_jobs_processed_total",
-                        &[
-                            ("model", or_empty(model)),
-                            ("api_provider", or_empty(provider)),
-                        ],
-                        Op::Inc(1.0),
-                    )?;
-                }
+        }
+        if let Value::Array(models) = field(self.facts, "processed_models") {
+            for pair in models {
+                let (model, provider) = match pair {
+                    Value::Array(items) if items.len() == 2 => (&items[0], &items[1]),
+                    _ => return Err(OpError::value("not enough values to unpack")),
+                };
+                self.named(
+                    "litellm_check_batch_cost_jobs_processed_total",
+                    &[
+                        ("model", or_empty(model)),
+                        ("api_provider", or_empty(provider)),
+                    ],
+                    Op::Inc(1.0),
+                )?;
             }
-            Ok(())
-        })())
+        }
+        Ok(())
     }
 
     fn check_batch_cost_error(&self) -> OpResult {
-        swallow(self.named(
+        self.named(
             "litellm_check_batch_cost_errors_total",
             &[("error_type", field(self.facts, "error_type").clone())],
             Op::Inc(1.0),
-        ))
+        )
     }
 
     fn callback_failure(&self) -> OpResult {
@@ -421,20 +453,18 @@ impl Ops<'_> {
 
     fn proxy_failure(&self) -> OpResult {
         let values = values_of(self.facts);
-        swallow((|| {
-            self.factory(
-                "litellm_proxy_failed_requests_metric",
-                &values,
-                Op::Inc(1.0),
-                true,
-            )?;
-            self.factory(
-                "litellm_proxy_total_requests_metric",
-                &values,
-                Op::Inc(1.0),
-                true,
-            )
-        })())
+        self.factory(
+            "litellm_proxy_failed_requests_metric",
+            &values,
+            Op::Inc(1.0),
+            true,
+        )?;
+        self.factory(
+            "litellm_proxy_total_requests_metric",
+            &values,
+            Op::Inc(1.0),
+            true,
+        )
     }
 
     fn moment(&self, key: &str) -> Result<Option<Moment>, OpError> {
@@ -501,8 +531,10 @@ impl Ops<'_> {
             if !customer {
                 labels = self.emit().labels(max, &context);
             }
-            self.emit()
-                .record(max, &labels, Op::Set(py_float(max_budget)?), customer)?;
+            if self.present(max) {
+                self.emit()
+                    .record(max, &labels, Op::Set(py_float(max_budget)?), customer)?;
+            }
         }
         if let Some(reset_at) = self.moment("budget_reset_at")? {
             let now = self
@@ -599,6 +631,20 @@ pub fn apply(store: &Store, op: &str, facts: &str) -> OpResult {
         store,
         settings: &facts.settings,
         facts: &facts.rest,
+    }
+    .run(op)
+}
+
+pub fn apply_facts(
+    store: &Store,
+    settings: &Settings,
+    op: &str,
+    facts: &Map<String, Value>,
+) -> OpResult {
+    Ops {
+        store,
+        settings,
+        facts,
     }
     .run(op)
 }

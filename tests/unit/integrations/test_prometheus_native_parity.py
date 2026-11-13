@@ -1,11 +1,13 @@
 import asyncio
 import copy
+import logging
 import re
 import time
 from collections.abc import Callable, Generator, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Final
+from zoneinfo import ZoneInfo
 
 import pytest
 from prometheus_client import REGISTRY, CollectorRegistry, generate_latest
@@ -13,6 +15,7 @@ from prometheus_client.openmetrics.exposition import generate_latest as generate
 from prometheus_client.registry import Collector
 
 import litellm
+from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger_v2 import Hook
 from litellm.integrations.custom_logger_v2.host import get_dispatcher, reset_host_for_tests
 from litellm.integrations.custom_logger_v2.legacy import (
@@ -111,6 +114,8 @@ def _event(
     request_metadata: Mapping[str, object] | None = None,
     hidden: Mapping[str, object] | None = None,
     guardrails: object = None,
+    tokens: Mapping[str, object] | None = None,
+    response: object = None,
 ) -> dict[str, object]:
     base: Final = START.replace(tzinfo=timezone.utc) if aware else START
     start: Final = base + timedelta(seconds=index)
@@ -156,6 +161,7 @@ def _event(
         },
         "hidden_params": {"litellm_overhead_time_ms": None, "additional_headers": headers, **(hidden or {})},
         "guardrail_information": guardrails,
+        **(tokens or {}),
     }
     litellm_metadata: Final[dict[str, object]] = {"user_api_key_end_user_id": end_user}
     if queue is not None:
@@ -176,6 +182,8 @@ def _event(
     }
     if exception is not None:
         kwargs["exception"] = exception
+    if response is not None:
+        kwargs["_response"] = response
     return kwargs
 
 
@@ -258,6 +266,9 @@ CORPUS: Final = (
         },
         guardrails={"guardrail_mode": "post_call", "duration": 0.4},
     ),
+    _event(10, tokens={"prompt_tokens": 0}, response={"usage": {"prompt_tokens": 1500, "completion_tokens": 3}}),
+    _event(11, tokens={"completion_tokens": "ten"}, metadata={"user_api_key_team_id": "team-raise"}),
+    _event(12, hidden={"litellm_overhead_time_ms": "slow"}, metadata={"user_api_key_team_id": "team-overhead"}),
 )
 
 
@@ -276,11 +287,41 @@ async def _drive(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
         monkeypatch.delenv(NATIVE_PROMETHEUS_ENV, raising=False)
     logger: Final = PrometheusLogger()
     assert (logger.native_companion is not None) is native if hasattr(logger, "native_companion") else not native
+    lines: Final = _Lines()
+    verbose_logger.addHandler(lines)
+    try:
+        text: Final = await _driven(logger)
+    finally:
+        verbose_logger.removeHandler(lines)
+    return text + "\n".join(lines.seen)
+
+
+class _Lines(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.seen: Final[list[str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message: Final = record.getMessage()
+        if _LOGGED.match(message):
+            self.seen.append(f"{record.levelname} {message}")
+
+
+_LOGGED: Final = re.compile(
+    r"(Prometheus Error|prometheus Layer Error|\[Non-Blocking\] Prometheus: Budget|Error recording)"
+)
+
+
+async def _driven(logger: PrometheusLogger) -> str:
     for kwargs in copy.deepcopy(CORPUS):
-        await logger.async_log_success_event(kwargs, None, kwargs["start_time"], kwargs["end_time"])
+        response: object = kwargs.pop("_response", None)
+        try:
+            await logger.async_log_success_event(kwargs, response, kwargs["start_time"], kwargs["end_time"])
+        except Exception as error:  # noqa: BLE001  # the legacy line logs it; the companion counts the same raise
+            verbose_logger.debug("parity: legacy success raised %s", error)
         await _deliver(logger, kwargs)
     outcomes: Final = await _direct_calls(logger)
-    return generate_latest(_ours()).decode() + "\n".join(outcomes)
+    return generate_latest(_ours()).decode() + "\n".join(outcomes) + "\n"
 
 
 async def _deliver(logger: PrometheusLogger, kwargs: dict[str, object]) -> None:
@@ -324,9 +365,19 @@ async def _direct_calls(logger: PrometheusLogger) -> list[str]:
         lambda: logger.record_check_batch_cost_run(3, [("gpt-4o-mini", "openai"), (None, None)]),
         lambda: logger.record_check_batch_cost_error("timeout"),
         lambda: logger.set_deployment_healthy("gpt-4o-mini", "model-1", "https://api.example.com/v1", "openai"),
+        lambda: logger._record_guardrail_metrics("pii", "slow", "success", None, "pre_call"),  # pyright: ignore[reportArgumentType]  # callers pass untyped values at runtime
+        lambda: logger.record_managed_file_size("big", "batch", "jsonl", None, "openai", "u"),  # pyright: ignore[reportArgumentType]  # callers pass untyped values at runtime
+        lambda: logger.record_managed_batch_duration("long", "gpt-4o-mini"),  # pyright: ignore[reportArgumentType]  # callers pass untyped values at runtime
+        lambda: logger.record_check_batch_cost_run("many", []),  # pyright: ignore[reportArgumentType]  # callers pass untyped values at runtime
     )
     outcomes: Final = [_outcome(call) for call in calls]
-    for event in (failure, rejected):
+    broken: Final = _failure(
+        13,
+        litellm.RateLimitError(message="slow", llm_provider="openai", model="gpt-4o-mini"),
+        zero_cost={"note": "no reason"},
+        metadata={"user_api_key_team_id": "team-broken"},
+    )
+    for event in (failure, rejected, broken):
         await logger.async_log_failure_event(event, None, event["start_time"], event["end_time"])
         await _deliver(logger, event)
     original: Final = litellm.RateLimitError(message="slow", llm_provider="openai", model="gpt-4o-mini")
@@ -362,6 +413,7 @@ def _budget_calls(logger: PrometheusLogger) -> list[str]:
     aware_reset: Final = datetime(2026, 11, 20, 0, 0, 0, tzinfo=timezone.utc)
     shifted_reset: Final = datetime(2026, 11, 14, 3, 30, 0, tzinfo=timezone(timedelta(hours=5)))
     naive_reset: Final = START + timedelta(hours=7, seconds=1)
+    dst_reset: Final = datetime(2027, 3, 20, 0, 0, 0, tzinfo=ZoneInfo("America/New_York"))
     team: Final = LiteLLM_TeamTable(
         team_id="team-1",
         team_alias="Team One",
@@ -391,6 +443,10 @@ def _budget_calls(logger: PrometheusLogger) -> list[str]:
         lambda: logger._set_customer_budget_metrics("cust-1", 1.0, 4.0, aware_reset),
         lambda: logger._set_customer_budget_metrics("cust-2", 2.0, None, None),
         lambda: logger._set_customer_budget_metrics("cust-3", 0.5, 1.0, naive_reset),
+        lambda: logger._set_org_budget_metrics("org-dst", "Dst", 1.0, 2.0, dst_reset),
+        lambda: logger._set_key_budget_metrics(
+            UserAPIKeyAuth(token="hashed-dst", spend=0.0, max_budget=1.0, budget_reset_at=dst_reset)
+        ),
     )
     return [_outcome(call) for call in calls]
 
@@ -426,8 +482,13 @@ async def _counts(logger: PrometheusLogger) -> str:
     return "counted"
 
 
-def _failure(index: int, exception: Exception) -> dict[str, object]:
-    event: Final = _event(index)
+def _failure(
+    index: int,
+    exception: Exception,
+    zero_cost: Mapping[str, object] | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    event: Final = _event(index, zero_cost=zero_cost, metadata=metadata)
     event["log_event_type"] = "failed_api_call"
     event["exception"] = exception
     event["standard_logging_object"]["status"] = "failure"
@@ -490,7 +551,7 @@ CONFIGS: Final[Mapping[str, Mapping[str, object]]] = {
         "prometheus_deployment_and_latency_caller_identity": "both",
         "prometheus_latency_buckets": [0.1, 1, 2.5, 600],
     },
-    "input_sequence_length_stays_in_python": {"prometheus_emit_input_sequence_length_label": True},
+    "input_sequence_length": {"prometheus_emit_input_sequence_length_label": True},
 }
 
 
@@ -508,6 +569,13 @@ async def test_the_native_store_and_handler_expose_exactly_what_the_python_logge
 
     assert "litellm_spend_metric" in python_text or config.startswith("excludes")
     assert _masked(native_text) == _masked(python_text)
+    assert ('input_sequence_length="1k-4k"' in python_text) is (config == "input_sequence_length")
+    if config == "defaults":
+        assert "ERROR prometheus Layer Error(): Exception occured - 'reason'" in python_text
+        assert "ERROR Prometheus Error: set_llm_deployment_success_metrics. Exception occured" in python_text
+        assert 'team="team-raise"' in python_text
+        assert 'litellm_remaining_team_budget_metric{team="team-raise"' not in python_text
+        assert 'org_id="org-dst"} 3044.0' in python_text
 
 
 async def test_openmetrics_output_matches_too(monkeypatch: pytest.MonkeyPatch) -> None:

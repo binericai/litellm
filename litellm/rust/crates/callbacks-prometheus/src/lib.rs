@@ -8,7 +8,7 @@ pub mod store;
 mod success;
 mod tracker;
 
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use futures_util::future::BoxFuture;
 use litellm_callbacks::{
@@ -19,7 +19,7 @@ use litellm_callbacks::{
 use crate::{emit::Emitter, failure::Failure, success::Success};
 pub use crate::{
     store::{Clock, FamilySpec, Kind, ManualClock, Op, Store, StoreError, SystemClock, Target},
-    success::AttemptFacts,
+    success::{AttemptFacts, LogLine},
     tracker::SeriesLimits,
 };
 
@@ -44,6 +44,7 @@ impl Prometheus {
                 },
                 subscriptions: vec![Subscription {
                     reads: FieldSet::of(&[Field::DeprecatedKwargs]),
+                    awaited: true,
                     ..Subscription::on(Hook::AttemptEnded)
                 }],
                 has_request_state: false,
@@ -66,28 +67,31 @@ impl Prometheus {
     }
 
     pub fn record_attempt(&self, facts: &AttemptFacts) -> Result<(), CallbackError> {
-        if facts.event == "failure" {
-            return Failure {
-                emit: Emitter {
-                    store: &self.store,
-                    settings: &facts.settings,
-                },
+        let logs = RefCell::new(Vec::new());
+        let emit = Emitter {
+            store: &self.store,
+            settings: &facts.settings,
+        };
+        let outcome = match facts.event.as_str() {
+            "failure" => Failure {
+                emit,
                 facts,
+                logs: &logs,
             }
-            .run();
+            .run(),
+            "success" => Success {
+                emit,
+                facts,
+                owns_latency: self.owns_latency,
+                logs: &logs,
+            }
+            .run(),
+            _ => Ok(()),
+        };
+        if let Some(token) = facts.token {
+            self.store.put_logs(token, logs.into_inner());
         }
-        if facts.event != "success" {
-            return Ok(());
-        }
-        Success {
-            emit: Emitter {
-                store: &self.store,
-                settings: &facts.settings,
-            },
-            facts,
-            owns_latency: self.owns_latency,
-        }
-        .run()
+        outcome
     }
 }
 

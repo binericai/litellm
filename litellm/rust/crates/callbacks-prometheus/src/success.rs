@@ -1,5 +1,7 @@
 use litellm_callbacks::CallbackError;
-use serde::Deserialize;
+use std::cell::RefCell;
+
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
@@ -35,6 +37,7 @@ pub struct ExceptionFacts {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct AttemptFacts {
     pub event: String,
+    #[serde(default)]
     pub payload: Value,
     #[serde(default)]
     pub model: Value,
@@ -58,7 +61,55 @@ pub struct AttemptFacts {
     pub deployment: Option<DeploymentFacts>,
     #[serde(default)]
     pub deployment_failure: Option<DeploymentFailure>,
+    #[serde(default)]
+    pub token: Option<u64>,
+    #[serde(default)]
+    pub deferred: Vec<Deferred>,
+    #[serde(default)]
+    pub input_sequence_length: Value,
+    #[serde(default)]
+    pub input_sequence_length_error: Option<String>,
     pub settings: Settings,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LogLine {
+    pub level: String,
+    pub format: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl LogLine {
+    pub fn new(level: &str, format: &str, args: Vec<String>) -> Self {
+        Self {
+            level: level.to_owned(),
+            format: format.to_owned(),
+            args,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Deferred {
+    pub op: String,
+    #[serde(default)]
+    pub facts: Map<String, Value>,
+    #[serde(default)]
+    pub on_error: Option<LogLine>,
+}
+
+pub fn exception_text(error: &CallbackError) -> String {
+    let message = match error {
+        CallbackError::Failed(message) => message.clone(),
+        other => other.to_string(),
+    };
+    for prefix in ["KeyError: ", "TypeError: ", "ValueError: "] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            return rest.to_owned();
+        }
+    }
+    message
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -164,6 +215,7 @@ pub struct Success<'a> {
     pub emit: Emitter<'a>,
     pub facts: &'a AttemptFacts,
     pub owns_latency: bool,
+    pub logs: &'a RefCell<Vec<LogLine>>,
 }
 
 impl Success<'_> {
@@ -250,12 +302,22 @@ impl Success<'_> {
             .inc("litellm_spend_metric", &context, py_float(response_cost)?)?;
         self.zero_cost(payload, &values)?;
         self.tokens(payload, metadata, &values)?;
+        self.deferred()?;
         self.virtual_key(payload, &values, &combined)?;
         self.rate_limits(payload, &values)?;
         if self.owns_latency {
+            if let Some(error) = &self.facts.input_sequence_length_error {
+                return Err(failed(error.clone()));
+            }
             self.latency(&values)?;
         }
-        let _ = self.deployment(payload, &values);
+        if let Err(error) = self.deployment(payload, &values) {
+            self.log(LogLine::new(
+                "exception",
+                "Prometheus Error: set_llm_deployment_success_metrics. Exception occured - %s",
+                vec![exception_text(&error)],
+            ));
+        }
         self.cache(payload, metadata, &values)?;
         self.media(metadata, &values)?;
         self.mcp(metadata, &values, response_cost)?;
@@ -445,9 +507,43 @@ impl Success<'_> {
         Ok(())
     }
 
+    pub fn log(&self, line: LogLine) {
+        self.logs.borrow_mut().push(line);
+    }
+
+    pub fn deferred(&self) -> Result<(), CallbackError> {
+        for deferred in &self.facts.deferred {
+            let applied = crate::ops::apply_facts(
+                self.emit.store,
+                self.settings(),
+                &deferred.op,
+                &deferred.facts,
+            );
+            match (applied, &deferred.on_error) {
+                (Ok(()), _) => {}
+                (Err(error), Some(line)) => {
+                    let mut line = line.clone();
+                    line.args.push(error.text());
+                    self.log(line);
+                }
+                (Err(error), None) => return Err(failed(error.prefixed())),
+            }
+        }
+        Ok(())
+    }
+
     fn latency(&self, values: &LabelValues) -> Result<(), CallbackError> {
         let times = &self.facts.times;
-        let context = values.context(self.settings());
+        let sequenced = if self.facts.input_sequence_length.is_null() {
+            values.clone()
+        } else {
+            values.clone().with(
+                "input_sequence_length",
+                self.facts.input_sequence_length.clone(),
+            )
+        };
+        let context = sequenced.context(self.settings());
+        let plain = values.context(self.settings());
         let ttft = duration(times.api_call_start_time, times.completion_start_time)?;
         if let Some(ttft) = ttft
             && self.facts.stream == Value::Bool(true)
@@ -476,7 +572,7 @@ impl Success<'_> {
         }
         if let Some(queue) = queue_seconds {
             self.emit
-                .observe("litellm_request_queue_time_seconds", &context, queue)?;
+                .observe("litellm_request_queue_time_seconds", &plain, queue)?;
         }
         Ok(())
     }
@@ -876,7 +972,7 @@ fn py_divide(value: &Value, by: f64) -> Result<f64, CallbackError> {
     .ok_or_else(|| {
         failed(format!(
             "unsupported operand type(s) for /: '{}' and 'int'",
-            py_str(value)
+            crate::pyfmt::py_type_name(value)
         ))
     })
 }

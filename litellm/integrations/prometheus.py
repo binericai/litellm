@@ -8,6 +8,7 @@ import math
 import os
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from functools import partial
@@ -1873,6 +1874,7 @@ class PrometheusLogger(CustomLogger):
             user_api_key = hash_token(user_api_key)
 
         label_context: Final = PrometheusLabelFactoryContext(enum_values)  # amortized per request.
+        native_pending: Final = None if self._native_store is None else self._native_store.expect(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # the legacy logging kwargs are untyped
 
         # increment total LLM requests and spend metric
         if self._native_store is None:
@@ -1914,17 +1916,18 @@ class PrometheusLogger(CustomLogger):
             )
 
         # remaining budget metrics
-        await self._increment_remaining_budget_metrics(
-            user_api_team=user_api_team,
-            user_api_team_alias=user_api_team_alias,
-            user_api_key=user_api_key,
-            user_api_key_alias=user_api_key_alias,
-            litellm_params=litellm_params,
-            response_cost=response_cost,
-            user_id=user_id,
-            user_api_key_org_id=user_api_key_org_id,
-            end_user_id=end_user_id,
-        )
+        with self._native_deferring(native_pending, native_store.budget_lookup_failed):
+            await self._increment_remaining_budget_metrics(
+                user_api_team=user_api_team,
+                user_api_team_alias=user_api_team_alias,
+                user_api_key=user_api_key,
+                user_api_key_alias=user_api_key_alias,
+                litellm_params=litellm_params,
+                response_cost=response_cost,
+                user_id=user_id,
+                user_api_key_org_id=user_api_key_org_id,
+                end_user_id=end_user_id,
+            )
 
         # set proxy virtual key rpm/tpm metrics
         if self._native_store is None:
@@ -1960,6 +1963,7 @@ class PrometheusLogger(CustomLogger):
                     else None
                 ),
             )
+        self._stash_input_sequence_length(native_pending, standard_logging_payload, kwargs, response_obj)  # pyright: ignore[reportArgumentType, reportUnknownArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
 
         # set x-ratelimit headers
         if self._native_store is None:
@@ -2032,8 +2036,34 @@ class PrometheusLogger(CustomLogger):
             label_context=PrometheusLabelFactoryContext(request_enum_values),
         )
 
+    def _stash_input_sequence_length(
+        self,
+        pending: dict[str, object] | None,  # mutable-ok: the per-attempt hand-off the companion reads
+        standard_logging_payload: StandardLoggingPayload,
+        kwargs: Mapping[str, object],
+        response_obj: object,
+    ) -> None:
+        if pending is None or not self._emit_input_sequence_length_label:
+            return
+        try:
+            bucket: Final = self._get_input_sequence_length(standard_logging_payload, kwargs, response_obj)
+        except Exception as error:  # noqa: BLE001  # the companion raises it at the same step the legacy order would
+            raised: Final = f"{type(error).__name__}: {error}"
+            pending["input_sequence_length_error"] = raised  # rebind-ok: filled in for the companion
+            return
+        pending["input_sequence_length"] = bucket  # rebind-ok: filled in for the companion
+
     def _native_owns_latency(self) -> bool:
-        return self._native_store is not None and self._native_store.owns_latency
+        return self._native_store is not None
+
+    def _native_deferring(
+        self,
+        pending: dict[str, object] | None,  # mutable-ok: the per-attempt hand-off the companion reads
+        on_error: Callable[[str, Mapping[str, object]], Mapping[str, object] | None],
+    ) -> AbstractContextManager[None]:
+        if pending is None or self._native_store is None:
+            return nullcontext()
+        return self._native_store.deferring(pending, on_error)
 
     def _increment_token_metrics(
         self,
@@ -2964,6 +2994,7 @@ class PrometheusLogger(CustomLogger):
         user_api_team: Final = standard_logging_payload["metadata"]["user_api_key_team_id"]
         user_api_team_alias: Final = standard_logging_payload["metadata"]["user_api_key_team_alias"]
         user_api_key_org_id: Final = standard_logging_payload["metadata"].get("user_api_key_org_id")
+        native_pending: Final = None if self._native_store is None else self._native_store.expect(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # the legacy logging kwargs are untyped
 
         try:
             enum_values: Final = UserAPIKeyLabelValues(
@@ -3011,13 +3042,14 @@ class PrometheusLogger(CustomLogger):
                 response_cost=failure_cost,
                 read_timeout=_get_budget_metrics_per_request_timeout(),
             )
-            await self._set_org_budget_metrics_after_api_request(
-                org_id=user_api_key_org_id,
-                response_cost=failure_cost,
-                carried=failure_org,
-                org_alias=failure_org_alias if isinstance(failure_org_alias, str) else None,
-                committed_spend=failure_committed.org,
-            )
+            with self._native_deferring(native_pending, native_store.no_log):
+                await self._set_org_budget_metrics_after_api_request(
+                    org_id=user_api_key_org_id,
+                    response_cost=failure_cost,
+                    carried=failure_org,
+                    org_alias=failure_org_alias if isinstance(failure_org_alias, str) else None,
+                    committed_spend=failure_committed.org,
+                )
         except Exception as e:
             verbose_logger.exception("prometheus Layer Error(): Exception occured - %s", e)
 
@@ -3894,19 +3926,19 @@ class PrometheusLogger(CustomLogger):
             error_type: Type of error if any, None otherwise
             hook_type: "pre_call", "during_call", or "post_call"
         """
-        if self._native_store is not None:
-            self._native_store.op(
-                "guardrail",
-                {
-                    "guardrail_name": guardrail_name,
-                    "latency_seconds": latency_seconds,
-                    "status": status,
-                    "error_type": error_type,
-                    "hook_type": hook_type,
-                },
-            )
-            return
         try:
+            if self._native_store is not None:
+                self._native_store.op(
+                    "guardrail",
+                    {
+                        "guardrail_name": guardrail_name,
+                        "latency_seconds": latency_seconds,
+                        "status": status,
+                        "error_type": error_type,
+                        "hook_type": hook_type,
+                    },
+                )
+                return
             # Record latency
             self.litellm_guardrail_latency_metric.labels(
                 guardrail_name=guardrail_name,
@@ -3944,19 +3976,19 @@ class PrometheusLogger(CustomLogger):
         user_email: str | None,
         api_key_alias: str | None,
     ):
-        if self._native_store is not None:
-            self._native_store.op(
-                "managed_batch_created",
-                {
-                    "model": model,
-                    "api_provider": api_provider,
-                    "user": user,
-                    "user_email": user_email,
-                    "api_key_alias": api_key_alias,
-                },
-            )
-            return
         try:
+            if self._native_store is not None:
+                self._native_store.op(
+                    "managed_batch_created",
+                    {
+                        "model": model,
+                        "api_provider": api_provider,
+                        "user": user,
+                        "user_email": user_email,
+                        "api_key_alias": api_key_alias,
+                    },
+                )
+                return
             self.litellm_managed_batch_created_total.labels(
                 model=model,
                 api_provider=api_provider,
@@ -3977,20 +4009,20 @@ class PrometheusLogger(CustomLogger):
         user: str | None = None,
     ):
         """Record the size of a managed file. Uses a gauge (last-seen value per label combination)."""
-        if self._native_store is not None:
-            self._native_store.op(
-                "managed_file_size",
-                {
-                    "size_bytes": size_bytes,
-                    "purpose": purpose,
-                    "file_type": file_type,
-                    "model": model,
-                    "api_provider": api_provider,
-                    "user": user,
-                },
-            )
-            return
         try:
+            if self._native_store is not None:
+                self._native_store.op(
+                    "managed_file_size",
+                    {
+                        "size_bytes": size_bytes,
+                        "purpose": purpose,
+                        "file_type": file_type,
+                        "model": model,
+                        "api_provider": api_provider,
+                        "user": user,
+                    },
+                )
+                return
             self.litellm_managed_file_size_bytes.labels(
                 purpose=purpose,
                 file_type=file_type,
@@ -4007,13 +4039,13 @@ class PrometheusLogger(CustomLogger):
         model: str | None = None,
         api_provider: str | None = None,
     ):
-        if self._native_store is not None:
-            self._native_store.op(
-                "managed_batch_duration",
-                {"duration_seconds": duration_seconds, "model": model, "api_provider": api_provider},
-            )
-            return
         try:
+            if self._native_store is not None:
+                self._native_store.op(
+                    "managed_batch_duration",
+                    {"duration_seconds": duration_seconds, "model": model, "api_provider": api_provider},
+                )
+                return
             self.litellm_managed_batch_duration_seconds.labels(
                 model=model or "",
                 api_provider=api_provider or "",
@@ -4029,19 +4061,19 @@ class PrometheusLogger(CustomLogger):
         user_email: str | None,
         api_key_alias: str | None,
     ):
-        if self._native_store is not None:
-            self._native_store.op(
-                "managed_file_created",
-                {
-                    "model": model,
-                    "api_provider": api_provider,
-                    "user": user,
-                    "user_email": user_email,
-                    "api_key_alias": api_key_alias,
-                },
-            )
-            return
         try:
+            if self._native_store is not None:
+                self._native_store.op(
+                    "managed_file_created",
+                    {
+                        "model": model,
+                        "api_provider": api_provider,
+                        "user": user,
+                        "user_email": user_email,
+                        "api_key_alias": api_key_alias,
+                    },
+                )
+                return
             self.litellm_managed_file_created_total.labels(
                 model=model,
                 api_provider=api_provider,
@@ -4054,10 +4086,10 @@ class PrometheusLogger(CustomLogger):
 
     def record_managed_file_deleted(self, result: str):
         """Record a managed file deletion attempt. result is 'success' or 'blocked'."""
-        if self._native_store is not None:
-            self._native_store.op("managed_file_deleted", {"result": result})
-            return
         try:
+            if self._native_store is not None:
+                self._native_store.op("managed_file_deleted", {"result": result})
+                return
             self.litellm_managed_file_deleted_total.labels(result=result).inc()
         except Exception as e:
             verbose_logger.warning("Error recording file deleted metric: %s", e)
@@ -4076,13 +4108,13 @@ class PrometheusLogger(CustomLogger):
         """
         import time
 
-        if self._native_store is not None:
-            self._native_store.op(
-                "check_batch_cost_run",
-                {"now": time.time(), "jobs_polled": jobs_polled, "processed_models": processed_models},
-            )
-            return
         try:
+            if self._native_store is not None:
+                self._native_store.op(
+                    "check_batch_cost_run",
+                    {"now": time.time(), "jobs_polled": jobs_polled, "processed_models": processed_models},
+                )
+                return
             self.litellm_check_batch_cost_last_run_timestamp.set(time.time())
             self.litellm_check_batch_cost_jobs_polled.set(jobs_polled)
 
@@ -4096,10 +4128,10 @@ class PrometheusLogger(CustomLogger):
             verbose_logger.warning("Error recording check batch cost metrics: %s", e)
 
     def record_check_batch_cost_error(self, error_type: str):
-        if self._native_store is not None:
-            self._native_store.op("check_batch_cost_error", {"error_type": error_type})
-            return
         try:
+            if self._native_store is not None:
+                self._native_store.op("check_batch_cost_error", {"error_type": error_type})
+                return
             self.litellm_check_batch_cost_errors_total.labels(
                 error_type=error_type,
             ).inc()
@@ -5423,8 +5455,10 @@ class PrometheusLogger(CustomLogger):
                 "values": enum_values.model_dump(),
                 "spend": spend,
                 "max_budget": max_budget,
-                "budget_reset_at": native_store.moment(budget_reset_at),
-                "now": None if budget_reset_at is None else native_store.moment(datetime.now(budget_reset_at.tzinfo)),
+                "budget_reset_at": native_store.wall_moment(budget_reset_at),
+                "now": None
+                if budget_reset_at is None
+                else native_store.wall_moment(datetime.now(budget_reset_at.tzinfo)),
             },
         )
 

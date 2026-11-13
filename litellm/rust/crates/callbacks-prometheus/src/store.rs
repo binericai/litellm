@@ -6,7 +6,10 @@ use std::{
 
 use indexmap::IndexMap;
 
-use crate::tracker::{SeriesLimits, Tracker};
+use crate::{
+    success::LogLine,
+    tracker::{SeriesLimits, Tracker},
+};
 
 pub const OVERFLOW_LABEL_VALUE: &str = "other";
 
@@ -174,6 +177,7 @@ pub struct Store {
     inner: Mutex<Inner>,
     limits: SeriesLimits,
     clock: Box<dyn Clock>,
+    logs: Mutex<HashMap<u64, Vec<LogLine>>>,
 }
 
 fn counter_name(declared: &str) -> &str {
@@ -221,7 +225,28 @@ impl Store {
             }),
             limits,
             clock,
+            logs: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn put_logs(&self, token: u64, lines: Vec<LogLine>) {
+        if lines.is_empty() {
+            return;
+        }
+        self.logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(token)
+            .or_default()
+            .extend(lines);
+    }
+
+    pub fn take_logs(&self, token: u64) -> Vec<LogLine> {
+        self.logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&token)
+            .unwrap_or_default()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

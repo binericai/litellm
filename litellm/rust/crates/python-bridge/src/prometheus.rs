@@ -202,6 +202,14 @@ impl NativePrometheusStore {
         ops::apply(&self.store, name, facts).map_err(op_error)
     }
 
+    fn take_logs(&self, token: u64) -> Vec<(String, String, Vec<String>)> {
+        self.store
+            .take_logs(token)
+            .into_iter()
+            .map(|line| (line.level, line.format, line.args))
+            .collect()
+    }
+
     #[pyo3(signature = (created=true))]
     fn encode_text(&self, created: bool) -> String {
         encode_text(&self.store.snapshot(), created)

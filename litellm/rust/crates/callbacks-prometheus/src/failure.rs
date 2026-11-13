@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use litellm_callbacks::CallbackError;
 use serde_json::{Map, Value};
 
@@ -6,14 +8,15 @@ use crate::{
     labels::{LabelValues, combined_custom_metadata, custom_labels_from_metadata, is_py_dict},
     pyfmt::py_str,
     success::{
-        AttemptFacts, DeploymentFailure, Success, get, required, set_deployment_state,
-        skips_invalid_key,
+        AttemptFacts, DeploymentFailure, LogLine, Success, exception_text, get, required,
+        set_deployment_state, skips_invalid_key,
     },
 };
 
 pub struct Failure<'a> {
     pub emit: Emitter<'a>,
     pub facts: &'a AttemptFacts,
+    pub logs: &'a RefCell<Vec<LogLine>>,
 }
 
 impl Failure<'_> {
@@ -35,7 +38,7 @@ impl Failure<'_> {
         let api_key_alias = required(metadata, "user_api_key_alias")?;
         let team = required(metadata, "user_api_key_team_id")?;
         let team_alias = required(metadata, "user_api_key_team_alias")?;
-        let _ = (|| -> Result<(), CallbackError> {
+        let block = (|| -> Result<(), CallbackError> {
             let combined = combined_custom_metadata(payload);
             let values = LabelValues {
                 custom_metadata_labels: custom_labels_from_metadata(
@@ -60,20 +63,34 @@ impl Failure<'_> {
             let context = values.context(&self.facts.settings);
             self.emit
                 .inc("litellm_llm_api_failed_requests_metric", &context, 1.0)?;
-            Success {
+            let success = Success {
                 emit: Emitter {
                     store: self.emit.store,
                     settings: self.emit.settings,
                 },
                 facts: self.facts,
                 owns_latency: false,
+                logs: self.logs,
+            };
+            success.zero_cost(payload, &values)?;
+            if let Some(deployment) = &self.facts.deployment_failure
+                && let Err(error) = self.deployment(deployment)
+            {
+                success.log(LogLine::new(
+                    "debug",
+                    "Prometheus Error: set_llm_deployment_failure_metrics. Exception occured - %s",
+                    vec![exception_text(&error)],
+                ));
             }
-            .zero_cost(payload, &values)?;
-            if let Some(deployment) = &self.facts.deployment_failure {
-                let _ = self.deployment(deployment);
-            }
-            Ok(())
+            success.deferred()
         })();
+        if let Err(error) = block {
+            self.logs.borrow_mut().push(LogLine::new(
+                "exception",
+                "prometheus Layer Error(): Exception occured - %s",
+                vec![exception_text(&error)],
+            ));
+        }
         Ok(())
     }
 

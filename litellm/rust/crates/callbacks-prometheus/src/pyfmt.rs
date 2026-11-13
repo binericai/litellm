@@ -149,6 +149,19 @@ pub fn py_number(value: &Value) -> Option<f64> {
     }
 }
 
+pub fn py_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(_) if is_py_int(value) => "int",
+        Value::Number(_) => "float",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) if opaque(value).is_some() => "object",
+        Value::Object(_) => "dict",
+    }
+}
+
 pub fn py_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections import deque
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from contextvars import ContextVar, Token
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias, TypeVar, get_args
 
@@ -58,6 +61,12 @@ _HIDDEN_KEYS: Final = ("additional_headers", "litellm_overhead_time_ms")
 _EPOCH_NAIVE: Final = datetime(1970, 1, 1)  # noqa: DTZ001  # callback timestamps use the legacy naive contract
 _EPOCH_AWARE: Final = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _ONE_MICROSECOND: Final = timedelta(microseconds=1)
+_PENDING_LIMIT: Final = 4096
+_Pending: TypeAlias = dict[tuple[object, bool], deque[dict[str, object]]]
+_TOKENS: Final = itertools.count(1)
+_BUDGET_LOOKUPS: Final = {"api_key": "key", "team": "team", "user": "user", "org": "org", "customer": "customer"}
+_Deferred: TypeAlias = list[Mapping[str, object]]
+_DEFERRING: Final[ContextVar[_Deferred | None]] = ContextVar("prometheus_native_deferring", default=None)
 _MAPPING: Final[TypeAdapter[Mapping[str, object]]] = TypeAdapter(Mapping[str, object])
 _MOST_RECENT_MODES: Final = frozenset(("mostrecent", "livemostrecent"))
 _STRICT: Final = ConfigDict(strict=True)
@@ -111,6 +120,29 @@ def moment(value: object) -> Mapping[str, object] | None:
         return None
     aware: Final = value.utcoffset() is not None
     return {"us": (value - (_EPOCH_AWARE if aware else _EPOCH_NAIVE)) // _ONE_MICROSECOND, "aware": aware}
+
+
+def wall_moment(value: datetime | None) -> Mapping[str, object] | None:
+    return None if value is None else moment(value.replace(tzinfo=None))
+
+
+def _pending_key(kwargs: Mapping[str, object]) -> tuple[object, bool]:
+    return (json_safe(kwargs.get("litellm_call_id")), kwargs.get("log_event_type") == "failed_api_call")
+
+
+def budget_lookup_failed(name: str, facts: Mapping[str, object]) -> Mapping[str, object] | None:
+    lookup: Final = _BUDGET_LOOKUPS.get(str(facts.get("entity"))) if name == "budget" else None
+    if lookup is None:
+        return None
+    return {
+        "level": "debug",
+        "format": "[Non-Blocking] Prometheus: Budget metric lookup %s failed: %s",
+        "args": [lookup],
+    }
+
+
+def no_log(_name: str, _facts: Mapping[str, object]) -> Mapping[str, object] | None:
+    return None
 
 
 def _payload(value: object) -> object:
@@ -180,6 +212,10 @@ class AttemptFacts:
 
     def __call__(self, kwargs: object) -> object:
         call: Final = _mapping_or_empty(kwargs)
+        store: Final = self._logger._native_store  # pyright: ignore[reportPrivateUsage]  # the logger owns its store
+        pending: Final = None if store is None else store.claim(call)
+        if pending is None:
+            return {"event": "skipped", "settings": _settings()}
         payload: Final = call.get("standard_logging_object")
         litellm_params: Final = _mapping_or_empty(call.get("litellm_params"))
         request_metadata: Final = {
@@ -213,6 +249,8 @@ class AttemptFacts:
             "key": self._key(call, litellm_params, call.get("standard_logging_object")),
             "deployment": self._deployment(call, litellm_params),
             "deployment_failure": self._deployment_failure(call),
+            "token": next(_TOKENS),
+            **pending,
             "settings": _settings(),
         }
 
@@ -269,11 +307,38 @@ class AttemptFacts:
         }
 
 
-def native_companion(
-    store: _native.NativePrometheusStore, logger: PrometheusLogger, owns_latency: bool
-) -> NativeLogger:
+class _LoggedNative:
+    __slots__ = ("native", "store")
+
+    def __init__(self, native: _native._NativeCallback, store: _native.NativePrometheusStore) -> None:  # pyright: ignore[reportPrivateUsage]  # the stub's protocol for exported callbacks
+        self.native: Final = native
+        self.store: Final = store
+
+    def manifest(self) -> str:
+        return self.native.manifest()
+
+    def request_state(self) -> object:
+        return self.native.request_state()
+
+    def handle(
+        self, hook: str, fields: Mapping[str, object], call: Mapping[str, object] | None, state: object, /
+    ) -> Awaitable[object]:
+        return self._logged(self.native.handle(hook, fields, call, state), fields)
+
+    async def _logged(self, running: Awaitable[object], fields: Mapping[str, object]) -> object:
+        try:
+            return await running
+        finally:
+            token: Final = _mapping_or_empty(fields.get(Field.deprecated_kwargs.value)).get("token")
+            if isinstance(token, int):
+                for level, message, args in self.store.take_logs(token):
+                    (verbose_logger.debug if level == "debug" else verbose_logger.error)(message, *args)
+
+
+def native_companion(store: _native.NativePrometheusStore, logger: PrometheusLogger) -> NativeLogger:
     return native_logger(
-        _native.prometheus_callback(store, owns_latency), {Field.deprecated_kwargs: AttemptFacts(logger)}
+        _LoggedNative(_native.prometheus_callback(store, True), store),
+        {Field.deprecated_kwargs: AttemptFacts(logger)},
     )
 
 
@@ -367,12 +432,61 @@ def _family(
     return metric
 
 
+class _Deferring:
+    __slots__ = ("deferred", "entry", "on_error", "reset")
+
+    def __init__(
+        self,
+        entry: dict[str, object],  # mutable-ok: the legacy handler fills it in
+        on_error: Callable[[str, Mapping[str, object]], Mapping[str, object] | None],
+    ) -> None:
+        self.entry: Final = entry
+        self.on_error: Final = on_error
+        self.deferred: Final[_Deferred] = []
+        self.reset: Token[_Deferred | None] | None = None
+
+    def __enter__(self) -> None:
+        self.reset = _DEFERRING.set(self.deferred)
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.reset is not None:
+            _DEFERRING.reset(self.reset)
+        self.entry["deferred"] = [
+            {**item, "on_error": self.on_error(str(item["op"]), _mapping_or_empty(item["facts"]))}
+            for item in self.deferred
+        ]
+
+
 class NativeStore:
-    __slots__ = ("owns_latency", "store")
+    __slots__ = ("pending", "store")
 
     def __init__(self, store: _native.NativePrometheusStore) -> None:
         self.store: Final = store
-        self.owns_latency = True
+        self.pending: Final[_Pending] = {}
+
+    def expect(self, kwargs: Mapping[str, object]) -> dict[str, object]:  # mutable-ok: the legacy handler fills it in
+        entry: Final[dict[str, object]] = {"deferred": []}  # mutable-ok: the legacy handler fills it in
+        self.pending.setdefault(_pending_key(kwargs), deque()).append(entry)
+        while len(self.pending) > _PENDING_LIMIT:
+            del self.pending[next(iter(self.pending))]
+        return entry
+
+    def claim(self, kwargs: Mapping[str, object]) -> dict[str, object] | None:  # mutable-ok: handed over once
+        key: Final = _pending_key(kwargs)
+        waiting: Final = self.pending.get(key)
+        if not waiting:
+            return None
+        entry: Final = waiting.popleft()
+        if not waiting:
+            del self.pending[key]
+        return entry
+
+    def deferring(
+        self,
+        entry: dict[str, object],  # mutable-ok: the legacy handler fills it in
+        on_error: Callable[[str, Mapping[str, object]], Mapping[str, object] | None],
+    ) -> _Deferring:
+        return _Deferring(entry, on_error)
 
     @classmethod
     def open(cls, logger: PrometheusLogger) -> NativeStore:
@@ -400,10 +514,13 @@ class NativeStore:
             if hasattr(PrometheusMetricLabels, metric):
                 self.store.declare_labels(metric, list(logger.get_labels_for_metric(metric)))
         REGISTRY.register(NativeStoreCollector(self.store))
-        self.owns_latency = not logger._emit_input_sequence_length_label  # pyright: ignore[reportPrivateUsage]  # that label needs the response object, which V2 attempt_ended does not carry
-        return native_companion(self.store, logger, self.owns_latency)
+        return native_companion(self.store, logger)
 
     def op(self, name: str, facts: Mapping[str, object]) -> None:
+        deferred: Final = _DEFERRING.get()
+        if deferred is not None:
+            deferred.append({"op": name, "facts": {key: json_safe(value) for key, value in facts.items()}})
+            return
         self.store.op(
             name, json.dumps({**{key: json_safe(value) for key, value in facts.items()}, "settings": _settings()})
         )
