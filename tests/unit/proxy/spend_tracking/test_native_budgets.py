@@ -87,6 +87,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> Iterator[SpendCounterStore]:
     monkeypatch.setattr(proxy_server, "spend_counter_store", spend_counter_store)
     monkeypatch.setattr(proxy_server, "prisma_client", None)
     monkeypatch.setattr(litellm, "budget_exceeded_throttle_percentage", 0.5)
+    monkeypatch.setattr(litellm, "callbacks", [])
     yield spend_counter_store
     native_budgets._installed.clear()  # pyright: ignore[reportPrivateUsage]  # later tests run without a native owner
 
@@ -124,12 +125,12 @@ class Admitted:
 
 
 def _install_native_owner(store: SpendCounterStore) -> native_budgets.NativeBudgetsLogger:
-    callbacks: Final[list[object]] = []  # mutable-ok: install_native_budgets inserts into litellm.callbacks
     native_budgets._installed.clear()  # pyright: ignore[reportPrivateUsage]  # each case installs its own owner over its own store
+    litellm.callbacks.clear()
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv(native_budgets.NATIVE_BUDGETS_ENV, "true")
-        native_budgets.install_native_budgets(store, callbacks)
-    logger: Final = callbacks[0]
+        native_budgets.install_native_budgets(store, litellm.callbacks)
+    logger: Final = litellm.callbacks[0]
     assert isinstance(logger, native_budgets.NativeBudgetsLogger)
     return logger
 
@@ -512,3 +513,24 @@ async def test_every_counter_kind_admits_like_python(store: SpendCounterStore, k
     assert _refusal_fields(native.refusal) == _refusal_fields(python.refusal)
     assert native.counters == python.counters
     assert _entries(native.reservation) == _entries(python.reservation)
+
+
+@pytest.mark.asyncio
+async def test_python_reserves_again_once_the_native_owner_leaves_the_callbacks(
+    store: SpendCounterStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity: Final = Identity(team_budget=100.0, spend={KEY: 1.0, TEAM: 2.0})
+    python: Final = await _python_admit(store, identity)
+    store.flush_local()
+    _ = _install_native_owner(store)
+    monkeypatch.setattr(litellm, "callbacks", [])
+    _seed(store, identity)
+
+    reservation: Final = await reserve_budget_for_request(**_arguments(identity))  # pyright: ignore[reportArgumentType]  # the shared argument table is typed per key above
+
+    assert _entries(reservation) == _entries(python.reservation)
+    assert _snapshot(store) == python.counters
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(native_budgets.NATIVE_BUDGETS_ENV, "true")
+        native_budgets.install_native_budgets(store, litellm.callbacks)
+    assert native_budgets.native_owner_reserves()

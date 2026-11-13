@@ -52,7 +52,7 @@ from litellm.proxy.spend_tracking.native_budgets import (
     is_native_reservation,
     native_admission,
     native_budget_route,
-    native_budgets,
+    native_owner_reserves,
     new_reservation_id,
     pending_native_reservation,
     settle_native_reservation,
@@ -322,7 +322,7 @@ async def reserve_budget_for_request(
     # In that case we fall back to read-time enforcement only.
     if reservation_cost is None or reservation_cost <= 0:
         return None
-    if native_budgets() is not None and native_budget_route(route):
+    if native_owner_reserves() and native_budget_route(route):
         return await _native_budget_plan(
             request_body=request_body,
             route=route,

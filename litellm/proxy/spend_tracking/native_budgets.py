@@ -309,15 +309,30 @@ class NativeBudgetsLogger(NativeLogger):
 
 _PROJECTIONS: Final[Mapping[Field, Projection]] = {Field.deprecated_kwargs: _admission}
 
-_installed: Final[list[NativeBudgets]] = []  # mutable-ok: one process-wide native owner, set once at startup
+
+@dataclass(frozen=True, slots=True)
+class _Owner:
+    budgets: NativeBudgets
+    logger: NativeBudgetsLogger
+
+
+_installed: Final[list[_Owner]] = []  # mutable-ok: one process-wide native owner, set once at startup
 
 
 def native_budgets() -> NativeBudgets | None:
-    return _installed[0] if _installed else None
+    return _installed[0].budgets if _installed else None
+
+
+def native_owner_reserves() -> bool:
+    return bool(_installed) and any(callback is _installed[0].logger for callback in litellm.callbacks)
 
 
 def install_native_budgets(store: SpendCounterStore, callbacks: list[object]) -> None:  # mutable-ok: litellm.callbacks
-    if _installed or not native_budgets_requested():
+    if _installed:
+        if not any(callback is _installed[0].logger for callback in callbacks):
+            callbacks.insert(0, _installed[0].logger)
+        return
+    if not native_budgets_requested():
         return
     from litellm.rust_bridge._native import NativeBudgets
 
@@ -327,8 +342,9 @@ def install_native_budgets(store: SpendCounterStore, callbacks: list[object]) ->
     register_abort_error("budget_exceeded", _budget_exceeded)
     register_abort_error("budget_unavailable", _budget_unavailable)
     register_abort_error("budget_reservation_failed", _reservation_failed)
+    assert isinstance(logger, NativeBudgetsLogger)
     callbacks.insert(0, logger)
-    _installed.append(budgets)
+    _installed.append(_Owner(budgets=budgets, logger=logger))
 
 
 async def settle_native_reservation(
