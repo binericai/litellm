@@ -390,15 +390,32 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         configured_output_tokens: Final = (
             get_estimated_output_tokens(user_api_key_dict=auth, model_name=requested_model) if reserves else None
         )
-        probe: Final = dict(data)
+        reserved_model: Final = limiter.rate_limited_model(requested_model)
+        facts: Final[Mapping[str, object]] = {
+            "call_id": data.get("litellm_call_id"),
+            "identity": request_identity(data),
+            "descriptors": [dict(descriptor) for descriptor in descriptors],
+            "requested_model": requested_model,
+            "reserved_model": None
+            if reserved_model is None
+            else {"requested": reserved_model.requested, "group": reserved_model.group},
+            "policy": policy(limiter),
+            "ptu_ceiling": None if ceiling is None else dataclasses.asdict(ceiling),
+            "reuses_request_slot": reuses_request_slot,
+            "prior_response": _prior(prior_response),
+        }
+        first_pass: Final = await self._call(
+            Hook.pre_call, {**facts, "phase": "first_pass"}, ctx, state=state, request=pre_call_request()
+        )
+        if first_pass is not None or not self.bridge.first_pass_admitted(state):
+            mirror_rate_limit_response(self.bridge, state)
+            return first_pass
         estimated_tokens: int | None = None  # rebind-ok: set only when the request reserves tokens
         ptu_estimate: Mapping[str, object] | None = None  # rebind-ok: set only for a team PTU reservation
         if reserves:
-            self._apply_output_cap(
-                probe, min(configured_tpm_limits), call_type, endpoint_type, configured_output_tokens
-            )
+            self._apply_output_cap(data, min(configured_tpm_limits), call_type, endpoint_type, configured_output_tokens)
             estimated_tokens = await offload_token_count(limiter._estimate_tokens_for_request)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
-                data=probe,
+                data=data,
                 model=requested_model,
                 min_configured_tpm_limit=min(configured_tpm_limits),
                 call_type=call_type,
@@ -407,7 +424,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             )
             if ceiling is not None:
                 ptu_input, ptu_output = await offload_token_count(limiter._estimate_input_and_output_tokens)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
-                    data=probe,
+                    data=data,
                     min_configured_tpm_limit=min(configured_tpm_limits),
                     call_type=call_type,
                     configured_output_tokens=configured_output_tokens,
@@ -415,41 +432,38 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
                     media_model_resolver=limiter._media_model_resolver,  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
                 )
                 ptu_estimate = {"input_tokens": ptu_input, "output_tokens": ptu_output}
-        io_estimate: Mapping[str, object] | None = None  # rebind-ok: set only for project ITPM/OTPM limits
-        if has_io:
-            _, io_output = limiter._estimate_input_and_output_tokens(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
-                data=probe, min_configured_tpm_limit=min_otpm_limit, call_type=call_type, include_media=False
+            reserved: Final = await self._call(
+                Hook.pre_call,
+                {**facts, "phase": "tokens", "estimated_tokens": estimated_tokens, "ptu_estimate": ptu_estimate},
+                ctx,
+                state=state,
+                request=pre_call_request(),
             )
-            io_input: Final = await offload_token_count(limiter._estimate_precise_input_tokens)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
-                data=probe, model=requested_model, call_type=call_type, team_id=auth.team_id
-            )
-            io_estimate = {
-                "input_tokens": io_input,
-                "output_tokens": io_output,
-                "explicit_output_cap": limiter._has_explicit_output_cap(probe, call_type),  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
-            }
-        reserved_model: Final = limiter.rate_limited_model(requested_model)
-        facts: Final = {
-            "call_id": data.get("litellm_call_id"),
-            "identity": request_identity(data),
-            "descriptors": [dict(descriptor) for descriptor in descriptors],
-            "requested_model": requested_model,
-            "estimated_tokens": estimated_tokens,
-            "reserved_model": None
-            if reserved_model is None
-            else {"requested": reserved_model.requested, "group": reserved_model.group},
-            "policy": policy(limiter),
-            "ptu_ceiling": None if ceiling is None else dataclasses.asdict(ceiling),
-            "ptu_estimate": ptu_estimate,
-            "io_estimate": io_estimate,
-            "reuses_request_slot": reuses_request_slot,
-            "prior_response": _prior(prior_response),
+            if reserved is not None:
+                mirror_rate_limit_response(self.bridge, state)
+                return reserved
+        if not has_io:
+            mirror_rate_limit_response(self.bridge, state)
+            return None
+        _, io_output = limiter._estimate_input_and_output_tokens(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+            data=data, min_configured_tpm_limit=min_otpm_limit, call_type=call_type, include_media=False
+        )
+        io_input: Final = await offload_token_count(limiter._estimate_precise_input_tokens)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
+            data=data, model=requested_model, call_type=call_type, team_id=auth.team_id
+        )
+        io_estimate: Final = {
+            "input_tokens": io_input,
+            "output_tokens": io_output,
+            "explicit_output_cap": limiter._has_explicit_output_cap(data, call_type),  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
         }
-        outcome: Final = await self._call(Hook.pre_call, facts, ctx, state=state, request=pre_call_request())
-        if reserves and self.bridge.first_pass_admitted(state):
-            self._apply_output_cap(data, min(configured_tpm_limits), call_type, endpoint_type, configured_output_tokens)
-        if self.bridge.io_reached(state):
-            self._apply_output_cap(data, min_otpm_limit, call_type, endpoint_type)
+        self._apply_output_cap(data, min_otpm_limit, call_type, endpoint_type)
+        outcome: Final = await self._call(
+            Hook.pre_call,
+            {**facts, "phase": "io", "estimated_tokens": estimated_tokens, "io_estimate": io_estimate},
+            ctx,
+            state=state,
+            request=pre_call_request(),
+        )
         mirror_rate_limit_response(self.bridge, state)
         return outcome
 

@@ -1466,3 +1466,27 @@ async def test_native_redis_calls_report_the_rate_limit_target_and_call_types_li
     assert native == python
     assert python
     assert {target for _, target in python} == {"rate_limits"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", (False, True))
+async def test_tokens_are_estimated_only_after_the_first_pass_admits_like_python(
+    raises: bool, backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    estimate: Final = PROXY_MaxParallelRequestsHandler_v3._estimate_tokens_for_request  # pyright: ignore[reportPrivateUsage]  # the estimator under observation
+    calls: Final[list[bool]] = []
+
+    def counted(self: PROXY_MaxParallelRequestsHandler_v3, **kwargs: object) -> int:
+        calls.append(self.native_companion is not None)
+        if raises and calls.count(calls[-1]) == 1:
+            raise RuntimeError("tokenizer failed")
+        return estimate(self, **kwargs)  # pyright: ignore[reportArgumentType]  # forwarded as the limiter passed them
+
+    monkeypatch.setattr(PROXY_MaxParallelRequestsHandler_v3, "_estimate_tokens_for_request", counted)
+    auth: Final = _auth(rpm_limit=2, tpm_limit=4000)
+    observed: Final = await _differential(
+        [Request(auth, {**_CHAT, "max_tokens": 30}) for _ in range(4)], [("api_key", _KEY)], backend
+    )
+    assert calls.count(True) == calls.count(False) == 2
+    assert observed[2:] == [observed[2], observed[2]]
+    assert observed[2] is not None

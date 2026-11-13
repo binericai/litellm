@@ -83,6 +83,18 @@ pub struct PreCallFacts {
     pub prior_response: Option<PriorResponse>,
     #[serde(default)]
     pub batch: Option<BatchFacts>,
+    #[serde(default)]
+    pub phase: Phase,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    #[default]
+    Whole,
+    FirstPass,
+    Tokens,
+    Io,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,13 +350,57 @@ impl ParallelRequestLimiter {
         facts: &PreCallFacts,
         ctx: Ctx<'_>,
     ) -> Result<Option<Abort>, Unverifiable> {
+        match facts.phase {
+            Phase::FirstPass => return self.first_pass(state, facts, ctx).await,
+            Phase::Tokens | Phase::Io if !state.stash().first_pass_admitted => return Ok(None),
+            Phase::Tokens => return self.reserve_tokens(state, facts, ctx).await,
+            Phase::Io => {
+                return self
+                    .reserve_io(state, facts, self.reservation_amount(facts), ctx)
+                    .await;
+            }
+            Phase::Whole => {}
+        }
+        if let Some(abort) = self.first_pass(state, facts, ctx).await? {
+            return Ok(Some(abort));
+        }
+        if !state.stash().first_pass_admitted {
+            return Ok(None);
+        }
+        if let Some(abort) = self.reserve_tokens(state, facts, ctx).await? {
+            return Ok(Some(abort));
+        }
+        self.reserve_io(state, facts, self.reservation_amount(facts), ctx)
+            .await
+    }
+
+    fn reserves_tokens(&self, facts: &PreCallFacts) -> bool {
+        self.engine.settings().tpm_reservation_enabled
+            && facts.descriptors.iter().any(|descriptor| {
+                !descriptor.is_project_io() && descriptor.limits().tokens_per_unit.is_some()
+            })
+    }
+
+    fn reservation_amount(&self, facts: &PreCallFacts) -> i64 {
+        if self.reserves_tokens(facts) {
+            facts.estimated_tokens.unwrap_or(0).max(1)
+        } else {
+            0
+        }
+    }
+
+    async fn first_pass(
+        &self,
+        state: &LimiterState,
+        facts: &PreCallFacts,
+        ctx: Ctx<'_>,
+    ) -> Result<Option<Abort>, Unverifiable> {
         let descriptors = &facts.descriptors;
         let settings = self.engine.settings();
         {
             let mut stash = state.stash();
             stash.owned = true;
             stash.first_pass_admitted = false;
-            stash.io_reached = false;
             stash.ptu_ceiling = facts.ptu_ceiling.clone();
             stash.rate_limit_response = facts.prior_response.clone().map(Response::from);
             if let Some(call_id) = &facts.call_id {
@@ -413,12 +469,18 @@ impl ParallelRequestLimiter {
                 stash.parallel_slot = Some(SlotAcquisition { slot_id, gauges });
             }
         }
-        let has_tpm_limits = descriptors.iter().any(|descriptor| {
-            !descriptor.is_project_io() && descriptor.limits().tokens_per_unit.is_some()
-        });
-        let mut reservation_amount = 0;
-        if has_tpm_limits && settings.tpm_reservation_enabled {
-            let estimated = facts.estimated_tokens.unwrap_or(0).max(1);
+        Ok(None)
+    }
+
+    async fn reserve_tokens(
+        &self,
+        state: &LimiterState,
+        facts: &PreCallFacts,
+        ctx: Ctx<'_>,
+    ) -> Result<Option<Abort>, Unverifiable> {
+        let descriptors = &facts.descriptors;
+        if self.reserves_tokens(facts) {
+            let estimated = self.reservation_amount(facts);
             let ptu_estimated = match (&facts.ptu_ceiling, facts.ptu_estimate) {
                 (Some(ceiling), Some(estimate)) => {
                     ceiling.estimate(estimate.input_tokens, estimate.output_tokens)
@@ -455,9 +517,8 @@ impl ParallelRequestLimiter {
             if let Some(stored) = stash.rate_limit_response.as_mut() {
                 stored.statuses.extend(tpm_response.statuses);
             }
-            reservation_amount = estimated;
         }
-        self.reserve_io(state, facts, reservation_amount, ctx).await
+        Ok(None)
     }
 
     async fn admit_batch(
@@ -543,7 +604,6 @@ impl ParallelRequestLimiter {
         if descriptors.is_empty() {
             return Ok(None);
         }
-        state.stash().io_reached = true;
         let estimate = facts.io_estimate.unwrap_or_default();
         let input_tokens = estimate.input_tokens.max(1);
         let output_tokens = if estimate.explicit_output_cap {
