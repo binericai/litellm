@@ -433,18 +433,23 @@ impl NativeParallelRequestLimiter {
         Ok(output_cap(&facts))
     }
 
-    fn take_parallel_slot(
+    fn take_parallel_slot<'py>(
         &self,
-        state: PyRef<'_, NativeParallelRequestLimiterState>,
-    ) -> Option<(String, Vec<(String, String)>)> {
-        state.0.stash().parallel_slot.take().map(|slot| {
-            (
-                slot.slot_id,
-                slot.gauges
-                    .into_iter()
-                    .map(|scope| (scope.descriptor, scope.value))
-                    .collect(),
-            )
+        py: Python<'py>,
+        state: PyRef<'py, NativeParallelRequestLimiterState>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&state.0);
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            Ok(limiter.take_parallel_slot(&state).await.map(|slot| {
+                (
+                    slot.slot_id,
+                    slot.gauges
+                        .into_iter()
+                        .map(|scope| (scope.descriptor, scope.value))
+                        .collect::<Vec<_>>(),
+                )
+            }))
         })
     }
 

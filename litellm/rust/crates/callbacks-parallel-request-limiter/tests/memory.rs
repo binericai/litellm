@@ -96,6 +96,34 @@ async fn the_rpm_limit_admits_up_to_the_limit_then_refuses_with_the_python_detai
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn taking_the_slot_waits_for_a_release_in_flight() {
+    let (limiter, store, _) = limiter(true);
+    let limiter = Arc::new(limiter);
+    let parallel = descriptors(
+        json!([{"key": "api_key", "value": "k", "rate_limit": {"max_parallel_requests": 2}}]),
+    );
+    let state = Arc::new(LimiterState::default());
+    assert_eq!(
+        limiter.pre_call(&state, facts(parallel, None), None).await,
+        None
+    );
+    let guard = store.memory_guard();
+    let releasing = tokio::spawn({
+        let (limiter, state) = (Arc::clone(&limiter), Arc::clone(&state));
+        async move { limiter.release_on_disconnect(&state).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let taking = tokio::spawn({
+        let (limiter, state) = (Arc::clone(&limiter), Arc::clone(&state));
+        async move { limiter.take_parallel_slot(&state).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(guard);
+    releasing.await.unwrap();
+    assert_eq!(taking.await.unwrap(), None);
+}
+
 #[rstest]
 #[tokio::test]
 async fn a_parallel_slot_is_held_until_post_call_success_releases_it() {

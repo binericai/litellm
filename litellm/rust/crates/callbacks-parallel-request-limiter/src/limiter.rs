@@ -807,6 +807,11 @@ impl ParallelRequestLimiter {
         )
     }
 
+    pub async fn take_parallel_slot(&self, state: &LimiterState) -> Option<SlotAcquisition> {
+        let _guard = state.release.lock().await;
+        state.stash().parallel_slot.take()
+    }
+
     pub async fn release_for_settlement(
         &self,
         state: &LimiterState,

@@ -2068,7 +2068,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         async with stash.parallel_slot_release_lock:
             if _ended_before_slot_reuse(round_ended_at, stash.parallel_slot_reused_at):
                 return
-            acquisition: Final = stash.parallel_slot or self._take_native_slot(stash)
+            acquisition: Final = stash.parallel_slot or await self._take_native_slot(stash)
             if acquisition is None:
                 return
             deferred: Final = in_logging_callback and await self._defer_parallel_slot_release(
@@ -2078,11 +2078,11 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 await self._release_parallel_request_slots(acquisition, parent_otel_span)
             stash.parallel_slot = None  # rebind-ok: marks this request's slot as released
 
-    def _take_native_slot(self, stash: RequestRateLimiterStash) -> ParallelSlotAcquisition | None:
+    async def _take_native_slot(self, stash: RequestRateLimiterStash) -> ParallelSlotAcquisition | None:
         native_state: Final = self._native_state(stash)
         if self.native_companion is None or native_state is None:
             return None
-        taken: Final = self.native_companion.take_parallel_slot(native_state)
+        taken: Final = await self.native_companion.take_parallel_slot(native_state)
         if taken is None:
             return None
         slot_id, gauges = taken
