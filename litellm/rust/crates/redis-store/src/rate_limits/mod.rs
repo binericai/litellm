@@ -1,3 +1,4 @@
+mod enqueued;
 mod keys;
 mod lua;
 mod scripts;
@@ -7,6 +8,7 @@ use std::{sync::Arc, time::Duration};
 
 use litellm_redis_client::{Declared, RedisBatch, RedisClient, Slot};
 
+pub use self::enqueued::EnqueuedReply;
 pub use self::keys::{Counter, Entry, Kind, Scope};
 pub use self::types::{
     AcquireReply, Applied, AtomicCounter, AtomicReply, Gauge, GuardedIncrement, GuardedReply,

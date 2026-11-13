@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     descriptor::{Descriptor, PROJECT_ITPM, PROJECT_OTPM},
     engine::{GuardedOp, Op},
+    enqueued::EnqueuedScope,
     status::{LimitKind, Status, WindowIdentity},
 };
 
@@ -25,6 +26,8 @@ pub struct BatchFacts {
     pub output_tokens: i64,
     #[serde(default)]
     pub per_model_usage: BTreeMap<String, BTreeMap<String, i64>>,
+    #[serde(default)]
+    pub enqueued_scopes: Vec<EnqueuedScope>,
 }
 
 pub struct Refusal {
@@ -194,6 +197,7 @@ mod tests {
                 "gpt".to_owned(),
                 BTreeMap::from([("total_tokens".to_owned(), 70)]),
             )]),
+            enqueued_scopes: Vec::new(),
         }
     }
 

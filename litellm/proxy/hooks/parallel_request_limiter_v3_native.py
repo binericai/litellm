@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import os
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from types import MappingProxyType
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Final
 
 from pydantic import TypeAdapter
 
+from litellm._logging import verbose_proxy_logger
 from litellm.caching.redis_batch import active_request_redis_batches
 from litellm.integrations.custom_logger_v2.call import CallContext
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
@@ -23,6 +25,17 @@ from litellm.integrations.custom_logger_v2.native import (
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError, map_v3_rate_limit_type
+from litellm.proxy.hooks.batch_enqueued_tokens import (
+    BATCH_ENQUEUED_REFUND_STATUSES,
+    BatchEnqueuedTokenOutcome,
+    BatchEnqueuedTokenOverLimit,
+    BatchEnqueuedTokenReservation,
+    BatchEnqueuedTokenScope,
+    BatchEnqueuedTokenStore,
+    batch_response_view,
+    canonical_provider_batch_id,
+    resolve_batch_enqueued_token_scopes,
+)
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.types.utils import CallTypes
 
@@ -31,8 +44,11 @@ PROJECT_OTPM_DESCRIPTOR_KEY: Final = "model_per_project_otpm"
 PTU_TEAM_DESCRIPTOR_KEY: Final = "model_per_team_ptu"
 
 if TYPE_CHECKING:
+    from opentelemetry.trace import Span
+
     from litellm.proxy.hooks.batch_rate_limiter import PROXY_BatchRateLimiter
     from litellm.proxy.hooks.parallel_request_limiter_v3 import PROXY_MaxParallelRequestsHandler_v3, RateLimitResponse
+    from litellm.proxy.utils import InternalUsageCache
     from litellm.rust_bridge._native import (
         NativeParallelRequestLimiter,
         NativeParallelRequestLimiterState,
@@ -52,6 +68,10 @@ _UNSUPPORTED_CALL_TYPES: Final = frozenset(
     }
 )
 _HEADERS: Final = TypeAdapter(dict[str, str])
+_SCOPES: Final = TypeAdapter(tuple[BatchEnqueuedTokenScope, ...])
+_RESERVATION: Final = TypeAdapter(BatchEnqueuedTokenReservation)
+_OVER_LIMIT: Final = TypeAdapter(BatchEnqueuedTokenOverLimit)
+_OUTCOME: Final = TypeAdapter(dict[str, object])
 _PTU_FIELDS: Final = TypeAdapter(dict[str, str | int | float])
 
 
@@ -184,7 +204,8 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
             case Hook.pre_call:
                 return await self._pre_call(data, ctx)
             case Hook.post_call_success:
-                return await self._call(hook, {"call_id": _call_id(data)}, ctx)
+                response: Final = getattr(view, Field.deprecated_response_obj.value, None)
+                return await self._call(hook, {"call_id": _call_id(data), "batch": _batch_response(response)}, ctx)
             case Hook.post_call_failure:
                 return await self._post_call_failure(data, ctx)
             case Hook.log_prepare:
@@ -217,14 +238,12 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         return await self._call(Hook.post_call_failure, failure_facts(self.limiter, data), ctx)
 
     def _declines(self, data: Mapping[str, object], call_type: str, auth: UserAPIKeyAuth | None) -> bool:
-        from litellm.proxy.hooks.batch_enqueued_tokens import resolve_batch_enqueued_token_scopes
         from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash
 
         stash: Final = get_request_stash()
         return (
             auth is None
             or call_type in _UNSUPPORTED_CALL_TYPES
-            or (call_type == CallTypes.acreate_batch.value and bool(resolve_batch_enqueued_token_scopes(auth)))
             or (stash is not None and stash.native_state is None and stash.call_type is not None)
             or not isinstance(data.get("litellm_call_id"), str)
         )
@@ -394,8 +413,9 @@ async def _prepared_batch(
         input_file_id: Final = data.get("input_file_id")
         if not input_file_id:
             return None
+        enqueued_scopes: Final = resolve_batch_enqueued_token_scopes(auth)
         should_skip, descriptors = batch._should_skip_batch_input_file_processing(  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the batch limiter's own skip decision over the untyped body
-            data=data, user_api_key_dict=auth, has_enqueued_scopes=False
+            data=data, user_api_key_dict=auth, has_enqueued_scopes=bool(enqueued_scopes)
         )
         if should_skip:
             return None
@@ -409,6 +429,14 @@ async def _prepared_batch(
         )
         data["_batch_token_count"] = usage.total_tokens
         data["_batch_request_count"] = usage.request_count
+        if enqueued_scopes:
+            return {
+                "descriptors": [],
+                "increments": [],
+                "request_count": usage.request_count,
+                "total_tokens": usage.total_tokens,
+                "enqueued_scopes": [dataclasses.asdict(scope) for scope in enqueued_scopes],
+            }
         charged: Final = (
             descriptors
             if descriptors is not None
@@ -432,6 +460,63 @@ async def _prepared_batch(
         "output_tokens": usage.output_tokens,
         "per_model_usage": usage.per_model_usage,
     }
+
+
+def _batch_response(response: object) -> Mapping[str, object] | None:
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash
+
+    stash: Final = get_request_stash()
+    if stash is None or stash.native_state is None:
+        return None
+    try:
+        view: Final = batch_response_view(response)
+        if view is None:
+            return None
+        return {
+            "id": canonical_provider_batch_id(view.id),
+            "terminal": view.status.lower() in BATCH_ENQUEUED_REFUND_STATUSES,
+        }
+    except Exception as e:  # noqa: BLE001  # post-call batch accounting must never fail the response
+        verbose_proxy_logger.exception("Error in batch enqueued-token post-call hook: %s", e)
+        return None
+
+
+class NativeBatchEnqueuedTokenStore(BatchEnqueuedTokenStore):
+    def __init__(self, internal_usage_cache: "InternalUsageCache", native: "NativeParallelRequestLimiter") -> None:
+        super().__init__(internal_usage_cache=internal_usage_cache)
+        self.native: Final = native
+
+    async def reserve(
+        self,
+        tokens: int,
+        scopes: tuple[BatchEnqueuedTokenScope, ...],
+        litellm_parent_otel_span: "Span | None" = None,
+    ) -> BatchEnqueuedTokenOutcome:
+        outcome: Final = _OUTCOME.validate_json(
+            await self.native.enqueued_reserve(tokens, _SCOPES.dump_json(scopes).decode())
+        )
+        if "over_limit" in outcome:
+            return _OVER_LIMIT.validate_python(outcome["over_limit"])
+        return _RESERVATION.validate_python(outcome["reservation"])
+
+    async def refund(
+        self, reservation: BatchEnqueuedTokenReservation, litellm_parent_otel_span: "Span | None" = None
+    ) -> None:
+        await self.native.enqueued_refund(_RESERVATION.dump_json(reservation).decode())
+
+    async def save_reservation(
+        self,
+        batch_id: str,
+        reservation: BatchEnqueuedTokenReservation,
+        litellm_parent_otel_span: "Span | None" = None,
+    ) -> None:
+        await self.native.enqueued_save(batch_id, _RESERVATION.dump_json(reservation).decode())
+
+    async def pop_reservation(
+        self, batch_id: str, litellm_parent_otel_span: "Span | None" = None
+    ) -> BatchEnqueuedTokenReservation | None:
+        popped: Final = await self.native.enqueued_pop(batch_id)
+        return None if popped is None else _RESERVATION.validate_json(popped)
 
 
 def mirror_rate_limit_response(
@@ -490,6 +575,7 @@ def native_engine(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> "NativePara
         limiter.window_size,
         limiter.tpm_reservation_enabled,
         None if clock is datetime.now else (lambda: clock().timestamp()),
+        time.monotonic,
     )
 
 
@@ -501,11 +587,16 @@ def native_parallel_request_limiter(
     cls: Final = type(manifest.selection.name, (ParallelRequestLimiterNativeLogger,), _namespace(bridge, manifest))  # pyright: ignore[reportArgumentType]  # the bridge takes its own state type
     logger: Final = cls(bridge, limiter)
     limiter.native_companion = bridge
+    store: Final = limiter.batch_enqueued_token_store
+    if not isinstance(store, NativeBatchEnqueuedTokenStore):
+        native_store: Final = NativeBatchEnqueuedTokenStore(store.internal_usage_cache, bridge)
+        limiter.batch_enqueued_token_store = native_store  # rebind-ok: the native owns the enqueued-token state
     return logger
 
 
 __all__ = [
     "NATIVE_PARALLEL_REQUEST_LIMITER_ENV",
+    "NativeBatchEnqueuedTokenStore",
     "ParallelRequestLimiterNativeLogger",
     "failure_facts",
     "limiter_state",

@@ -214,6 +214,10 @@ impl Engine {
             .map_err(|_| Unverifiable)
     }
 
+    pub fn store(&self) -> &Arc<RateLimits> {
+        &self.store
+    }
+
     pub fn memory_updates(&self) -> &UpdateLock {
         self.store.memory_updates()
     }

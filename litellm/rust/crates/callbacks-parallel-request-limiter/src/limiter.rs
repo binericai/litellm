@@ -18,7 +18,8 @@ use serde_json::{Map, Value};
 use crate::{
     batch::{self, BatchFacts},
     descriptor::{Descriptor, PROJECT_ITPM, PROJECT_OTPM, PTU_TEAM},
-    engine::{Ctx, Engine, Op, Policy, Settlement, SlotAcquisition, Unverifiable},
+    engine::{Ctx, Engine, Now, Op, Policy, Settlement, SlotAcquisition, Unverifiable},
+    enqueued::{EnqueuedOutcome, EnqueuedTokens, process_monotonic},
     ptu::{Ceiling, Usage, settlement_tokens},
     refusal,
     state::{IoReservation, LimiterState, RateLimitedModel, Stash},
@@ -123,6 +124,20 @@ pub struct CallIdFacts {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchResponseFacts {
+    pub id: String,
+    pub terminal: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostCallSuccessFacts {
+    #[serde(default)]
+    pub call_id: Option<String>,
+    #[serde(default)]
+    pub batch: Option<BatchResponseFacts>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostCallFailureFacts {
     #[serde(default)]
     pub tpm_actual: i64,
@@ -216,6 +231,7 @@ fn windows_keyed(windows: &[WindowIdentity], key: &str) -> Vec<WindowIdentity> {
 pub struct ParallelRequestLimiter {
     manifest: Manifest,
     engine: Engine,
+    enqueued: EnqueuedTokens,
 }
 
 fn decode<T: DeserializeOwned + Default>(input: &HookInput) -> Result<T, CallbackError> {
@@ -245,7 +261,7 @@ pub fn manifest() -> Manifest {
                 ..Subscription::on(Hook::PreCall)
             },
             Subscription {
-                reads: kwargs,
+                reads: FieldSet::of(&[Field::DeprecatedKwargs, Field::DeprecatedResponseObj]),
                 awaited: true,
                 ..Subscription::on(Hook::PostCallSuccess)
             },
@@ -266,14 +282,24 @@ pub fn manifest() -> Manifest {
 
 impl ParallelRequestLimiter {
     pub fn new(engine: Engine) -> Self {
+        Self::with_monotonic(engine, process_monotonic())
+    }
+
+    pub fn with_monotonic(engine: Engine, monotonic: Now) -> Self {
+        let enqueued = EnqueuedTokens::new(Arc::clone(engine.store()), monotonic);
         Self {
             manifest: manifest(),
             engine,
+            enqueued,
         }
     }
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    pub fn enqueued(&self) -> &EnqueuedTokens {
+        &self.enqueued
     }
 
     async fn release_stashed(&self, state: &LimiterState, in_logging_callback: bool, ctx: Ctx<'_>) {
@@ -439,6 +465,28 @@ impl ParallelRequestLimiter {
         ctx: Ctx<'_>,
     ) -> Result<Option<Abort>, Unverifiable> {
         state.stash().batch_tpd_refunds.clear();
+        if !batch.enqueued_scopes.is_empty() {
+            return Ok(
+                match self
+                    .enqueued
+                    .reserve(batch.total_tokens, batch.enqueued_scopes.clone())
+                    .await
+                {
+                    EnqueuedOutcome::OverLimit { scope, enqueued } => {
+                        Some(refusal::batch_enqueued_limited(
+                            &scope,
+                            enqueued,
+                            batch.total_tokens,
+                            facts.requested_model.as_deref(),
+                        ))
+                    }
+                    EnqueuedOutcome::Reservation(reservation) => {
+                        state.stash().batch_enqueued = Some(reservation);
+                        None
+                    }
+                },
+            );
+        }
         let response = self
             .engine
             .atomic_check_and_increment(&batch.descriptors, &batch.increments, ctx)
@@ -576,7 +624,7 @@ impl ParallelRequestLimiter {
         )
     }
 
-    pub async fn post_call_success(&self, state: &LimiterState, facts: CallIdFacts) {
+    pub async fn post_call_success(&self, state: &LimiterState, facts: PostCallSuccessFacts) {
         let applies = {
             let stash = state.stash();
             stash.owned && stash.for_call(facts.call_id.as_deref())
@@ -591,6 +639,17 @@ impl ParallelRequestLimiter {
                 },
             )
             .await;
+        }
+        if let Some(batch) = facts.batch {
+            let reservation = state.stash().batch_enqueued.take();
+            if let Some(reservation) = reservation {
+                self.enqueued.save(&batch.id, &reservation).await;
+            }
+            if batch.terminal
+                && let Some(popped) = self.enqueued.pop(&batch.id).await
+            {
+                self.enqueued.refund(&popped).await;
+            }
         }
     }
 
@@ -617,6 +676,10 @@ impl ParallelRequestLimiter {
             request: None,
         };
         self.release_stashed(state, false, ctx).await;
+        let enqueued = state.stash().batch_enqueued.take();
+        if let Some(reservation) = enqueued {
+            self.enqueued.refund(&reservation).await;
+        }
         let refunds = std::mem::take(&mut state.stash().batch_tpd_refunds);
         if !refunds.is_empty() {
             self.engine.reservation_aware(&refunds).await;

@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use litellm_callbacks::{CallFacts, Callback, Field, FieldValues, Hook, HookInput, Verdict};
 use litellm_callbacks_parallel_request_limiter::{
-    Backend, Ctx, Descriptor, Engine, FailureFacts, IoReservation, LimiterState,
-    ParallelRequestLimiter, PolicyFacts, Response, Settings, SlotAcquisition, SuccessFacts,
-    Unverifiable, WindowIdentity,
+    Backend, Ctx, Descriptor, Engine, EnqueuedReservation, EnqueuedScope, FailureFacts,
+    IoReservation, LimiterState, ParallelRequestLimiter, PolicyFacts, Response, Settings,
+    SlotAcquisition, SuccessFacts, Unverifiable, WindowIdentity, process_monotonic,
 };
 use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value};
 use litellm_redis_store::rate_limits::Scope;
@@ -80,6 +80,10 @@ fn io_json(reservation: &IoReservation) -> Value {
     })
 }
 
+fn reservation_json(reservation: &EnqueuedReservation) -> Value {
+    serde_json::to_value(reservation).unwrap_or(Value::Null)
+}
+
 fn reply(response: Result<Response, Unverifiable>) -> Value {
     match response {
         Err(Unverifiable) => json!({"unverifiable": true}),
@@ -100,12 +104,13 @@ fn reply(response: Result<Response, Unverifiable>) -> Value {
 #[pymethods]
 impl NativeParallelRequestLimiter {
     #[new]
-    #[pyo3(signature = (rate_limits, window_size, tpm_reservation_enabled, now = None))]
+    #[pyo3(signature = (rate_limits, window_size, tpm_reservation_enabled, now = None, monotonic = None))]
     fn new(
         rate_limits: PyRef<'_, NativeRateLimits>,
         window_size: i64,
         tpm_reservation_enabled: bool,
         now: Option<Py<PyAny>>,
+        monotonic: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let clock = match now {
             Some(now) => python_clock(now),
@@ -119,7 +124,10 @@ impl NativeParallelRequestLimiter {
             },
             clock,
         );
-        let limiter = ParallelRequestLimiter::new(engine);
+        let limiter = ParallelRequestLimiter::with_monotonic(
+            engine,
+            monotonic.map_or_else(process_monotonic, python_clock),
+        );
         limiter
             .manifest()
             .validate()
@@ -300,8 +308,62 @@ impl NativeParallelRequestLimiter {
             "ptu_windows": windows_json(&stash.ptu_windows),
             "itpm": io_json(&stash.itpm),
             "otpm": io_json(&stash.otpm),
+            "batch_enqueued_reservation": stash.batch_enqueued.take().map(|reservation| reservation_json(&reservation)),
         });
         serde_json::to_string(&exported).map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    fn enqueued_reserve<'py>(
+        &self,
+        py: Python<'py>,
+        tokens: i64,
+        scopes: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let scopes: Vec<EnqueuedScope> = decoded(scopes)?;
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            let outcome = limiter.enqueued().reserve(tokens, scopes).await;
+            serde_json::to_string(&outcome)
+                .map_err(|error| PyValueError::new_err(error.to_string()))
+        })
+    }
+
+    fn enqueued_refund<'py>(
+        &self,
+        py: Python<'py>,
+        reservation: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let reservation: EnqueuedReservation = decoded(reservation)?;
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            limiter.enqueued().refund(&reservation).await;
+            Ok(())
+        })
+    }
+
+    fn enqueued_save<'py>(
+        &self,
+        py: Python<'py>,
+        batch_id: String,
+        reservation: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let reservation: EnqueuedReservation = decoded(reservation)?;
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            limiter.enqueued().save(&batch_id, &reservation).await;
+            Ok(())
+        })
+    }
+
+    fn enqueued_pop<'py>(&self, py: Python<'py>, batch_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            Ok(limiter
+                .enqueued()
+                .pop(&batch_id)
+                .await
+                .map(|reservation| reservation_json(&reservation).to_string()))
+        })
     }
 
     fn owned(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> bool {

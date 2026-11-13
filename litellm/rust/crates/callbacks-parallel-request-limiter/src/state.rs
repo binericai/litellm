@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     engine::{Op, SlotAcquisition},
+    enqueued::EnqueuedReservation,
     ptu::Ceiling,
     status::{Response, WindowIdentity},
 };
@@ -39,6 +40,7 @@ pub struct Stash {
     pub otpm: IoReservation,
     pub io_reservation_released: bool,
     pub batch_tpd_refunds: Vec<Op>,
+    pub batch_enqueued: Option<EnqueuedReservation>,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -559,6 +559,7 @@ class _NativeStash(TypedDict):
     ptu_windows: list[_NativeWindow]
     itpm: _NativeIo
     otpm: _NativeIo
+    batch_enqueued_reservation: BatchEnqueuedTokenReservation | None  # writable-ok: read once from the bridge's JSON
 
 
 _NATIVE_STASH: Final = TypeAdapter(_NativeStash)
@@ -969,12 +970,14 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         self._check_and_increment_lock = asyncio.Lock()
         self.native_companion: NativeParallelRequestLimiter | None = None
         from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
+            NativeBatchEnqueuedTokenStore,
             native_engine,
             native_parallel_request_limiter_enabled,
         )
 
         if native_parallel_request_limiter_enabled():
             self.native_companion = native_engine(self)
+            self.batch_enqueued_token_store = NativeBatchEnqueuedTokenStore(internal_usage_cache, self.native_companion)
 
     def _adopt_native_state(
         self,
@@ -1017,6 +1020,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         stash.otpm_reserved_tokens = exported["otpm"]["tokens"]
         stash.otpm_reserved_scopes = frozenset(exported["otpm"]["scopes"])
         stash.otpm_reserved_window_identities = _window_identities(exported["otpm"]["windows"])
+        enqueued: Final = exported["batch_enqueued_reservation"]
+        stash.batch_enqueued_reservation = enqueued  # rebind-ok: the adopted stash takes the native's reservation
         stash.native_state = None
         return True
 
@@ -5825,11 +5830,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             verbose_proxy_logger.exception("Error in batch enqueued-token post-call hook: %s", e)
 
     async def _handle_batch_enqueued_post_call(self, user_api_key_dict: UserAPIKeyAuth, response: object) -> None:
+        stash: Final = get_request_stash()
+        if self._native_state(stash) is not None:
+            return
         view: Final = batch_response_view(response)
         if view is None:
             return
         span: Final = user_api_key_dict.parent_otel_span
-        stash: Final = get_request_stash()
         if stash is not None and stash.batch_enqueued_reservation is not None:
             await self.batch_enqueued_token_store.save_reservation(
                 batch_id=canonical_provider_batch_id(view.id),

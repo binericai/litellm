@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     batch::Refusal,
     descriptor::Descriptor,
+    enqueued::EnqueuedScope,
     ptu::Ceiling,
     status::{Code, Response},
 };
@@ -102,6 +103,35 @@ pub fn batch_rate_limited(refusal: Refusal, requested_model: Option<&str>) -> Ab
                 ("detail".to_owned(), Value::String(refusal.detail)),
                 ("headers".to_owned(), Value::Object(header_values)),
                 ("rate_limit_type".to_owned(), json!(refusal.limit_type)),
+                ("requested_model".to_owned(), json!(requested_model)),
+            ]),
+        }),
+    }
+}
+
+pub fn batch_enqueued_limited(
+    scope: &EnqueuedScope,
+    enqueued: i64,
+    total_tokens: i64,
+    requested_model: Option<&str>,
+) -> Abort {
+    let remaining = (scope.limit - enqueued).max(0);
+    let detail = format!(
+        "Batch enqueued token limit exceeded for {}: {}. Batch requires {total_tokens} tokens but only {remaining} enqueued tokens remaining out of {} enqueued token limit. Tokens free up as running batches complete or are cancelled.",
+        scope.key, scope.value, scope.limit,
+    );
+    let headers = BTreeMap::from([("rate_limit_type".to_owned(), "tokens".to_owned())]);
+    Abort {
+        status: 429,
+        message: detail.clone(),
+        code: None,
+        headers,
+        error: Some(AbortError {
+            kind: BATCH_RATE_LIMITED.to_owned(),
+            fields: Map::from_iter([
+                ("detail".to_owned(), Value::String(detail)),
+                ("headers".to_owned(), json!({"rate_limit_type": "tokens"})),
+                ("rate_limit_type".to_owned(), json!("tokens")),
                 ("requested_model".to_owned(), json!(requested_model)),
             ]),
         }),

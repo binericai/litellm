@@ -4,7 +4,7 @@ import shutil
 import socket
 import subprocess
 import time
-from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -13,6 +13,7 @@ from typing import Final
 
 import pytest
 import redis
+from pydantic import TypeAdapter
 
 from litellm.caching.caching import DualCache
 from litellm.caching.redis_cache import RedisCache
@@ -65,6 +66,7 @@ class Request:
     call_type: str = "acompletion"
     fallback: str | None = None
     nested: bool = False
+    response: object = None
 
 
 @dataclass
@@ -74,7 +76,7 @@ class Side:
     remote: "redis.Redis | None" = None
     contexts: dict[int, contextvars.Context] = field(default_factory=dict)
     datas: dict[int, dict[str, object]] = field(default_factory=dict)
-    responses: dict[int, ModelResponse] = field(default_factory=dict)
+    responses: dict[int, object] = field(default_factory=dict)
     states: dict[int, object] = field(default_factory=dict)
     dynamic: _PROXY_DynamicRateLimitHandlerV3 | None = None
 
@@ -264,21 +266,25 @@ def _logging_kwargs(index: int, request: Request) -> dict[str, object]:
 
 async def _end(side: Side, index: int, request: Request) -> object:
     data: Final = side.datas[index]
-    response: Final = ModelResponse(model=str(request.body.get("model")), usage=request.usage)
+    response: Final = (
+        ModelResponse(model=str(request.body.get("model")), usage=request.usage)
+        if request.response is None
+        else request.response
+    )
     side.responses[index] = response
     kwargs: Final = _logging_kwargs(index, request)
     match request.end:
         case "success":
             if side.dynamic is not None:
-                await side.dynamic.async_post_call_success_hook(data, request.auth, response)
+                await side.dynamic.async_post_call_success_hook(data, request.auth, response)  # pyright: ignore[reportArgumentType]  # a batch object stands in for the response like the proxy passes it
             if side.native is not None:
                 await side.native.run_native(
                     Hook.post_call_success,
-                    _READS,
-                    SimpleNamespace(deprecated_kwargs=data),
+                    frozenset({Field.deprecated_kwargs, Field.deprecated_response_obj}),
+                    SimpleNamespace(deprecated_kwargs=data, deprecated_response_obj=response),
                     _ctx(side, index, Hook.post_call_success, request),
                 )
-            await side.limiter.async_post_call_success_hook(data, request.auth, response)
+            await side.limiter.async_post_call_success_hook(data, request.auth, response)  # pyright: ignore[reportArgumentType]  # a batch object stands in for the response like the proxy passes it
             if side.native is not None:
                 await side.native.run_native(
                     Hook.log_prepare,
@@ -308,8 +314,9 @@ async def _end(side: Side, index: int, request: Request) -> object:
         case "disconnect":
             await side.limiter.async_release_max_parallel_requests_on_disconnect(request.auth)
     stash: Final = get_request_stash()
+    hidden: Final = getattr(response, "_hidden_params", {})
     return (
-        response._hidden_params.get("additional_headers"),
+        hidden.get("additional_headers"),
         kwargs["standard_logging_object"],
         None if stash is None else stash.rate_limit_response,
     )
@@ -362,6 +369,7 @@ async def _differential(
     between: Callable[[Clock], None] | None = None,
     ceiling: PTUTeamCeiling | None = None,
     dynamic: pytest.MonkeyPatch | None = None,
+    probe: Callable[[Side], Awaitable[object]] | None = None,
 ) -> list[object]:
     clock: Final = Clock()
     python: Final = _side(clock, native=False, port=backend[0], ceiling=ceiling)
@@ -383,12 +391,16 @@ async def _differential(
                 ended = [await _run(side, index, _end, request) for side in (python, native)]
                 assert ended[0] == ended[1], (index, ended)
         assert _snapshot(python, scopes) == _snapshot(native, scopes), index
+        if probe is not None:
+            assert await probe(python) == await probe(native), index
         if between is not None:
             between(clock)
     for index, request in held:
         ended = [await _run(side, index, _end, request) for side in (python, native)]
         assert ended[0] == ended[1], (index, ended)
         assert _snapshot(python, scopes) == _snapshot(native, scopes), index
+        if probe is not None:
+            assert await probe(python) == await probe(native), index
     return observed
 
 
@@ -916,3 +928,89 @@ async def test_a_batch_is_charged_and_refused_like_python(
     )
     assert observed[0] is None
     assert observed[2] is not None or end == "proxy_failure"
+
+
+def _batch_object(batch_id: str, status: str) -> SimpleNamespace:
+    return SimpleNamespace(id=batch_id, status=status, object="batch")
+
+
+_TEAM_ENQUEUED: Final = "t-enqueued"
+_RECORD: Final = TypeAdapter(dict[str, object])
+
+
+def _enqueued_probe(batch_ids: Sequence[str]) -> Callable[[Side], Awaitable[object]]:
+    from litellm.proxy.hooks.batch_enqueued_tokens import BatchEnqueuedTokenScope
+
+    scopes: Final = (
+        BatchEnqueuedTokenScope(key="api_key", value=_KEY, limit=1),
+        BatchEnqueuedTokenScope(key="team", value=_TEAM_ENQUEUED, limit=1),
+    )
+
+    async def probe(side: Side) -> object:
+        store = side.limiter.batch_enqueued_token_store
+        counters = [await store.reserve(10**15, (scope,)) for scope in scopes]
+        remote = side.remote
+        if remote is None:
+            return counters
+        records = []
+        for batch_id in batch_ids:
+            raw = remote.get(f"batch_enqueued_token_reservation:{batch_id}")
+            record = {} if not raw else _RECORD.validate_json(str(raw))
+            parsed = {name: value for name, value in record.items() if name != "reserved_at_monotonic"}
+            records.append((parsed, remote.ttl(f"batch_enqueued_token_reservation:{batch_id}") // 10))
+        keys = sorted(str(key) for key in remote.scan_iter("batch_enqueued_tokens:*"))
+        return counters, records, [(key, remote.get(key), remote.ttl(key) // 10) for key in keys]
+
+    return probe
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "failure", "proxy_failure"))
+@pytest.mark.parametrize(
+    "limits",
+    (
+        {"metadata": {"batch_enqueued_token_limit": 1500}},
+        {
+            "metadata": {"batch_enqueued_token_limit": 3000},
+            "team_id": _TEAM_ENQUEUED,
+            "team_metadata": {"batch_enqueued_token_limit": 1000},
+            "rpm_limit": 50,
+        },
+    ),
+)
+async def test_batch_enqueued_tokens_are_reserved_saved_and_refunded_like_python(
+    end: str,
+    limits: dict[str, object],
+    backend: tuple[int | None, int | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _batch_usage(monkeypatch, total_tokens=600, request_count=6)
+    auth: Final = _auth(**limits)
+
+    def submit(batch_id: str) -> Request:
+        return Request(auth, _BATCH, end=end, call_type="acreate_batch", response=_batch_object(batch_id, "validating"))
+
+    def retrieve(batch_id: str, status: str) -> Request:
+        return Request(
+            auth, {"batch_id": batch_id}, call_type="aretrieve_batch", response=_batch_object(batch_id, status)
+        )
+
+    batch_ids: Final = ("batch_a", "batch_b", "batch_c", "batch_d")
+    observed: Final = await _differential(
+        [
+            submit("batch_a"),
+            submit("batch_b"),
+            submit("batch_c"),
+            retrieve("batch_a", "in_progress"),
+            retrieve("batch_a", "Completed"),
+            submit("batch_d"),
+            retrieve("batch_a", "completed"),
+            retrieve("batch_b", "cancelled"),
+        ],
+        [("api_key", _KEY)],
+        backend,
+        probe=_enqueued_probe(batch_ids),
+    )
+    assert observed[0] is None
+    assert (observed[2] is not None) == (end != "proxy_failure")
+    assert observed[2] is None or "enqueued token limit" in str(observed[2])
