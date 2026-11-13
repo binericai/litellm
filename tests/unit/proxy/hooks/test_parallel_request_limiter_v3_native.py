@@ -750,3 +750,41 @@ async def test_a_declined_nested_call_on_a_native_request_is_limited_like_python
     ended: Final = [(await _run(side, 1, _end, nested), await _run(side, 0, _end, outer)) for side in sides]
     assert ended[0] == ended[1]
     assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
+
+
+@pytest.mark.asyncio
+async def test_python_and_rust_callers_racing_on_the_memory_tier_lose_no_update() -> None:
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import WindowGuardedIncrement
+    from litellm.redis.stores.rate_limits.types import CounterIncrement
+
+    side: Final = _side(Clock(), native=True)
+    limiter: Final = side.limiter
+    descriptor: Final = {"key": "api_key", "value": _KEY, "rate_limit": {"tokens_per_unit": 10**9}}
+    seeded: Final = await limiter.atomic_check_and_increment_by_n(
+        [descriptor],  # pyright: ignore[reportArgumentType]  # the typed dict as JSON callers build it
+        [{"tokens": 1}],
+    )
+    window: Final = next(iter(seeded.get("reservation_windows", frozenset())))
+    counter: Final = RateLimitScope("api_key", _KEY).counter("tokens")
+    rounds: Final = 300
+
+    async def rust_atomic() -> None:
+        await limiter.atomic_check_and_increment_by_n(
+            [descriptor],  # pyright: ignore[reportArgumentType]  # the typed dict as JSON callers build it
+            [{"tokens": 1}],
+        )
+
+    async def store_increment() -> None:
+        await limiter.rate_limits.increment(CounterIncrement(counter=counter, amount=1, ttl=60))
+
+    async def python_read_modify_write() -> None:
+        await limiter._apply_local_window_guarded_token_increments(  # pyright: ignore[reportPrivateUsage]  # the Python section under test
+            [WindowGuardedIncrement(CounterIncrement(counter=counter, amount=1, ttl=60), window[1], "local")]
+        )
+
+    await asyncio.gather(
+        *(call() for _ in range(rounds) for call in (rust_atomic, store_increment, python_read_modify_write))
+    )
+    final: Final = limiter.rate_limits.local((counter,))[0]
+    assert isinstance(final, int | float)
+    assert final == 1 + 3 * rounds

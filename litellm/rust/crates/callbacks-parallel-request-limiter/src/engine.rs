@@ -1,12 +1,8 @@
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Condvar, Mutex, PoisonError, Weak},
-    time::Duration,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use futures_util::future::join_all;
 use litellm_redis_store::{
-    Number, Pending, RequestRedis, Send as RedisSend,
+    Number, Pending, RequestRedis, Send as RedisSend, UpdateLock,
     rate_limits::{
         AcquireReply, AtomicCounter, AtomicReply, Counter, Entry, Gauge, GuardedIncrement,
         Increment, Kind, Local, RateLimits, Scope, WindowCount,
@@ -114,64 +110,10 @@ type Group = (Vec<AtomicCounter>, Vec<AtomicMeta>);
 
 type Registry = (Option<Vec<(String, f64)>>, i64);
 
-#[derive(Default)]
-pub struct MemoryLock {
-    held: Mutex<bool>,
-    freed: Condvar,
-}
-
-pub struct MemoryGuard<'a>(&'a MemoryLock);
-
-static SHARED: Mutex<Vec<(Weak<RateLimits>, Arc<MemoryLock>)>> = Mutex::new(Vec::new());
-
-impl MemoryLock {
-    pub fn shared(store: &Arc<RateLimits>) -> Arc<MemoryLock> {
-        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-        shared.retain(|(owner, _)| owner.strong_count() > 0);
-        if let Some((_, lock)) = shared
-            .iter()
-            .find(|(owner, _)| owner.as_ptr() == Arc::as_ptr(store))
-        {
-            return Arc::clone(lock);
-        }
-        let lock = Arc::new(MemoryLock::default());
-        shared.push((Arc::downgrade(store), Arc::clone(&lock)));
-        lock
-    }
-
-    pub fn lock(&self) -> MemoryGuard<'_> {
-        self.acquire();
-        MemoryGuard(self)
-    }
-
-    pub fn acquire(&self) {
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        while *held {
-            held = self
-                .freed
-                .wait(held)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        *held = true;
-    }
-
-    pub fn release(&self) {
-        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = false;
-        self.freed.notify_one();
-    }
-}
-
-impl Drop for MemoryGuard<'_> {
-    fn drop(&mut self) {
-        self.0.release();
-    }
-}
-
 pub struct Engine {
     store: Arc<RateLimits>,
     settings: Settings,
     now: Now,
-    lock: Arc<MemoryLock>,
 }
 
 fn limit_kind(kind: Kind) -> LimitKind {
@@ -254,17 +196,15 @@ fn atomic_status(meta: &AtomicMeta, code: Code, limit: i64, count: i64) -> Statu
 
 impl Engine {
     pub fn new(store: Arc<RateLimits>, settings: Settings, now: Now) -> Self {
-        let lock = MemoryLock::shared(&store);
         Self {
             store,
             settings,
             now,
-            lock,
         }
     }
 
-    pub fn memory_lock(&self) -> Arc<MemoryLock> {
-        Arc::clone(&self.lock)
+    pub fn memory_updates(&self) -> &UpdateLock {
+        self.store.memory_updates()
     }
 
     pub fn settings(&self) -> Settings {
@@ -465,7 +405,7 @@ impl Engine {
                 }
                 states
             } else {
-                let _guard = self.lock.lock();
+                let _guard = self.store.memory_guard();
                 self.sliding_window_memory(&counters, now_int, self.settings.window_size)
             };
             windowed = Self::over_limit_list(&counters, &states, &metas, read_only);
@@ -668,7 +608,7 @@ impl Engine {
                     }
                     self.unverifiable(ctx.policy, "batch_rate_limiter_script", &error)?;
                     tracing::warn!(%error, "Redis Lua script failed for slot group {index}");
-                    let _guard = self.lock.lock();
+                    let _guard = self.store.memory_guard();
                     states_by_group.push(self.sliding_window_memory(group, now_int, window_size));
                 }
             }
@@ -814,8 +754,9 @@ impl Engine {
                 Err(error) => {
                     self.unverifiable(ctx.policy, "parallel_acquire_script", &error)?;
                     tracing::warn!(%error, "parallel_acquire_script failed, falling back to in-memory gauge");
-                    let _guard = self.lock.lock();
-                    Ok(self.acquire_in_memory(gauges, slot_id))
+                    let now = self.now();
+                    let _guard = self.store.memory_guard();
+                    Ok(self.acquire_in_memory(gauges, slot_id, now))
                 }
                 Ok(AcquireReply::OverLimit {
                     index, in_flight, ..
@@ -841,12 +782,12 @@ impl Engine {
                 }
             };
         }
-        let _guard = self.lock.lock();
-        Ok(self.acquire_in_memory(gauges, slot_id))
+        let now = self.now();
+        let _guard = self.store.memory_guard();
+        Ok(self.acquire_in_memory(gauges, slot_id, now))
     }
 
-    fn acquire_in_memory(&self, gauges: &[GaugeSpec], slot_id: &str) -> Response {
-        let now = self.now();
+    fn acquire_in_memory(&self, gauges: &[GaugeSpec], slot_id: &str, now: f64) -> Response {
         let cutoff = now - SLOT_TTL_SECONDS as f64;
         let mut states: Vec<Registry> = Vec::new();
         for gauge in gauges {
@@ -933,7 +874,7 @@ impl Engine {
     }
 
     async fn release_in_memory(&self, acquisition: &SlotAcquisition) {
-        let _guard = self.lock.lock();
+        let _guard = self.store.memory_guard();
         let ttl = Some(Duration::from_secs(SLOT_TTL_SECONDS as u64));
         for scope in &acquisition.gauges {
             let value = match self.local(Entry::Gauge(scope.clone())) {
@@ -1014,8 +955,9 @@ impl Engine {
             return self.atomic_redis(groups, ctx).await;
         }
         let flat: Vec<AtomicMeta> = groups.into_iter().flat_map(|(_, meta)| meta).collect();
-        let _guard = self.lock.lock();
-        Ok(self.atomic_in_memory(&flat))
+        let now = self.now();
+        let _guard = self.store.memory_guard();
+        Ok(self.atomic_in_memory(&flat, now))
     }
 
     fn atomic_response(reply: &AtomicReply, meta: &[AtomicMeta]) -> Result<Response, String> {
@@ -1111,8 +1053,9 @@ impl Engine {
                     tracing::error!(%error, "atomic_check_and_increment_by_n: Redis Lua execution failed, falling back to in-memory enforcement");
                     let flat: Vec<AtomicMeta> =
                         groups.iter().flat_map(|(_, meta)| meta.clone()).collect();
-                    let _guard = self.lock.lock();
-                    return Ok(self.atomic_in_memory(&flat));
+                    let now = self.now();
+                    let _guard = self.store.memory_guard();
+                    return Ok(self.atomic_in_memory(&flat, now));
                 }
             };
             let response = match Self::atomic_response(&reply, meta) {
@@ -1122,8 +1065,9 @@ impl Engine {
                     self.unverifiable(ctx.policy, "check_and_increment_by_n_script", &error)?;
                     let flat: Vec<AtomicMeta> =
                         groups.iter().flat_map(|(_, meta)| meta.clone()).collect();
-                    let _guard = self.lock.lock();
-                    return Ok(self.atomic_in_memory(&flat));
+                    let now = self.now();
+                    let _guard = self.store.memory_guard();
+                    return Ok(self.atomic_in_memory(&flat, now));
                 }
             };
             if response.is_over() {
@@ -1193,8 +1137,9 @@ impl Engine {
             self.unverifiable(ctx.policy, "check_and_increment_by_n_script", error)?;
             tracing::error!(%error, "atomic_check_and_increment_by_n: Redis Lua execution failed, falling back to in-memory enforcement");
             let flat: Vec<AtomicMeta> = groups.iter().flat_map(|(_, meta)| meta.clone()).collect();
-            let _guard = self.lock.lock();
-            return Ok(self.atomic_in_memory(&flat));
+            let now = self.now();
+            let _guard = self.store.memory_guard();
+            return Ok(self.atomic_in_memory(&flat, now));
         }
         if responses.len() == 1
             && let Some(Ok(response)) = responses.into_iter().next()
@@ -1208,8 +1153,8 @@ impl Engine {
         })
     }
 
-    fn atomic_in_memory(&self, metas: &[AtomicMeta]) -> Response {
-        let now_int = self.now().trunc() as i64;
+    fn atomic_in_memory(&self, metas: &[AtomicMeta], now: f64) -> Response {
+        let now_int = now.trunc() as i64;
         let mut states: Vec<(bool, i64, String)> = Vec::new();
         for meta in metas {
             let start = self
@@ -1615,7 +1560,7 @@ impl Engine {
             .filter(|op| op.backend != Backend::Local)
             .collect();
         if !local.is_empty() {
-            let _guard = self.lock.lock();
+            let _guard = self.store.memory_guard();
             for operation in local {
                 let counter = &operation.increment.counter;
                 let active = self
@@ -1659,32 +1604,5 @@ impl Engine {
                 let _ = self.store.increment(increment).await;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{sync::mpsc, thread, time::Duration};
-
-    use rstest::rstest;
-
-    use super::*;
-
-    #[rstest]
-    fn a_held_memory_lock_blocks_another_thread_until_released() {
-        let lock = Arc::new(MemoryLock::default());
-        lock.acquire();
-        let (sender, receiver) = mpsc::channel();
-        let waiter = {
-            let lock = Arc::clone(&lock);
-            thread::spawn(move || {
-                let _guard = lock.lock();
-                sender.send(()).unwrap();
-            })
-        };
-        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
-        lock.release();
-        assert!(receiver.recv_timeout(Duration::from_secs(5)).is_ok());
-        waiter.join().unwrap();
     }
 }

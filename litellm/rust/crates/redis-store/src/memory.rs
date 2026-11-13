@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,7 +22,46 @@ pub fn system_clock() -> Clock {
 /// store names others, plus one lock for every read-modify-write on it.
 pub struct Memory<V: Clone> {
     cache: InMemoryCache<V>,
-    updates: Mutex<()>,
+    updates: UpdateLock,
+}
+
+/// The tier's update lock. Unlike a mutex guard it can also be taken and released by separate
+/// calls, so a caller in another language can hold it across a read and a write of its own.
+#[derive(Default)]
+pub struct UpdateLock {
+    held: Mutex<bool>,
+    freed: Condvar,
+}
+
+pub struct UpdateGuard<'a>(&'a UpdateLock);
+
+impl UpdateLock {
+    pub fn acquire(&self) {
+        let mut held = lock(&self.held);
+        while *held {
+            held = self
+                .freed
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *held = true;
+    }
+
+    pub fn release(&self) {
+        *lock(&self.held) = false;
+        self.freed.notify_one();
+    }
+
+    fn guard(&self) -> UpdateGuard<'_> {
+        self.acquire();
+        UpdateGuard(self)
+    }
+}
+
+impl Drop for UpdateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl<V: Clone> Memory<V> {
@@ -30,7 +69,7 @@ impl<V: Clone> Memory<V> {
         let now = now.clone();
         Self {
             cache: InMemoryCache::with_clock(entries, None, move || now()),
-            updates: Mutex::new(()),
+            updates: UpdateLock::default(),
         }
     }
 
@@ -81,8 +120,12 @@ impl<V: Clone> Memory<V> {
     }
 
     /// Held across a read and a conditional write that `update` cannot express.
-    pub fn guard(&self) -> MutexGuard<'_, ()> {
-        lock(&self.updates)
+    pub fn guard(&self) -> UpdateGuard<'_> {
+        self.updates.guard()
+    }
+
+    pub fn updates(&self) -> &UpdateLock {
+        &self.updates
     }
 }
 
@@ -119,4 +162,37 @@ impl<V: Counter> Memory<V> {
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, thread};
+
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn a_held_update_lock_holds_back_an_increment_from_another_thread() {
+        let memory = Arc::new(Memory::<Number>::new(None, &system_clock()));
+        memory.set("k", Number::Int(5), None).unwrap();
+        memory.updates().acquire();
+        let (sender, receiver) = mpsc::channel();
+        let incrementer = {
+            let memory = Arc::clone(&memory);
+            thread::spawn(move || {
+                sender
+                    .send(memory.increment("k", Number::Int(1), None).unwrap())
+                    .unwrap();
+            })
+        };
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        memory.set("k", Number::Int(7), None).unwrap();
+        memory.updates().release();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Number::Int(8)
+        );
+        incrementer.join().unwrap();
+    }
 }

@@ -15,7 +15,7 @@ pub use self::types::{
 use crate::{
     Error, Number, Pending, RequestRedis, Send,
     dual_cache::{DualCache, MemorySettings, PipelineIncrement},
-    memory::{Clock, system_clock},
+    memory::{Clock, UpdateGuard, UpdateLock, system_clock},
     remote::{Remote, RemoteSlot},
     request::pending,
 };
@@ -80,6 +80,16 @@ impl RateLimits {
             .into_iter()
             .map(|(_, members)| members)
             .collect()
+    }
+
+    /// Held across a read-modify-write of the memory tier, so it is atomic against every
+    /// increment of the tier and every other holder, in Rust or in Python.
+    pub fn memory_guard(&self) -> UpdateGuard<'_> {
+        self.cache.memory().guard()
+    }
+
+    pub fn memory_updates(&self) -> &UpdateLock {
+        self.cache.memory().updates()
     }
 
     pub fn get_local(&self, entry: &Entry) -> Result<Option<Local>, Error> {

@@ -182,12 +182,12 @@ impl NativeParallelRequestLimiter {
     }
 
     fn lock_memory(&self, py: Python<'_>) {
-        let lock = self.limiter.engine().memory_lock();
-        py.detach(|| lock.acquire());
+        let limiter = Arc::clone(&self.limiter);
+        py.detach(|| limiter.engine().memory_updates().acquire());
     }
 
     fn unlock_memory(&self) {
-        self.limiter.engine().memory_lock().release();
+        self.limiter.engine().memory_updates().release();
     }
 
     #[pyo3(signature = (descriptors, read_only, skip_tpm_check, parallel_slot_id, skip_parallel_check, policy, request = None))]
