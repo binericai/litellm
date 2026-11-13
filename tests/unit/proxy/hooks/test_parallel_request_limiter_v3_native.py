@@ -189,9 +189,9 @@ async def _admit(side: Side, index: int, request: Request) -> object:
             state = side.states[index]
             assert isinstance(state, NativeState)
             stash = get_request_stash()
-            owner = stash.native_state if request.nested and stash is not None else state.handle
-            assert owner is not None
-            assert side.native.bridge.owned(owner)  # pyright: ignore[reportArgumentType]  # the handle is the bridge state
+            owner = (stash.native_state if stash is not None else None) if request.nested else state.handle
+            assert owner is not None or request.nested
+            assert owner is None or side.native.bridge.owned(owner)  # pyright: ignore[reportArgumentType]  # the handle is the bridge state
             if isinstance(outcome, Abort):
                 assert outcome.exception is not None
                 raise outcome.exception
@@ -722,5 +722,31 @@ async def test_a_nested_mcp_tool_call_reuses_the_requests_slot_like_python(
     scopes: Final = [("api_key", _KEY)]
     assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
     ended: Final = [(await _run(side, 1, _end, tool), await _run(side, 0, _end, outer)) for side in sides]
+    assert ended[0] == ended[1]
+    assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ("pass_through_endpoint", "_arealtime"))
+@pytest.mark.parametrize("end", ("success", "failure", "proxy_failure"))
+async def test_a_declined_nested_call_on_a_native_request_is_limited_like_python(
+    call_type: str, end: str, backend: tuple[int | None, int | None]
+) -> None:
+    clock: Final = Clock()
+    sides: Final = (_side(clock, native=False, port=backend[0]), _side(clock, native=True, port=backend[1]))
+    auth: Final = _auth(max_parallel_requests=2, rpm_limit=4, tpm_limit=3000)
+    outer: Final = Request(auth, {**_CHAT, "max_tokens": 20}, end=end)
+    nested: Final = Request(auth, {**_CHAT, "max_tokens": 10}, call_type=call_type, nested=True, end=end)
+    scopes: Final = [("api_key", _KEY)]
+    for side in sides:
+        context = contextvars.copy_context()
+        side.contexts.update({0: context, 1: context, 2: context})
+    admitted: Final = [
+        (await _run(side, 0, _admit, outer), await _run(side, 1, _admit, nested), await _run(side, 2, _admit, nested))
+        for side in sides
+    ]
+    assert admitted[0] == admitted[1]
+    assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)
+    ended: Final = [(await _run(side, 1, _end, nested), await _run(side, 0, _end, outer)) for side in sides]
     assert ended[0] == ended[1]
     assert _snapshot(sides[0], scopes) == _snapshot(sides[1], scopes)

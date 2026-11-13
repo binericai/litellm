@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use litellm_callbacks::{CallFacts, Callback, Field, FieldValues, Hook, HookInput, Verdict};
 use litellm_callbacks_parallel_request_limiter::{
-    Ctx, Descriptor, Engine, FailureFacts, LimiterState, ParallelRequestLimiter, PolicyFacts,
-    Response, Settings, SlotAcquisition, SuccessFacts, Unverifiable,
+    Backend, Ctx, Descriptor, Engine, FailureFacts, IoReservation, LimiterState,
+    ParallelRequestLimiter, PolicyFacts, Response, Settings, SlotAcquisition, SuccessFacts,
+    Unverifiable, WindowIdentity,
 };
 use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value};
 use litellm_redis_store::rate_limits::Scope;
@@ -51,29 +52,42 @@ fn system_now() -> f64 {
         .unwrap_or_default()
 }
 
+fn windows_json(windows: &[WindowIdentity]) -> Vec<Value> {
+    windows
+        .iter()
+        .map(|identity| {
+            let kind: &str = identity.counter.kind.into();
+            let backend = match identity.backend {
+                Backend::Redis => "redis",
+                Backend::Local => "local",
+            };
+            json!([
+                identity.counter.scope.descriptor,
+                identity.counter.scope.value,
+                kind,
+                identity.window_start,
+                backend,
+            ])
+        })
+        .collect()
+}
+
+fn io_json(reservation: &IoReservation) -> Value {
+    json!({
+        "tokens": reservation.tokens,
+        "scopes": reservation.scopes,
+        "windows": windows_json(&reservation.windows),
+    })
+}
+
 fn reply(response: Result<Response, Unverifiable>) -> Value {
     match response {
         Err(Unverifiable) => json!({"unverifiable": true}),
         Ok(response) => {
-            let windows: Option<Vec<Value>> = response.windows.as_ref().map(|windows| {
-                windows
-                    .iter()
-                    .map(|identity| {
-                        let kind: &str = identity.counter.kind.into();
-                        let backend = match identity.backend {
-                            litellm_callbacks_parallel_request_limiter::Backend::Redis => "redis",
-                            litellm_callbacks_parallel_request_limiter::Backend::Local => "local",
-                        };
-                        json!([
-                            identity.counter.scope.descriptor,
-                            identity.counter.scope.value,
-                            kind,
-                            identity.window_start,
-                            backend,
-                        ])
-                    })
-                    .collect()
-            });
+            let windows: Option<Vec<Value>> = response
+                .windows
+                .as_ref()
+                .map(|windows| windows_json(windows));
             json!({
                 "overall_code": response.overall,
                 "statuses": response.statuses,
@@ -257,6 +271,37 @@ impl NativeParallelRequestLimiter {
             limiter.engine().release_slots(&acquisition).await;
             Ok(())
         })
+    }
+
+    fn owner_call_id(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> Option<String> {
+        state.0.stash().owner_call_id.clone()
+    }
+
+    fn hand_over(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> PyResult<String> {
+        let mut stash = state.0.stash();
+        stash.owned = false;
+        let exported = json!({
+            "rate_limit_response": stash.rate_limit_response.as_ref().map(|response| json!({
+                "overall_code": response.overall,
+                "statuses": response.statuses,
+            })),
+            "parallel_slot": stash.parallel_slot.as_ref().map(|slot| json!({
+                "slot_id": slot.slot_id,
+                "gauges": slot.gauges.iter().map(|scope| (&scope.descriptor, &scope.value)).collect::<Vec<_>>(),
+            })),
+            "reserved_tokens": stash.reserved_tokens,
+            "reserved_model": stash.reserved_model.as_ref().map(|model| (&model.requested, &model.group)),
+            "reserved_scopes": stash.reserved_scopes,
+            "fallback_models": stash.fallback_models,
+            "reservation_released": stash.reservation_released,
+            "io_reservation_released": stash.io_reservation_released,
+            "tpm_limited_tags": stash.tpm_limited_tags,
+            "ptu_reserved_tokens": stash.ptu_reserved_tokens,
+            "ptu_windows": windows_json(&stash.ptu_windows),
+            "itpm": io_json(&stash.itpm),
+            "otpm": io_json(&stash.otpm),
+        });
+        serde_json::to_string(&exported).map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
     fn owned(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> bool {

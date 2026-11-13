@@ -529,6 +529,48 @@ _NativeWindow: TypeAlias = tuple[str, str, Literal["requests", "tokens"], str, L
 _NATIVE_WINDOWS: Final = TypeAdapter[list[_NativeWindow] | None](list[_NativeWindow] | None)
 
 
+class _NativeSlot(TypedDict):
+    slot_id: str
+    gauges: list[tuple[str, str]]
+
+
+class _NativeResponse(TypedDict):
+    overall_code: str
+    statuses: list[RateLimitStatus]
+
+
+class _NativeIo(TypedDict):
+    tokens: int
+    scopes: list[tuple[str, str]]
+    windows: list[_NativeWindow]
+
+
+class _NativeStash(TypedDict):
+    rate_limit_response: _NativeResponse | None
+    parallel_slot: _NativeSlot | None
+    reserved_tokens: int
+    reserved_model: tuple[str, str] | None
+    reserved_scopes: list[tuple[str, str]]
+    fallback_models: list[str]
+    reservation_released: bool
+    io_reservation_released: bool
+    tpm_limited_tags: list[str]
+    ptu_reserved_tokens: int
+    ptu_windows: list[_NativeWindow]
+    itpm: _NativeIo
+    otpm: _NativeIo
+
+
+_NATIVE_STASH: Final = TypeAdapter(_NativeStash)
+
+
+def _window_identities(windows: Sequence[_NativeWindow]) -> frozenset[ReservationWindowIdentity]:
+    return frozenset(
+        (RateLimitScope(key, value).counter(kind), window_start, backend)
+        for key, value, kind, window_start, backend in windows
+    )
+
+
 class _MemorySection:
     def __init__(self, native: "NativeParallelRequestLimiter | None") -> None:
         self.native: Final = native
@@ -933,6 +975,50 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
         if native_parallel_request_limiter_enabled():
             self.native_companion = native_engine(self)
+
+    def _adopt_native_state(
+        self,
+        stash: RequestRateLimiterStash,
+        native_state: "NativeParallelRequestLimiterState",
+        call_id: str | None,
+    ) -> bool:
+        native: Final = self.native_companion
+        if native is None or native.owner_call_id(native_state) == call_id:
+            return False
+        exported: Final = _NATIVE_STASH.validate_json(native.hand_over(native_state))
+        slot: Final = exported["parallel_slot"]
+        model: Final = exported["reserved_model"]
+        response: Final = exported["rate_limit_response"]
+        stash.rate_limit_response = (
+            None
+            if response is None
+            else RateLimitResponse(overall_code=response["overall_code"], statuses=response["statuses"])
+        )
+        stash.parallel_slot = (
+            None
+            if slot is None
+            else ParallelSlotAcquisition(
+                slot_id=slot["slot_id"],
+                gauges=tuple(RateLimitScope(key, value) for key, value in slot["gauges"]),
+            )
+        )
+        stash.reserved_tokens = exported["reserved_tokens"]
+        stash.reserved_model = None if model is None else RateLimitedModel(requested=model[0], group=model[1])
+        stash.reserved_scopes = frozenset(exported["reserved_scopes"])
+        stash.fallback_models = frozenset(exported["fallback_models"])
+        stash.reservation_released = exported["reservation_released"]
+        stash.io_reservation_released = exported["io_reservation_released"]
+        stash.tpm_limited_tags = frozenset(exported["tpm_limited_tags"])
+        stash.ptu_reserved_tokens = exported["ptu_reserved_tokens"]
+        stash.ptu_reserved_window_identities = _window_identities(exported["ptu_windows"])
+        stash.itpm_reserved_tokens = exported["itpm"]["tokens"]
+        stash.itpm_reserved_scopes = frozenset(exported["itpm"]["scopes"])
+        stash.itpm_reserved_window_identities = _window_identities(exported["itpm"]["windows"])
+        stash.otpm_reserved_tokens = exported["otpm"]["tokens"]
+        stash.otpm_reserved_scopes = frozenset(exported["otpm"]["scopes"])
+        stash.otpm_reserved_window_identities = _window_identities(exported["otpm"]["windows"])
+        stash.native_state = None
+        return True
 
     def _native_state(self, stash: RequestRateLimiterStash | None) -> "NativeParallelRequestLimiterState | None":
         if self.native_companion is None or stash is None:
@@ -1585,10 +1671,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         return RateLimitResponse(
             overall_code=response["overall_code"],
             statuses=response["statuses"],
-            reservation_windows=frozenset(
-                (RateLimitScope(key, value).counter(kind), window_start, backend)
-                for key, value, kind, window_start, backend in windows
-            ),
+            reservation_windows=_window_identities(windows),
         )
 
     async def _native_should_rate_limit(
@@ -4209,7 +4292,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         verbose_proxy_logger.debug("Inside Rate Limit Pre-Call Hook")
 
         stash: Final = claim_request_stash_for_data(data)
-        if self._native_state(stash) is not None:
+        native_state: Final = self._native_state(stash)
+        call_id: Final = _call_id_from_callback_kwargs(data)  # pyright: ignore[reportUnknownArgumentType]  # the hook's data is the untyped proxy body
+        if native_state is not None and not self._adopt_native_state(stash, native_state, call_id):
             return None
         stash.call_type = call_type
         reuses_request_slot: Final = call_type == CallTypes.call_mcp_tool.value and stash.parallel_slot is not None
