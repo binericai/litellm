@@ -16,7 +16,9 @@ use pyo3::{
 };
 use serde_json::{Value, json};
 
-use crate::redis::store::{rate_limits::NativeRateLimits, request::NativeRequestRedis};
+use crate::redis::store::{
+    rate_limits::NativeRateLimits, relabel, request::NativeRequestRedis, targeted_call,
+};
 
 #[pyclass(frozen, name = "NativeParallelRequestLimiter")]
 pub(crate) struct NativeParallelRequestLimiter {
@@ -26,6 +28,18 @@ pub(crate) struct NativeParallelRequestLimiter {
 
 #[pyclass(frozen, name = "NativeParallelRequestLimiterState")]
 pub(crate) struct NativeParallelRequestLimiterState(Arc<LimiterState>);
+
+fn limiter_async<'py, T, F>(py: Python<'py>, operation: F) -> PyResult<Bound<'py, PyAny>>
+where
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+    F: Future<Output = PyResult<T>> + Send + 'static,
+{
+    let target = py
+        .import("litellm.redis.stores.rate_limits.types")?
+        .getattr("RATE_LIMITS_TARGET")?;
+    let call = targeted_call(py, &target, "eval")?;
+    run_async_value(py, call.scope(operation))
+}
 
 fn named<T: serde::de::DeserializeOwned>(name: &str) -> PyResult<T> {
     serde_json::from_value(Value::String(name.to_owned()))
@@ -124,7 +138,8 @@ impl NativeParallelRequestLimiter {
                 tpm_reservation_enabled,
             },
             clock,
-        );
+        )
+        .with_relabel(Arc::new(relabel));
         let limiter = ParallelRequestLimiter::with_monotonic(
             engine,
             monotonic.map_or_else(process_monotonic, python_clock),
@@ -181,7 +196,7 @@ impl NativeParallelRequestLimiter {
             state: state.map(|state| state as litellm_callbacks::RequestState),
         };
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             let verdict: Option<Verdict> = limiter
                 .handle(&input)
                 .await
@@ -216,7 +231,7 @@ impl NativeParallelRequestLimiter {
         let policy: PolicyFacts = decoded(policy)?;
         let request = request.map(|request| request.0.clone());
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             let ctx = Ctx {
                 policy: policy.into(),
                 request: request.as_ref(),
@@ -249,7 +264,7 @@ impl NativeParallelRequestLimiter {
         let policy: PolicyFacts = decoded(policy)?;
         let request = request.map(|request| request.0.clone());
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             let ctx = Ctx {
                 policy: policy.into(),
                 request: request.as_ref(),
@@ -276,7 +291,7 @@ impl NativeParallelRequestLimiter {
                 .collect(),
         };
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             limiter.engine().release_slots(&acquisition).await;
             Ok(())
         })
@@ -326,7 +341,7 @@ impl NativeParallelRequestLimiter {
     ) -> PyResult<Bound<'py, PyAny>> {
         let scopes: Vec<EnqueuedScope> = decoded(scopes)?;
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             let outcome = limiter.enqueued().reserve(tokens, scopes).await;
             serde_json::to_string(&outcome)
                 .map_err(|error| PyValueError::new_err(error.to_string()))
@@ -340,7 +355,7 @@ impl NativeParallelRequestLimiter {
     ) -> PyResult<Bound<'py, PyAny>> {
         let reservation: EnqueuedReservation = decoded(reservation)?;
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             limiter.enqueued().refund(&reservation).await;
             Ok(())
         })
@@ -354,7 +369,7 @@ impl NativeParallelRequestLimiter {
     ) -> PyResult<Bound<'py, PyAny>> {
         let reservation: EnqueuedReservation = decoded(reservation)?;
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             limiter.enqueued().save(&batch_id, &reservation).await;
             Ok(())
         })
@@ -362,7 +377,7 @@ impl NativeParallelRequestLimiter {
 
     fn enqueued_pop<'py>(&self, py: Python<'py>, batch_id: String) -> PyResult<Bound<'py, PyAny>> {
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             Ok(limiter
                 .enqueued()
                 .pop(&batch_id)
@@ -440,7 +455,7 @@ impl NativeParallelRequestLimiter {
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&state.0);
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             Ok(limiter.take_parallel_slot(&state).await.map(|slot| {
                 (
                     slot.slot_id,
@@ -465,7 +480,7 @@ impl NativeParallelRequestLimiter {
         let state = Arc::clone(&state.0);
         let request = request.map(|request| request.0.clone());
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             limiter
                 .settle_success(&state, facts, request.as_ref())
                 .await;
@@ -485,7 +500,7 @@ impl NativeParallelRequestLimiter {
         let state = Arc::clone(&state.0);
         let request = request.map(|request| request.0.clone());
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             limiter.settle_turn(&state, facts, request.as_ref()).await;
             Ok(())
         })
@@ -503,7 +518,7 @@ impl NativeParallelRequestLimiter {
         let state = Arc::clone(&state.0);
         let request = request.map(|request| request.0.clone());
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             limiter
                 .settle_failure(&state, facts, request.as_ref())
                 .await;
@@ -522,7 +537,7 @@ impl NativeParallelRequestLimiter {
         let state = Arc::clone(&state.0);
         let request = request.map(|request| request.0.clone());
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             limiter
                 .release_for_settlement(&state, call_id.as_deref(), request.as_ref())
                 .await;
@@ -537,7 +552,7 @@ impl NativeParallelRequestLimiter {
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&state.0);
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             limiter.release_on_disconnect(&state).await;
             Ok(())
         })
@@ -558,7 +573,7 @@ impl NativeParallelRequestLimiter {
         let state = state.map(|state| Arc::clone(&state.0));
         let request = request.map(|request| request.0.clone());
         let limiter = Arc::clone(&self.limiter);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             let verdict = limiter
                 .fallback_target_allowed(
                     state.as_deref(),

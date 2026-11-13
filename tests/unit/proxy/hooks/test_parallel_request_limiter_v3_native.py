@@ -1420,3 +1420,49 @@ async def test_the_real_dispatcher_registers_one_native_and_limits_like_python(
         429,
         f"429: Rate limit exceeded for api_key: {_KEY}. Limit type: max_parallel_requests. Current limit: 1, Remaining: 0.",
     )
+
+
+async def _redis_events(
+    monkeypatch: pytest.MonkeyPatch, port: int, native: bool, requests: Sequence[Request]
+) -> list[tuple[str, str | None]]:
+    from litellm._internal_context import current_service_target
+    from litellm.rust_bridge.host import redis_events
+
+    seen: Final[list[tuple[str, str | None]]] = []
+
+    def record(
+        event_loop: asyncio.AbstractEventLoop | None,
+        call_type: str,
+        start_time: float,
+        end_time: float,
+        failure: redis_events.Failure | None,
+    ) -> None:
+        seen.append((call_type, current_service_target()))
+
+    monkeypatch.setattr(redis_events, "record_redis_call", record)
+    side: Final = _side(Clock(), native=native, port=port)
+    for index, request in enumerate(requests):
+        await _run(side, index, _admit, request)
+        await _run(side, index, _end, request)
+    settled = -1
+    while settled != len(seen):
+        settled = len(seen)
+        await asyncio.sleep(0.2)
+    return sorted(seen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "failure"))
+async def test_native_redis_calls_report_the_rate_limit_target_and_call_types_like_python(
+    end: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("redis-server") is None:
+        pytest.skip("redis-server is not installed")
+    auth: Final = _auth(rpm_limit=5, tpm_limit=4000, max_parallel_requests=2)
+    requests: Final = [Request(auth, {**_CHAT, "max_tokens": 30}, end=end, usage=_CACHED_USAGE) for _ in range(2)]
+    with _redis_server() as python_port, _redis_server() as native_port:
+        python: Final = await _redis_events(monkeypatch, python_port, native=False, requests=requests)
+        native: Final = await _redis_events(monkeypatch, native_port, native=True, requests=requests)
+    assert native == python
+    assert python
+    assert {target for _, target in python} == {"rate_limits"}

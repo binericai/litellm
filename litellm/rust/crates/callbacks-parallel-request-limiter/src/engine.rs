@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use futures_util::future::join_all;
+use litellm_redis_client::{CallTag, current_tag, tagged};
 use litellm_redis_store::{
     Number, Pending, RequestRedis, Send as RedisSend, UpdateLock,
     rate_limits::{
@@ -17,6 +18,8 @@ use crate::{
 pub const SLOT_TTL_SECONDS: i64 = 3600;
 
 pub type Now = Arc<dyn Fn() -> f64 + Send + Sync>;
+
+pub type Relabel = Arc<dyn Fn(&CallTag, &'static str) -> CallTag + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -114,6 +117,7 @@ pub struct Engine {
     store: Arc<RateLimits>,
     settings: Settings,
     now: Now,
+    relabel: Option<Relabel>,
 }
 
 fn limit_kind(kind: Kind) -> LimitKind {
@@ -200,6 +204,19 @@ impl Engine {
             store,
             settings,
             now,
+            relabel: None,
+        }
+    }
+
+    pub fn with_relabel(mut self, relabel: Relabel) -> Self {
+        self.relabel = Some(relabel);
+        self
+    }
+
+    async fn labelled<F: Future>(&self, call_type: &'static str, operation: F) -> F::Output {
+        match (self.relabel.as_ref(), current_tag()) {
+            (Some(relabel), Some(tag)) => tagged(relabel(&tag, call_type), operation).await,
+            _ => operation.await,
         }
     }
 
@@ -208,8 +225,7 @@ impl Engine {
         if local.is_some() || !self.store.has_redis() {
             return Ok(local);
         }
-        self.store
-            .get(ctx.request, &entry, None)
+        self.labelled("async_get_cache", self.store.get(ctx.request, &entry, None))
             .await
             .map_err(|_| Unverifiable)
     }
@@ -520,7 +536,10 @@ impl Engine {
             let members: Vec<Counter> =
                 group.iter().map(|&index| counters[index].clone()).collect();
             let reply = match self.store.read_counters(RedisSend::Now, &members) {
-                Some(pending) => pending.await.map_err(|error| error.to_string()),
+                Some(pending) => self
+                    .labelled("batch_counter_read_script", pending)
+                    .await
+                    .map_err(|error| error.to_string()),
                 None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
             };
             match reply {
@@ -582,12 +601,18 @@ impl Engine {
         for (index, group) in groups.iter().enumerate() {
             let declared = pending.next().flatten();
             let reply = match declared {
-                Some(declared) => declared.await.map_err(|error| error.to_string()),
+                Some(declared) => self
+                    .labelled("batch_rate_limiter_script", declared)
+                    .await
+                    .map_err(|error| error.to_string()),
                 None => match self
                     .store
                     .sliding_window(RedisSend::Now, group, now_int, window_size)
                 {
-                    Some(now) => now.await.map_err(|error| error.to_string()),
+                    Some(now) => self
+                        .labelled("batch_rate_limiter_script", now)
+                        .await
+                        .map_err(|error| error.to_string()),
                     None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
                 },
             };
@@ -610,7 +635,11 @@ impl Engine {
                         self.refund(Self::batch_refunds(&applied, &values)).await;
                         for (later, declared) in groups[index + 1..].iter().zip(pending.by_ref()) {
                             let Some(declared) = declared else { continue };
-                            let Ok(counts) = declared.await else { continue };
+                            let Ok(counts) =
+                                self.labelled("batch_rate_limiter_script", declared).await
+                            else {
+                                continue;
+                            };
                             let values: Vec<State> = counts
                                 .into_iter()
                                 .map(|count| State {
@@ -666,7 +695,11 @@ impl Engine {
                 ttl: Some(Duration::ZERO),
             };
             let outcome = match self.store.guarded_increment(RedisSend::Now, &increment) {
-                Some(pending) => pending.await.map(|_| ()).map_err(|error| error.to_string()),
+                Some(pending) => self
+                    .labelled("window_guarded_token_increment_script", pending)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
                 None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
             };
             if let Err(error) = outcome {
@@ -705,7 +738,10 @@ impl Engine {
         if read_only {
             let counts = if self.store.has_redis() {
                 let reply = match self.store.parallel_count(RedisSend::Now, &scopes, slot_ttl) {
-                    Some(pending) => pending.await.map_err(|error| error.to_string()),
+                    Some(pending) => self
+                        .labelled("parallel_count_script", pending)
+                        .await
+                        .map_err(|error| error.to_string()),
                     None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
                 };
                 match reply {
@@ -762,7 +798,10 @@ impl Engine {
                 .store
                 .parallel_acquire(RedisSend::Now, &specs, slot_ttl, slot_id)
             {
-                Some(pending) => pending.await.map_err(|error| error.to_string()),
+                Some(pending) => self
+                    .labelled("parallel_acquire_script", pending)
+                    .await
+                    .map_err(|error| error.to_string()),
                 None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
             };
             return match reply {
@@ -853,7 +892,10 @@ impl Engine {
                 &acquisition.gauges,
                 &acquisition.slot_id,
             ) {
-                Some(pending) => pending.await.map_err(|error| error.to_string()),
+                Some(pending) => self
+                    .labelled("parallel_release_script", pending)
+                    .await
+                    .map_err(|error| error.to_string()),
                 None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
             };
             match reply {
@@ -1057,7 +1099,10 @@ impl Engine {
         let mut windows = Vec::new();
         for (counters, meta) in &groups {
             let reply = match self.store.check_and_increment(RedisSend::Now, counters) {
-                Some(pending) => pending.await.map_err(|error| error.to_string()),
+                Some(pending) => self
+                    .labelled("check_and_increment_by_n_script", pending)
+                    .await
+                    .map_err(|error| error.to_string()),
                 None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
             };
             let reply = match reply {
@@ -1112,7 +1157,10 @@ impl Engine {
         let replies: Vec<Result<AtomicReply, String>> =
             join_all(declared.into_iter().map(|declared| async move {
                 match declared {
-                    Some(pending) => pending.await.map_err(|error| error.to_string()),
+                    Some(pending) => self
+                        .labelled("check_and_increment_by_n_script", pending)
+                        .await
+                        .map_err(|error| error.to_string()),
                     None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
                 }
             }))
@@ -1490,7 +1538,11 @@ impl Engine {
             return;
         }
         if !self.store.has_redis() {
-            self.store.increment_many(operations).await;
+            self.labelled(
+                "async_increment_pipeline",
+                self.store.increment_many(operations),
+            )
+            .await;
             return;
         }
         let scopes: Vec<Scope> = operations
@@ -1510,25 +1562,43 @@ impl Engine {
                 continue;
             }
             let outcome = match self.store.token_increment(RedisSend::Now, &members) {
-                Some(pending) => pending.await.map(|_| ()).map_err(|error| error.to_string()),
+                Some(pending) => self
+                    .labelled("token_increment_script", pending)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
                 None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
             };
             if let Err(error) = outcome {
                 tracing::warn!(%error, "TTL preservation failed, falling back to regular pipeline");
-                self.store.increment_many(operations).await;
+                self.labelled(
+                    "async_increment_pipeline",
+                    self.store.increment_many(operations),
+                )
+                .await;
                 return;
             }
         }
     }
 
     pub async fn increment_many(&self, operations: &[Increment]) {
-        self.store.increment_many(operations).await;
+        self.labelled(
+            "async_increment_pipeline",
+            self.store.increment_many(operations),
+        )
+        .await;
     }
 
     pub async fn increment_many_post_call(&self, operations: &[Increment], ctx: Ctx<'_>) {
         match self.batch(ctx) {
             Some(request) => self.store.increment_many_post_call(request, operations),
-            None => self.store.increment_many(operations).await,
+            None => {
+                self.labelled(
+                    "async_increment_pipeline",
+                    self.store.increment_many(operations),
+                )
+                .await
+            }
         }
     }
 
@@ -1554,7 +1624,9 @@ impl Engine {
     pub async fn reservation_aware(&self, operations: &[Op]) {
         for operation in operations {
             if let Op::Plain(increment) = operation {
-                let _ = self.store.increment(increment).await;
+                let _ = self
+                    .labelled("async_increment", self.store.increment(increment))
+                    .await;
             }
         }
         let guarded: Vec<&GuardedOp> = operations
@@ -1607,7 +1679,11 @@ impl Engine {
                     ttl: increment.ttl,
                 };
                 let outcome = match self.store.guarded_increment(RedisSend::Now, &guarded) {
-                    Some(pending) => pending.await.map(|_| ()).map_err(|error| error.to_string()),
+                    Some(pending) => self
+                        .labelled("window_guarded_token_increment_script", pending)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
                     None => Err("the rate limiter has no Redis to run its scripts on".to_owned()),
                 };
                 match outcome {
@@ -1616,7 +1692,9 @@ impl Engine {
                 }
             }
             if increment.amount.as_f64() > 0.0 {
-                let _ = self.store.increment(increment).await;
+                let _ = self
+                    .labelled("async_increment", self.store.increment(increment))
+                    .await;
             }
         }
     }
