@@ -1,6 +1,7 @@
 import asyncio
 import gc
 from collections.abc import Awaitable, Generator
+from contextvars import ContextVar
 from typing import Final
 
 import pytest
@@ -241,6 +242,38 @@ async def test_a_v2_callback_writer_without_abort_still_waits_for_the_legacy_ent
     assert data["model"] == "tagged"
 
 
+REQUEST_STASH: Final[ContextVar[object]] = ContextVar("request_stash", default=None)
+
+
+class StashClaimer(CustomLoggerV2):
+    def __init__(self, stash: object) -> None:
+        self.stash = stash
+
+    @on(Hook.pre_call, writes={F.metadata}, may_abort=True)
+    async def pre_call(self, view: object, ctx: CallContext[object]) -> None:
+        _ = REQUEST_STASH.set(self.stash)
+
+
+async def test_a_blocking_v2_callback_sets_context_a_later_legacy_callback_and_the_caller_see() -> None:
+    stash: Final = object()
+    seen: Final[list[object]] = []
+    callbacks: Final[list[object]] = [StashClaimer(stash), PreCallOnly()]
+
+    def start(logger: object, data: object) -> Awaitable[None]:
+        async def run() -> None:
+            seen.append(REQUEST_STASH.get())
+
+        return run()
+
+    await run_subscribers(
+        hook_subscribers(Hook.pre_call, callbacks),
+        KwargsFields({"messages": []}, PROXY_REQUEST_KEYS),
+        start,
+    )
+
+    assert (seen, REQUEST_STASH.get()) == ([stash], stash)
+
+
 async def test_legacy_only_and_dispatched_subscribers_give_the_same_result() -> None:
     first: Final = PreCallOnly()
     second: Final = PreCallOnly()
@@ -326,6 +359,39 @@ def test_sync_subscribers_run_a_blocking_v2_callback_inline_in_list_order() -> N
 
     assert journal == [(masking, details)]
     assert details["standard_logging_object"] == {"stamped": True}
+
+
+class AwaitedEnd(CustomLoggerV2):
+    def __init__(self, journal: list[object]) -> None:
+        self.journal = journal
+
+    @on(Hook.attempt_ended, awaited=True)
+    async def ended(self, view: object, ctx: CallContext[object]) -> None:
+        self.journal.append("awaited")
+
+
+@pytest.mark.parametrize("hook", [Hook.log_prepare, Hook.attempt_ended])
+def test_a_sync_line_that_runs_v2_callbacks_inline_keeps_the_threads_event_loop(hook: Hook) -> None:
+    journal: Final[list[object]] = []
+    details: Final[dict[str, object]] = {"standard_logging_object": {}}
+    callbacks: Final = [SyncStamp(), SyncStamp(), AwaitedEnd(journal), AwaitedEnd(journal)]
+    loop: Final = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        run_subscribers_sync(
+            hook_subscribers(hook, callbacks),
+            KwargsFields(details, {F.standard_logging_payload: "standard_logging_object"}),
+            lambda logger, data: None,
+        )
+        current = asyncio.get_event_loop()
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    assert current is loop
+    assert (journal, details["standard_logging_object"]) == (
+        (["awaited", "awaited"], {}) if hook is Hook.attempt_ended else ([], {"stamped": True})
+    )
 
 
 def test_every_entry_keeps_string_and_callable_callbacks_in_list_order() -> None:
