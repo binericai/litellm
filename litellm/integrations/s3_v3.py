@@ -261,7 +261,7 @@ def new_s3_v2_logger(s3_callback_params_override: Mapping[str, object] | None = 
     )
     periodic: Final = asyncio.create_task(_periodic_flush(sink, _flush_interval()))
     generated: Final = type(native_logger(sink.callback()))
-    cls: Final = type("s3_v2", (S3LoggerV3, generated), {"sink": sink, "periodic_flush_task": periodic})
+    cls: Final = type(S3Logger.__name__, (S3LoggerV3, generated), {"sink": sink, "periodic_flush_task": periodic})
     return cls(sink.callback(), {Field.deprecated_kwargs: lambda kwargs: project_kwargs(sink, kwargs)})
 
 

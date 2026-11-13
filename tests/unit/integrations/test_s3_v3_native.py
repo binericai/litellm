@@ -855,3 +855,17 @@ async def test_a_sync_line_delivery_is_skipped_by_the_native_logger(
     )
     assert rust_logger.sink.queued_keys() == []
     assert rust_logger.sink.stashed() == 0
+
+
+@pytest.mark.asyncio
+async def test_readiness_and_the_callbacks_view_see_the_native_logger_as_s3_v2(
+    buckets: tuple[FakeBucket, FakeBucket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.proxy_server import _hidden_runtime_callback_names
+
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, {})
+    for logger in (python_logger, rust_logger):
+        assert "S3Logger" in str(logger)
+        monkeypatch.setattr(litellm, "callbacks", [logger])
+        name = litellm.logging_callback_manager._get_callback_string(logger)
+        assert name in _hidden_runtime_callback_names(frozenset({"s3_v2"}))
