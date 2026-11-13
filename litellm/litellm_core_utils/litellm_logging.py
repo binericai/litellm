@@ -874,12 +874,26 @@ class Logging(LiteLLMLoggingBaseClass):
     def v2_logging_scope(self) -> RequestScope | None:
         if self.v2_scope is not None or litellm.global_disable_no_log_param:
             return self.v2_scope
-        params: Final = require_attributes(
-            self._model_call_details_view.get("litellm_params", {}), _ParamsLookup, "get"
-        )
-        if params.get("no-log", False) is not True:
+        litellm_params: Final[object] = self._model_call_details_view.get("litellm_params", {})
+        no_log: Final = require_attributes(litellm_params, _ParamsLookup, "get").get("no-log", False) is True
+        opt_outs: Final = self._v2_caller_opt_outs(litellm_params)
+        if not (no_log or opt_outs):
             return None
-        return get_dispatcher().open_scope(RequestSelection(no_log=True))
+        return get_dispatcher().open_scope(RequestSelection(caller_opt_outs=opt_outs, no_log=no_log))
+
+    def _v2_caller_opt_outs(self, litellm_params: object) -> frozenset[str]:
+        if EnterpriseCallbackControls is None:
+            return frozenset()
+        try:
+            disabled: Final = EnterpriseCallbackControls.get_disabled_callbacks(
+                _callback_control_params(litellm_params), self.standard_callback_dynamic_params
+            )
+            if not disabled or not EnterpriseCallbackControls._should_allow_dynamic_callback_disabling():  # pyright: ignore[reportPrivateUsage]  # the gate should_run_callback applies
+                return frozenset()
+        except Exception as e:  # noqa: BLE001  # should_run_callback treats a failed check as not disabled
+            verbose_logger.debug("Error checking disabled callbacks header: %s", e)
+            return frozenset()
+        return frozenset(name for name in disabled if isinstance(name, str))
 
     def v2_call_facts(self) -> CallFacts | None:
         if self.v2_scope is None:
@@ -5098,6 +5112,7 @@ class Logging(LiteLLMLoggingBaseClass):
         end_time: datetime.datetime | None = None,
         *,
         for_async_request: bool = False,
+        async_handler_follows: bool = False,
     ) -> None:
         """Restores trace_id/session_id contextvars once this attempt's own failure
         logging (including any nested calls its callbacks trigger) is fully done.
@@ -5112,6 +5127,7 @@ class Logging(LiteLLMLoggingBaseClass):
                     start_time=start_time,
                     end_time=end_time,
                     for_async_request=for_async_request,
+                    async_handler_follows=async_handler_follows,
                 )
         finally:
             self._restore_correlation_context()
@@ -5123,6 +5139,7 @@ class Logging(LiteLLMLoggingBaseClass):
         start_time: datetime.datetime | None = None,
         end_time: datetime.datetime | None = None,
         for_async_request: bool = False,
+        async_handler_follows: bool = False,
     ) -> None:
         verbose_logger.debug("Logging Details LiteLLM-Failure Call: %s", litellm.failure_callback)
         if not self.should_run_logging(event_type="sync_failure"):  # prevent double logging
@@ -5167,7 +5184,7 @@ class Logging(LiteLLMLoggingBaseClass):
                 callbacks,
                 self.model_call_details,
                 functools.partial(self._deliver_sync_failure, run),
-                include_v2=self.claim_v2_failure(not for_async_request),
+                include_v2=self.claim_v2_failure(not (for_async_request or async_handler_follows)),
                 owner=self,
             )
         except Exception as e:
