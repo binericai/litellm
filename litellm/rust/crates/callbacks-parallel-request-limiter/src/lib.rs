@@ -8,7 +8,8 @@ mod status;
 
 pub use descriptor::{Descriptor, Limits, PROJECT_ITPM, PROJECT_OTPM, PTU_TEAM};
 pub use engine::{
-    Ctx, Engine, Now, Op, Policy, SLOT_TTL_SECONDS, Settings, SlotAcquisition, Unverifiable,
+    Ctx, Engine, MemoryGuard, MemoryLock, Now, Op, Policy, SLOT_TTL_SECONDS, Settings,
+    SlotAcquisition, Unverifiable,
 };
 pub use limiter::{
     CallIdFacts, Candidate, FailureFacts, ModelFacts, NAME, ParallelRequestLimiter, PolicyFacts,

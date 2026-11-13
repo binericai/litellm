@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use litellm_callbacks::{CallFacts, Callback, Field, FieldValues, Hook, HookInput, Verdict};
 use litellm_callbacks_parallel_request_limiter::{
-    Descriptor, Engine, FailureFacts, LimiterState, ParallelRequestLimiter, PolicyFacts, Settings,
-    SuccessFacts,
+    Ctx, Descriptor, Engine, FailureFacts, LimiterState, ParallelRequestLimiter, PolicyFacts,
+    Response, Settings, SlotAcquisition, SuccessFacts, Unverifiable,
 };
 use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value};
+use litellm_redis_store::rate_limits::Scope;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
@@ -48,6 +49,38 @@ fn system_now() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64())
         .unwrap_or_default()
+}
+
+fn reply(response: Result<Response, Unverifiable>) -> Value {
+    match response {
+        Err(Unverifiable) => json!({"unverifiable": true}),
+        Ok(response) => {
+            let windows: Option<Vec<Value>> = response.windows.as_ref().map(|windows| {
+                windows
+                    .iter()
+                    .map(|identity| {
+                        let kind: &str = identity.counter.kind.into();
+                        let backend = match identity.backend {
+                            litellm_callbacks_parallel_request_limiter::Backend::Redis => "redis",
+                            litellm_callbacks_parallel_request_limiter::Backend::Local => "local",
+                        };
+                        json!([
+                            identity.counter.scope.descriptor,
+                            identity.counter.scope.value,
+                            kind,
+                            identity.window_start,
+                            backend,
+                        ])
+                    })
+                    .collect()
+            });
+            json!({
+                "overall_code": response.overall,
+                "statuses": response.statuses,
+                "windows": windows,
+            })
+        }
+    }
 }
 
 #[pymethods]
@@ -131,6 +164,98 @@ impl NativeParallelRequestLimiter {
                 .await
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
             Ok(Pythonized(verdict))
+        })
+    }
+
+    fn lock_memory(&self, py: Python<'_>) {
+        let lock = self.limiter.engine().memory_lock();
+        py.detach(|| lock.acquire());
+    }
+
+    fn unlock_memory(&self) {
+        self.limiter.engine().memory_lock().release();
+    }
+
+    #[pyo3(signature = (descriptors, read_only, skip_tpm_check, parallel_slot_id, skip_parallel_check, policy, request = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn should_rate_limit<'py>(
+        &self,
+        py: Python<'py>,
+        descriptors: &str,
+        read_only: bool,
+        skip_tpm_check: bool,
+        parallel_slot_id: Option<String>,
+        skip_parallel_check: bool,
+        policy: &str,
+        request: Option<PyRef<'py, NativeRequestRedis>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let descriptors: Vec<Descriptor> = decoded(descriptors)?;
+        let policy: PolicyFacts = decoded(policy)?;
+        let request = request.map(|request| request.0.clone());
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            let ctx = Ctx {
+                policy: policy.into(),
+                request: request.as_ref(),
+            };
+            let response = limiter
+                .engine()
+                .should_rate_limit(
+                    &descriptors,
+                    read_only,
+                    skip_tpm_check,
+                    parallel_slot_id.as_deref(),
+                    skip_parallel_check,
+                    ctx,
+                )
+                .await;
+            Ok(Pythonized(reply(response)))
+        })
+    }
+
+    #[pyo3(signature = (descriptors, increments, policy, request = None))]
+    fn atomic_check_and_increment<'py>(
+        &self,
+        py: Python<'py>,
+        descriptors: &str,
+        increments: Vec<(i64, i64)>,
+        policy: &str,
+        request: Option<PyRef<'py, NativeRequestRedis>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let descriptors: Vec<Descriptor> = decoded(descriptors)?;
+        let policy: PolicyFacts = decoded(policy)?;
+        let request = request.map(|request| request.0.clone());
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            let ctx = Ctx {
+                policy: policy.into(),
+                request: request.as_ref(),
+            };
+            let response = limiter
+                .engine()
+                .atomic_check_and_increment(&descriptors, &increments, ctx)
+                .await;
+            Ok(Pythonized(reply(response)))
+        })
+    }
+
+    fn release_slots<'py>(
+        &self,
+        py: Python<'py>,
+        slot_id: String,
+        gauges: Vec<(String, String)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let acquisition = SlotAcquisition {
+            slot_id,
+            gauges: gauges
+                .into_iter()
+                .map(|(descriptor, value)| Scope { descriptor, value })
+                .collect(),
+        };
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            limiter.engine().release_slots(&acquisition).await;
+            Ok(())
         })
     }
 

@@ -174,7 +174,7 @@ async def _admit(side: Side, index: int, request: Request) -> object:
     side.datas[index] = data
     cache: Final = DualCache()
     try:
-        if side.native is not None:
+        if side.native is not None and request.call_type == "acompletion":
             request_state = side.native.request_state
             assert request_state is not None
             side.states[index] = request_state()
@@ -610,3 +610,87 @@ async def test_project_io_without_reservation_still_reserves_like_python(
         _PROJECT_SCOPES,
         backend,
     )
+
+
+async def _guarded(call: Coroutine[object, object, object]) -> object:
+    try:
+        return await call
+    except Exception as error:  # noqa: BLE001  # the refusal is the observable compared across sides
+        return _outcome(error)
+
+
+@pytest.mark.asyncio
+async def test_body_free_checks_and_request_capacity_run_through_the_engine_like_python(
+    backend: tuple[int | None, int | None],
+) -> None:
+    clock: Final = Clock()
+    sides: Final = (_side(clock, native=False, port=backend[0]), _side(clock, native=True, port=backend[1]))
+    auth: Final = _auth(rpm_limit=3, max_parallel_requests=2)
+
+    async def capacity(side: Side) -> object:
+        async with side.limiter.request_capacity(auth, "gpt-4o"):
+            return _snapshot(side, [("api_key", _KEY)])
+
+    observed: Final[list[object]] = []
+    for _ in range(4):
+        checked = [await _guarded(side.limiter.raise_if_over_limit_before_body(auth)) for side in sides]
+        assert checked[0] == checked[1]
+        held = [await _guarded(capacity(side)) for side in sides]
+        assert held[0] == held[1]
+        assert _snapshot(sides[0], [("api_key", _KEY)]) == _snapshot(sides[1], [("api_key", _KEY)])
+        observed.append((checked[0], held[0]))
+    assert observed[-1][0] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "increments",
+    (({"requests": 1, "tokens": 30},), ({"requests": 1, "tokens": 400},), ({"tokens": 0},), ({"tokens": -5},)),
+)
+async def test_atomic_checks_run_through_the_engine_like_python(
+    increments: tuple[dict[str, int], ...], backend: tuple[int | None, int | None]
+) -> None:
+    clock: Final = Clock()
+    sides: Final = (_side(clock, native=False, port=backend[0]), _side(clock, native=True, port=backend[1]))
+    descriptors: Final = [
+        {"key": "api_key", "value": _KEY, "rate_limit": {"requests_per_unit": 2, "tokens_per_unit": 100}}
+    ]
+    for _ in range(3):
+        responses = [
+            await _guarded(
+                side.limiter.atomic_check_and_increment_by_n(
+                    descriptors,  # pyright: ignore[reportArgumentType]  # the typed dict as JSON callers build it
+                    list(increments),  # pyright: ignore[reportArgumentType]  # the typed dict as JSON callers build it
+                )
+            )
+            for side in sides
+        ]
+        assert responses[0] == responses[1]
+        assert _snapshot(sides[0], [("api_key", _KEY)]) == _snapshot(sides[1], [("api_key", _KEY)])
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_calls_fall_through_to_python_and_count_through_the_engine(
+    backend: tuple[int | None, int | None],
+) -> None:
+    observed: Final = await _differential(
+        [Request(_auth(rpm_limit=2, max_parallel_requests=1), _CHAT, call_type="call_mcp_tool") for _ in range(3)],
+        [("api_key", _KEY)],
+        backend,
+    )
+    assert observed[2] is not None
+
+
+@pytest.mark.asyncio
+async def test_the_dynamic_limiters_private_limiter_runs_on_the_engine_when_the_flag_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
+        _PROXY_DynamicRateLimitHandlerV3,  # pyright: ignore[reportPrivateUsage]  # the class has no public alias
+    )
+
+    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
+    handler: Final = _PROXY_DynamicRateLimitHandlerV3(DualCache())
+    assert handler.v3_limiter.native_companion is not None
+    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "false")
+    assert _PROXY_DynamicRateLimitHandlerV3(DualCache()).v3_limiter.native_companion is None

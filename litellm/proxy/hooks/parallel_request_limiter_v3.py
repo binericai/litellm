@@ -524,6 +524,24 @@ class RateLimitResponse(TypedDict):
     reservation_windows: NotRequired[ReadOnly[frozenset[ReservationWindowIdentity]]]
 
 
+_NATIVE_STATUSES: Final = TypeAdapter(list[RateLimitStatus])
+_NativeWindow: TypeAlias = tuple[str, str, Literal["requests", "tokens"], str, Literal["redis", "local"]]
+_NATIVE_WINDOWS: Final = TypeAdapter[list[_NativeWindow] | None](list[_NativeWindow] | None)
+
+
+class _MemorySection:
+    def __init__(self, native: "NativeParallelRequestLimiter | None") -> None:
+        self.native: Final = native
+
+    def __enter__(self) -> None:
+        if self.native is not None:
+            self.native.lock_memory()
+
+    def __exit__(self, *_: object) -> None:
+        if self.native is not None:
+            self.native.unlock_memory()
+
+
 class RateLimitResponseWithDescriptors(TypedDict):
     descriptors: list[RateLimitDescriptor]
     response: RateLimitResponse
@@ -908,6 +926,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         # one round-trip.
         self._check_and_increment_lock = asyncio.Lock()
         self.native_companion: NativeParallelRequestLimiter | None = None
+        from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
+            native_engine,
+            native_parallel_request_limiter_enabled,
+        )
+
+        if native_parallel_request_limiter_enabled():
+            self.native_companion = native_engine(self)
 
     def _native_state(self, stash: RequestRateLimiterStash | None) -> "NativeParallelRequestLimiterState | None":
         if self.native_companion is None or stash is None:
@@ -1348,7 +1373,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         This follows the same logic as the Redis Lua script but uses async cache operations.
         """
         async with self._check_and_increment_lock:
-            return self._in_memory_cache_sliding_window(counters=counters, now_int=now_int, window_size=window_size)
+            with self._memory_section():
+                return self._in_memory_cache_sliding_window(counters=counters, now_int=now_int, window_size=window_size)
 
     def _in_memory_cache_sliding_window(
         self,
@@ -1543,6 +1569,70 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 self._counter_refunds_from_batch_values(group, tuple((c.window_start, c.count) for c in counts))
             )
 
+    def _memory_section(self) -> "_MemorySection":
+        return _MemorySection(self.native_companion)
+
+    def _native_reply(self, reply: Mapping[str, object]) -> RateLimitResponse:
+        if reply.get("unverifiable"):
+            raise RateLimitUnverifiableError()
+        windows: Final = _NATIVE_WINDOWS.validate_python(reply.get("windows"))
+        response: Final = RateLimitResponse(
+            overall_code="OVER_LIMIT" if reply.get("overall_code") == "OVER_LIMIT" else "OK",
+            statuses=_NATIVE_STATUSES.validate_python(reply.get("statuses")),
+        )
+        if windows is None:
+            return response
+        return RateLimitResponse(
+            overall_code=response["overall_code"],
+            statuses=response["statuses"],
+            reservation_windows=frozenset(
+                (RateLimitScope(key, value).counter(kind), window_start, backend)
+                for key, value, kind, window_start, backend in windows
+            ),
+        )
+
+    async def _native_should_rate_limit(
+        self,
+        descriptors: Sequence[RateLimitDescriptor],
+        read_only: bool,
+        skip_tpm_check: bool,
+        parallel_slot_id: str | None,
+        skip_parallel_check: bool,
+    ) -> RateLimitResponse:
+        from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, pre_call_request
+
+        assert self.native_companion is not None
+        reply: Final = await self.native_companion.should_rate_limit(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+            json.dumps([dict(descriptor) for descriptor in descriptors]),
+            read_only,
+            skip_tpm_check,
+            parallel_slot_id,
+            skip_parallel_check,
+            json.dumps(policy(self)),
+            pre_call_request() if self.rate_limits.has_request_batch else None,
+        )
+        response: Final = self._native_reply(reply)
+        return RateLimitResponse(overall_code=response["overall_code"], statuses=response["statuses"])
+
+    async def _native_atomic_check_and_increment(
+        self,
+        descriptors: Sequence[RateLimitDescriptor],
+        increments: Sequence[Mapping[Literal["requests", "tokens"], int]],
+    ) -> RateLimitResponse:
+        from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, pre_call_request
+
+        assert self.native_companion is not None
+        reply: Final = await self.native_companion.atomic_check_and_increment(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+            json.dumps([dict(descriptor) for descriptor in descriptors]),
+            [
+                (int(increment.get("requests", 0) or 0), int(increment.get("tokens", 0) or 0))
+                for increment in increments
+            ],
+            json.dumps(policy(self)),
+            pre_call_request() if self.rate_limits.has_request_batch else None,
+        )
+        return self._native_reply(reply)
+
     @with_service_target(RATE_LIMITS_TARGET)
     async def should_rate_limit(
         self,
@@ -1582,6 +1672,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         release with — when omitted, a generated slot id is used and the slot
         can only be reclaimed by TTL expiry.
         """
+        if self.native_companion is not None:
+            return await self._native_should_rate_limit(
+                descriptors, read_only, skip_tpm_check, parallel_slot_id, skip_parallel_check
+            )
 
         current_time: Final = self._get_current_time()
         now: Final = current_time.timestamp()
@@ -1778,7 +1872,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     e,
                 )
                 async with self._check_and_increment_lock:
-                    return self._acquire_parallel_slots_in_memory(gauges, slot_id)
+                    with self._memory_section():
+                        return self._acquire_parallel_slots_in_memory(gauges, slot_id)
             if isinstance(reply, GaugeOverLimit):
                 return RateLimitResponse(
                     overall_code="OVER_LIMIT",
@@ -1791,7 +1886,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             return RateLimitResponse(overall_code="OK", statuses=statuses)
 
         async with self._check_and_increment_lock:
-            return self._acquire_parallel_slots_in_memory(gauges, slot_id)
+            with self._memory_section():
+                return self._acquire_parallel_slots_in_memory(gauges, slot_id)
 
     def _read_local_gauge_counts(self, gauges: Sequence[RateLimitScope]) -> list[int]:
         return [
@@ -1875,6 +1971,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         request's slot. The in-memory fallback decrements integer mirror
         values (floored at 0) because the mirror carries no per-slot ids.
         """
+        if self.native_companion is not None:
+            await self.native_companion.release_slots(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+                acquisition["slot_id"],
+                [(scope.descriptor_key, scope.descriptor_value) for scope in acquisition["gauges"]],
+            )
+            return
         gauges: Final = acquisition["gauges"]
         slot_id: Final = acquisition["slot_id"]
         if not gauges or not slot_id:
@@ -1917,17 +2019,18 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
     async def _release_parallel_request_slots_in_memory(self, gauges: Sequence[RateLimitScope], slot_id: str) -> None:
         async with self._check_and_increment_lock:
-            for scope in gauges:
-                raw_value = self.rate_limits.local((scope.gauge,))[0]
-                if isinstance(raw_value, dict):
-                    if slot_id not in raw_value:
+            with self._memory_section():
+                for scope in gauges:
+                    raw_value = self.rate_limits.local((scope.gauge,))[0]
+                    if isinstance(raw_value, dict):
+                        if slot_id not in raw_value:
+                            continue
+                        new_value: dict[str, float] | int = {key: ts for key, ts in raw_value.items() if key != slot_id}
+                    elif raw_value is None:
                         continue
-                    new_value: dict[str, float] | int = {key: ts for key, ts in raw_value.items() if key != slot_id}
-                elif raw_value is None:
-                    continue
-                else:
-                    new_value = max(0, int(raw_value) - 1)
-                self.rate_limits.set_local(scope.gauge, new_value, PARALLEL_REQUEST_SLOT_TTL_SECONDS)
+                    else:
+                        new_value = max(0, int(raw_value) - 1)
+                    self.rate_limits.set_local(scope.gauge, new_value, PARALLEL_REQUEST_SLOT_TTL_SECONDS)
 
     @with_service_target(RATE_LIMITS_TARGET)
     async def atomic_check_and_increment_by_n(
@@ -1962,6 +2065,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             RateLimitResponse with one status per (descriptor, rate_limit_type)
             counter, mirroring `should_rate_limit`'s shape.
         """
+        if self.native_companion is not None and len(descriptors) == len(increments):
+            return await self._native_atomic_check_and_increment(descriptors, increments)
         if len(descriptors) != len(increments):
             raise ValueError("atomic_check_and_increment_by_n: descriptors and increments must have the same length")
 
@@ -1995,7 +2100,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             m for _counters, group_meta in descriptor_groups for m in group_meta
         ]
         async with self._check_and_increment_lock:
-            return self._atomic_check_and_increment_in_memory(per_counter_meta=flat_meta)
+            with self._memory_section():
+                return self._atomic_check_and_increment_in_memory(per_counter_meta=flat_meta)
 
     def _build_descriptor_atomic_payload(
         self,
@@ -2105,7 +2211,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 )
                 flat_meta: list[AtomicCounterMeta] = [m for _c, group_meta in descriptor_groups for m in group_meta]
                 async with self._check_and_increment_lock:
-                    return self._atomic_check_and_increment_in_memory(per_counter_meta=flat_meta)
+                    with self._memory_section():
+                        return self._atomic_check_and_increment_in_memory(per_counter_meta=flat_meta)
 
             response = self._build_atomic_response(reply, meta)
             if response["overall_code"] == "OVER_LIMIT":
@@ -2171,7 +2278,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             )
             flat_meta: Final = tuple(itertools.chain.from_iterable(group_meta for _c, group_meta in descriptor_groups))
             async with self._check_and_increment_lock:
-                return self._atomic_check_and_increment_in_memory(per_counter_meta=flat_meta)
+                with self._memory_section():
+                    return self._atomic_check_and_increment_in_memory(per_counter_meta=flat_meta)
         if len(responses) == 1 and not isinstance(responses[0], BaseException):
             return responses[0]
         return RateLimitResponse(
@@ -4503,15 +4611,16 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
     async def _apply_local_window_guarded_token_increments(self, operations: Sequence[WindowGuardedIncrement]) -> None:
         async with self._check_and_increment_lock:
-            for operation in operations:
-                counter = operation.increment.counter
-                active_window_start = _scalar(self.rate_limits.local((counter.window,))[0])
-                if active_window_start is None or str(active_window_start) != operation.expected_window_start:
-                    continue
-                current_counter = _scalar(self.rate_limits.local((counter,))[0]) or 0
-                self.rate_limits.set_local(
-                    counter, float(current_counter) + operation.increment.amount, operation.increment.ttl
-                )
+            with self._memory_section():
+                for operation in operations:
+                    counter = operation.increment.counter
+                    active_window_start = _scalar(self.rate_limits.local((counter.window,))[0])
+                    if active_window_start is None or str(active_window_start) != operation.expected_window_start:
+                        continue
+                    current_counter = _scalar(self.rate_limits.local((counter,))[0]) or 0
+                    self.rate_limits.set_local(
+                        counter, float(current_counter) + operation.increment.amount, operation.increment.ttl
+                    )
 
     async def _apply_redis_window_guarded_token_increments(self, operations: Sequence[WindowGuardedIncrement]) -> None:
         """Each guarded increment runs now, one after another, and falls back to the plain increment when its

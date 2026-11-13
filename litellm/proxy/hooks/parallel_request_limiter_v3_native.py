@@ -384,18 +384,22 @@ def _call_id(data: Mapping[str, object]) -> str | None:
     return call_id if isinstance(call_id, str) else None
 
 
-def native_parallel_request_limiter(
-    limiter: "PROXY_MaxParallelRequestsHandler_v3",
-) -> ParallelRequestLimiterNativeLogger:
+def native_engine(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> "NativeParallelRequestLimiter":
     from litellm.rust_bridge._native import NativeParallelRequestLimiter
 
     clock: Final = limiter._time_provider  # pyright: ignore[reportPrivateUsage]  # the native reads the limiter's clock
-    bridge: Final = NativeParallelRequestLimiter(
+    return NativeParallelRequestLimiter(
         limiter.rate_limits._handle,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # both limiters share one store and memory tier
         limiter.window_size,
         limiter.tpm_reservation_enabled,
         None if clock is datetime.now else (lambda: clock().timestamp()),
     )
+
+
+def native_parallel_request_limiter(
+    limiter: "PROXY_MaxParallelRequestsHandler_v3",
+) -> ParallelRequestLimiterNativeLogger:
+    bridge: Final = limiter.native_companion or native_engine(limiter)
     manifest: Final = WireManifest.model_validate_json(bridge.manifest())
     cls: Final = type(manifest.selection.name, (ParallelRequestLimiterNativeLogger,), _namespace(bridge, manifest))  # pyright: ignore[reportArgumentType]  # the bridge takes its own state type
     logger: Final = cls(bridge, limiter)
@@ -409,6 +413,7 @@ __all__ = [
     "failure_facts",
     "limiter_state",
     "mirror_rate_limit_response",
+    "native_engine",
     "native_parallel_request_limiter",
     "native_parallel_request_limiter_enabled",
     "policy",
