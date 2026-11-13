@@ -132,6 +132,7 @@ if TYPE_CHECKING:
 
     from litellm.proxy.utils import InternalUsageCache as _InternalUsageCache
     from litellm.router import Router
+    from litellm.rust_bridge._native import NativeParallelRequestLimiter, NativeParallelRequestLimiterState
     from litellm.types.agents import AgentResponse
 
     Span = _Span
@@ -640,6 +641,7 @@ class RequestRateLimiterStash:
     io_reservation_released: bool = False
     tpm_limited_tags: frozenset[str] = field(default_factory=frozenset)
     socket_agent_windows: tuple[RateLimitDescriptor, ...] = ()
+    native_state: "NativeParallelRequestLimiterState | None" = None
 
     def clear_reserved_tokens(self) -> None:
         self.reserved_tokens = 0
@@ -905,6 +907,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         # follow-up because Lua dominates wall-time and the lock is held for
         # one round-trip.
         self._check_and_increment_lock = asyncio.Lock()
+        self.native_companion: NativeParallelRequestLimiter | None = None
+
+    def _native_state(self, stash: RequestRateLimiterStash | None) -> "NativeParallelRequestLimiterState | None":
+        if self.native_companion is None or stash is None:
+            return None
+        return stash.native_state
 
     def _get_batch_rate_limiter(self) -> CallTypeRateLimiter | None:
         """Get or lazy-load the batch rate limiter."""
@@ -4002,6 +4010,23 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         descriptors: Final = [
             descriptor for descriptor in built if descriptor["key"] in PER_MODEL_RATE_LIMIT_DESCRIPTOR_KEYS
         ]
+        native_state: Final = self._native_state(stash)
+        if self.native_companion is not None and native_state is not None:
+            from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
+                policy,
+                pre_call_request,
+                raise_wire_abort,
+            )
+
+            reply: Final = await self.native_companion.fallback_target_allowed(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+                native_state,
+                json.dumps([dict(descriptor) for descriptor in descriptors]),
+                model,
+                json.dumps(policy(self)),
+                pre_call_request(),
+            )
+            raise_wire_abort(reply.get("abort"))
+            return bool(reply.get("allowed"))
         allowed: Final = (
             not descriptors
             or (await self.should_rate_limit(descriptors, parent_otel_span=user_api_key_dict.parent_otel_span))[
@@ -4076,6 +4101,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         verbose_proxy_logger.debug("Inside Rate Limit Pre-Call Hook")
 
         stash: Final = claim_request_stash_for_data(data)
+        if self._native_state(stash) is not None:
+            return None
         stash.call_type = call_type
         reuses_request_slot: Final = call_type == CallTypes.call_mcp_tool.value and stash.parallel_slot is not None
         if reuses_request_slot:
@@ -4911,24 +4938,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         # than parsed out of the body) carry their usage in
         # ``combined_usage_object`` instead (a Responses WebSocket turn in its
         # raw events) and would otherwise never charge the TPM window.
-        _usage: Final[Usage | dict[str, object] | None] = (
-            getattr(response_obj, "usage", None)
-            if isinstance(
-                response_obj,
-                (
-                    ModelResponse,
-                    EmbeddingResponse,
-                    TextCompletionResponse,
-                    BaseLiteLLMOpenAIResponseObject,
-                ),
-            )
-            else get_usage_object(response_obj)
-            if isinstance(response_obj, ExtractionResponse)
-            else _unmodeled_response_usage(kwargs, response_obj)
-        )
-        total_tokens = self._get_total_tokens_from_usage(usage=_usage, rate_limit_type=rate_limit_type)
-        if total_tokens == 0:
-            total_tokens = self._aggregate_only_total_tokens(usage=_usage)
+        _usage: Final = self._success_usage(kwargs, response_obj)
+        total_tokens: Final = self._success_total_tokens(_usage, rate_limit_type)
 
         stash: Final = get_request_stash_for_call(_call_id_from_callback_kwargs(kwargs))
         open_reservation: Final = stash if stash is not None and not stash.reservation_released else None
@@ -5039,6 +5050,130 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
         return pipeline_operations
 
+    @staticmethod
+    def _success_usage(kwargs: Mapping[str, object], response_obj: object) -> Usage | dict[str, object] | None:
+        return (
+            getattr(response_obj, "usage", None)
+            if isinstance(
+                response_obj,
+                (
+                    ModelResponse,
+                    EmbeddingResponse,
+                    TextCompletionResponse,
+                    BaseLiteLLMOpenAIResponseObject,
+                ),
+            )
+            else get_usage_object(response_obj)
+            if isinstance(response_obj, ExtractionResponse)
+            else _unmodeled_response_usage(kwargs, response_obj)
+        )
+
+    def _success_total_tokens(
+        self, usage: Usage | dict[str, object] | None, rate_limit_type: Literal["output", "input", "total"]
+    ) -> int:
+        total_tokens: Final = self._get_total_tokens_from_usage(usage=usage, rate_limit_type=rate_limit_type)
+        return total_tokens if total_tokens != 0 else self._aggregate_only_total_tokens(usage=usage)
+
+    def _native_model_facts(
+        self,
+        model: RateLimitedModel,
+        request_metadata: Mapping[str, object],
+        team_id: object,
+        usage_source: object,
+        total_tokens: int,
+    ) -> Mapping[str, object]:
+        ceiling: Final = (
+            self._ptu_team_ceiling_resolver(team_id, model.group) if isinstance(team_id, str) and team_id else None
+        )
+        return {
+            "candidates": [
+                {
+                    "group": candidate.group,
+                    "key_owns": self._key_owns_model_tpm_limit_from_request_metadata(request_metadata, candidate),
+                }
+                for candidate in self._rate_limited_models(model)
+            ],
+            "ptu": None
+            if ceiling is None
+            else {
+                "value": f"{team_id}:{ceiling.model_group}",
+                "actual_tokens": self._ptu_settlement_tokens(
+                    ceiling, self._resolve_reconciled_usage(usage_source), total_tokens
+                ),
+            },
+        }
+
+    async def _settle_success_natively(
+        self,
+        native: "NativeParallelRequestLimiter",
+        native_state: "NativeParallelRequestLimiterState",
+        kwargs: Mapping[str, object],
+        response_obj: object,
+        rate_limit_type: Literal["output", "input", "total"],
+        parent_otel_span: Span | None,
+    ) -> None:
+        from litellm.litellm_core_utils.core_helpers import (
+            get_litellm_metadata_from_kwargs,  # pyright: ignore[reportUnknownVariableType]  # the helper is untyped
+        )
+        from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, post_call_request
+
+        empty: Final[Mapping[str, object]] = MappingProxyType({})
+        standard_logging_object: Final = as_str_mapping(kwargs.get("standard_logging_object")) or empty
+        request_metadata: Final = (
+            as_str_mapping(get_litellm_metadata_from_kwargs(dict(kwargs)))  # pyright: ignore[reportUnknownArgumentType]  # the helper is untyped
+            or empty
+        )
+        origin: Final = request_metadata.get(INTERNAL_CALL_ORIGIN_METADATA_KEY)
+        metadata: Final = as_str_mapping(standard_logging_object.get("metadata")) or empty
+        usage: Final = self._success_usage(kwargs, response_obj)
+        total_tokens: Final = self._success_total_tokens(usage, rate_limit_type)
+        served_model: Final = self._rate_limited_model(get_model_group_from_litellm_kwargs(dict(kwargs)))
+        reserved: Final = native.reserved_model(native_state)
+        reserved_model: Final = None if reserved is None else RateLimitedModel(requested=reserved[0], group=reserved[1])
+        team_id: Final = metadata.get("user_api_key_team_id")
+        usage_source: Final = response_obj if usage is None else usage
+        end_user: Final = kwargs.get("user") or metadata.get("user_api_key_end_user_id")
+        session: Final = metadata.get("session_id") or metadata.get("trace_id")
+        facts: Final = {
+            "call_id": _call_id_from_callback_kwargs(kwargs),
+            "exempt": bool(origin and origin != "autorouter_compaction"),
+            "total_tokens": total_tokens,
+            "targets": {
+                "user_api_key_hash": metadata.get("user_api_key_hash") or None,
+                "user_api_key_user_id": metadata.get("user_api_key_user_id") or None,
+                "user_api_key_team_id": team_id or None,
+                "user_api_key_org_id": metadata.get("user_api_key_org_id") or None,
+                "user_api_key_project_id": metadata.get("user_api_key_project_id") or None,
+                "end_user_id": end_user or None,
+                "agent_id": metadata.get("agent_id") or None,
+                "session_id": session or None,
+            },
+            "served_model": None
+            if served_model is None
+            else {"requested": served_model.requested, "group": served_model.group},
+            "models": {
+                model.requested: self._native_model_facts(model, request_metadata, team_id, usage_source, total_tokens)
+                for model in (served_model, reserved_model)
+                if model is not None
+            },
+            "team_label": f"{_callback_kwargs_mapping(metadata).get('user_api_key_team_id')}",
+            "policy": policy(self),
+        }
+        io_token_operations: Final = self._build_io_token_reservation_ops(kwargs=kwargs, response_obj=response_obj)
+        await native.settle_success(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+            native_state,
+            json.dumps(facts, default=str),
+            post_call_request() if self.rate_limits.has_redis else None,
+        )
+        if isinstance(io_token_operations, list):
+            await self.async_increment_tokens_with_ttl_preservation(
+                pipeline_operations=io_token_operations, parent_otel_span=parent_otel_span
+            )
+        elif io_token_operations:
+            await self.async_increment_reservation_aware_tokens(
+                pipeline_operations=io_token_operations, parent_otel_span=parent_otel_span
+            )
+
     def _build_team_ptu_tpm_ops(
         self,
         standard_logging_metadata: Mapping[str, object],
@@ -5119,6 +5254,17 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
             callback_kwargs: Final = _callback_kwargs_mapping(kwargs)
             stash: Final = get_request_stash_for_call(_call_id_from_callback_kwargs(callback_kwargs))
+            native_state: Final = self._native_state(stash)
+            if self.native_companion is not None and native_state is not None:
+                await self._settle_success_natively(
+                    self.native_companion,
+                    native_state,
+                    callback_kwargs,
+                    response_obj,  # pyright: ignore[reportUnknownArgumentType]  # hook arguments are unannotated
+                    rate_limit_type,
+                    litellm_parent_otel_span,
+                )
+                return
             await self._release_stashed_parallel_slot(
                 stash,
                 litellm_parent_otel_span,
@@ -5294,6 +5440,21 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             pipeline_operations: Final[list[CounterIncrement]] = []
 
             stash: Final = get_request_stash_for_call(_call_id_from_callback_kwargs(failed_call))
+            native_state: Final = self._native_state(stash)
+            if self.native_companion is not None and native_state is not None:
+                from litellm.proxy.hooks.parallel_request_limiter_v3_native import post_call_request
+
+                await self.native_companion.settle_failure(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+                    native_state,
+                    json.dumps(
+                        {
+                            "call_id": _call_id_from_callback_kwargs(failed_call),
+                            "tpm_actual": self._recovered_partial_usage_tokens(failed_call)[0],
+                        }
+                    ),
+                    post_call_request() if self.rate_limits.has_redis else None,
+                )
+                return
             await self._release_stashed_parallel_slot(stash, litellm_parent_otel_span, in_logging_callback=True)
 
             # Skip the reservation refund if async_post_call_failure_hook
@@ -5415,7 +5576,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         object's current max_parallel_requests configuration, which can
         change mid-request) decides whether there is anything to release.
         """
-        await self._release_stashed_parallel_slot(get_request_stash(), None)
+        stash: Final = get_request_stash()
+        native_state: Final = self._native_state(stash)
+        if self.native_companion is not None and native_state is not None:
+            await self.native_companion.release_on_disconnect(native_state)  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+            return
+        await self._release_stashed_parallel_slot(stash, None)
 
     @with_service_target(RATE_LIMITS_TARGET)
     async def async_post_call_success_hook(self, data: dict, user_api_key_dict: UserAPIKeyAuth, response) -> None:
@@ -5499,7 +5665,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         """
         try:
             stash: Final = get_request_stash()
-            if stash is None:
+            if stash is None or self._native_state(stash) is not None:
                 return
             await self._release_stashed_parallel_slot(stash, user_api_key_dict.parent_otel_span)
 

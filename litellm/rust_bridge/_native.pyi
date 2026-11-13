@@ -1,5 +1,5 @@
 from asyncio import Future
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Generic, Literal, Never, NotRequired, Protocol, TypedDict, TypeVar, final
 
 import httpx
@@ -1281,3 +1281,49 @@ class RouterCall(Generic[_S]):
     # candidate ids, pick first; pre_route: see _PreRouteStep; cache: see _CacheStep; secrets, build and model_info:
     # see those steps; first call: None.
     def next(self, outcome: object) -> _S: ...
+
+@final
+class NativeParallelRequestLimiterState:
+    def __new__(cls, _uninstantiable: Never, /) -> Never: ...
+
+@final
+class NativeParallelRequestLimiter:
+    def __new__(
+        cls,
+        rate_limits: NativeRateLimits,
+        window_size: int,
+        tpm_reservation_enabled: bool,
+        now: Callable[[], float] | None = None,
+    ) -> NativeParallelRequestLimiter: ...
+    def manifest(self) -> str: ...
+    def request_state(self) -> NativeParallelRequestLimiterState: ...
+    def handle(
+        self,
+        hook: str,
+        fields: Mapping[str, object],
+        call: Mapping[str, object] | None,
+        state: NativeParallelRequestLimiterState | None,
+        /,
+        request: NativeRequestRedis | None = None,
+    ) -> Future[object]: ...
+    def owned(self, state: NativeParallelRequestLimiterState) -> bool: ...
+    def first_pass_admitted(self, state: NativeParallelRequestLimiterState) -> bool: ...
+    def rate_limit_response(self, state: NativeParallelRequestLimiterState) -> str | None: ...
+    def reserved_model(self, state: NativeParallelRequestLimiterState) -> tuple[str, str] | None: ...
+    def reserved_tokens(self, state: NativeParallelRequestLimiterState) -> int: ...
+    def holds_parallel_slot(self, state: NativeParallelRequestLimiterState) -> bool: ...
+    def settle_success(
+        self, state: NativeParallelRequestLimiterState, facts: str, request: NativeRequestRedis | None = None
+    ) -> Future[None]: ...
+    def settle_failure(
+        self, state: NativeParallelRequestLimiterState, facts: str, request: NativeRequestRedis | None = None
+    ) -> Future[None]: ...
+    def release_on_disconnect(self, state: NativeParallelRequestLimiterState) -> Future[None]: ...
+    def fallback_target_allowed(
+        self,
+        state: NativeParallelRequestLimiterState | None,
+        descriptors: str,
+        model: str,
+        policy: str,
+        request: NativeRequestRedis | None = None,
+    ) -> Future[Mapping[str, object]]: ...

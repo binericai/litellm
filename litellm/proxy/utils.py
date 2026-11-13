@@ -295,6 +295,10 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (  # noqa: F401, RUF
     PROXY_MaxParallelRequestsHandler_v3,
     _PROXY_MaxParallelRequestsHandler_v3,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
 )
+from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
+    native_parallel_request_limiter,
+    native_parallel_request_limiter_enabled,
+)
 from litellm.proxy.hooks.sensitive_data_routing import (  # noqa: F401, RUF100  # legacy module exports
     PROXY_SensitiveDataRoutingHandler,
     _PROXY_SensitiveDataRoutingHandler,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
@@ -2358,6 +2362,12 @@ class ProxyLogging:
             }
             passed_in_args = {name: value for name, value in available_args.items() if name in expected_args}
             proxy_hook_obj = proxy_hook(**passed_in_args)
+            if isinstance(proxy_hook_obj, _PROXY_MaxParallelRequestsHandler_v3) and (
+                native_parallel_request_limiter_enabled()
+            ):
+                litellm.logging_callback_manager.add_litellm_callback(
+                    native_parallel_request_limiter(proxy_hook_obj)  # pyright: ignore[reportArgumentType]  # a V2 native takes its list position like a legacy callback
+                )
             litellm.logging_callback_manager.add_litellm_callback(proxy_hook_obj)
 
             self.proxy_hook_mapping[hook] = proxy_hook_obj
