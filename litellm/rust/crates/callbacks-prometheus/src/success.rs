@@ -1,7 +1,7 @@
 use litellm_callbacks::CallbackError;
 use std::cell::RefCell;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
@@ -12,6 +12,14 @@ use crate::{
     pyfmt::{py_number, py_str, py_truthy},
     store::Op,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuccessStep {
+    Head,
+    Limits,
+    Latency,
+    Tail,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 pub struct Moment {
@@ -28,15 +36,7 @@ pub struct Times {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-pub struct ExceptionFacts {
-    pub status_code: Option<i64>,
-    pub text: String,
-    pub deployment_failure: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct AttemptFacts {
-    pub event: String,
     #[serde(default)]
     pub payload: Value,
     #[serde(default)]
@@ -54,49 +54,35 @@ pub struct AttemptFacts {
     #[serde(default)]
     pub times: Times,
     #[serde(default)]
-    pub exception: Option<ExceptionFacts>,
-    #[serde(default)]
     pub key: Option<KeyFacts>,
     #[serde(default)]
     pub deployment: Option<DeploymentFacts>,
-    #[serde(default)]
-    pub deployment_failure: Option<DeploymentFailure>,
-    #[serde(default)]
-    pub token: Option<u64>,
-    #[serde(default)]
-    pub deferred: Vec<Deferred>,
-    #[serde(default)]
-    pub input_sequence_length: Value,
-    #[serde(default)]
-    pub input_sequence_length_error: Option<String>,
     pub settings: Settings,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+pub enum Level {
+    #[strum(serialize = "debug")]
+    Debug,
+    #[strum(serialize = "error")]
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogLine {
-    pub level: String,
-    pub format: String,
-    #[serde(default)]
+    pub level: Level,
+    pub format: &'static str,
     pub args: Vec<String>,
 }
 
 impl LogLine {
-    pub fn new(level: &str, format: &str, args: Vec<String>) -> Self {
+    pub const fn new(level: Level, format: &'static str, args: Vec<String>) -> Self {
         Self {
-            level: level.to_owned(),
-            format: format.to_owned(),
+            level,
+            format,
             args,
         }
     }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct Deferred {
-    pub op: String,
-    #[serde(default)]
-    pub facts: Map<String, Value>,
-    #[serde(default)]
-    pub on_error: Option<LogLine>,
 }
 
 pub fn exception_text(error: &CallbackError) -> String {
@@ -140,45 +126,6 @@ pub struct DeploymentFacts {
     pub completion_start_present: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct DeploymentFailure {
-    #[serde(default)]
-    pub values: Value,
-    #[serde(default)]
-    pub selected: bool,
-    #[serde(default)]
-    pub litellm_model_name: Value,
-    #[serde(default)]
-    pub model_id: Value,
-    #[serde(default)]
-    pub api_base: Value,
-    #[serde(default)]
-    pub provider: Value,
-    #[serde(default)]
-    pub has_exception: bool,
-}
-
-const AUTH_ERROR_PATTERNS: [&str; 5] = [
-    "virtual key expected",
-    "expected to start with 'sk-'",
-    "authentication error",
-    "invalid api key",
-    "api key not valid",
-];
-
-pub fn skips_invalid_key(exception: Option<&ExceptionFacts>) -> bool {
-    let Some(exception) = exception else {
-        return false;
-    };
-    if exception.deployment_failure {
-        return false;
-    }
-    exception.status_code == Some(401)
-        || AUTH_ERROR_PATTERNS
-            .iter()
-            .any(|pattern| exception.text.contains(pattern))
-}
-
 pub fn duration(start: Option<Moment>, end: Option<Moment>) -> Result<Option<f64>, CallbackError> {
     match (start, end) {
         (Some(start), Some(end)) if start.aware != end.aware => Err(failed(
@@ -214,7 +161,7 @@ pub fn get<'a>(map: &'a Map<String, Value>, key: &str) -> &'a Value {
 pub struct Success<'a> {
     pub emit: Emitter<'a>,
     pub facts: &'a AttemptFacts,
-    pub owns_latency: bool,
+    pub input_sequence_length: Value,
     pub logs: &'a RefCell<Vec<LogLine>>,
 }
 
@@ -223,16 +170,13 @@ impl Success<'_> {
         &self.facts.settings
     }
 
-    pub fn run(&self) -> Result<(), CallbackError> {
+    pub fn run(&self, step: SuccessStep) -> Result<(), CallbackError> {
         let Some(payload) = is_py_dict(&self.facts.payload) else {
             return Err(failed(format!(
                 "standard_logging_object is required, got={}",
                 py_str(&self.facts.payload)
             )));
         };
-        if skips_invalid_key(self.facts.exception.as_ref()) {
-            return Ok(());
-        }
         let metadata = required(payload, "metadata")?;
         let metadata =
             is_py_dict(metadata).ok_or_else(|| failed("metadata is not subscriptable"))?;
@@ -295,33 +239,37 @@ impl Success<'_> {
         .with("user_agent", get(metadata, "user_agent").clone())
         .with("stream", stream)
         .with("service_tier", self.facts.service_tier.clone());
-        let context = values.context(self.settings());
-
-        self.emit.inc("litellm_requests_metric", &context, 1.0)?;
-        self.emit
-            .inc("litellm_spend_metric", &context, py_float(response_cost)?)?;
-        self.zero_cost(payload, &values)?;
-        self.tokens(payload, metadata, &values)?;
-        self.deferred()?;
-        self.virtual_key(payload, &values, &combined)?;
-        self.rate_limits(payload, &values)?;
-        if self.owns_latency {
-            if let Some(error) = &self.facts.input_sequence_length_error {
-                return Err(failed(error.clone()));
+        match step {
+            SuccessStep::Head => {
+                let context = values.context(self.settings());
+                self.emit.inc("litellm_requests_metric", &context, 1.0)?;
+                self.emit
+                    .inc("litellm_spend_metric", &context, py_float(response_cost)?)?;
+                self.zero_cost(payload, &values)?;
+                self.tokens(payload, metadata, &values)
             }
-            self.latency(&values)?;
+            SuccessStep::Limits => {
+                self.virtual_key(payload, &values, &combined)?;
+                self.rate_limits(payload, &values)
+            }
+            SuccessStep::Latency => {
+                self.latency(&values)?;
+                if let Err(error) = self.deployment(payload, &values) {
+                    self.log(LogLine::new(
+                        Level::Error,
+                        "Prometheus Error: set_llm_deployment_success_metrics. Exception occured - %s",
+                        vec![exception_text(&error)],
+                    ));
+                }
+                Ok(())
+            }
+            SuccessStep::Tail => {
+                self.cache(payload, metadata, &values)?;
+                self.media(metadata, &values)?;
+                self.mcp(metadata, &values, response_cost)?;
+                self.proxy_total(model_group, &values)
+            }
         }
-        if let Err(error) = self.deployment(payload, &values) {
-            self.log(LogLine::new(
-                "exception",
-                "Prometheus Error: set_llm_deployment_success_metrics. Exception occured - %s",
-                vec![exception_text(&error)],
-            ));
-        }
-        self.cache(payload, metadata, &values)?;
-        self.media(metadata, &values)?;
-        self.mcp(metadata, &values, response_cost)?;
-        self.proxy_total(model_group, &values)
     }
 
     pub fn zero_cost(
@@ -511,36 +459,14 @@ impl Success<'_> {
         self.logs.borrow_mut().push(line);
     }
 
-    pub fn deferred(&self) -> Result<(), CallbackError> {
-        for deferred in &self.facts.deferred {
-            let applied = crate::ops::apply_facts(
-                self.emit.store,
-                self.settings(),
-                &deferred.op,
-                &deferred.facts,
-            );
-            match (applied, &deferred.on_error) {
-                (Ok(()), _) => {}
-                (Err(error), Some(line)) => {
-                    let mut line = line.clone();
-                    line.args.push(error.text());
-                    self.log(line);
-                }
-                (Err(error), None) => return Err(failed(error.prefixed())),
-            }
-        }
-        Ok(())
-    }
-
     fn latency(&self, values: &LabelValues) -> Result<(), CallbackError> {
         let times = &self.facts.times;
-        let sequenced = if self.facts.input_sequence_length.is_null() {
+        let sequenced = if self.input_sequence_length.is_null() {
             values.clone()
         } else {
-            values.clone().with(
-                "input_sequence_length",
-                self.facts.input_sequence_length.clone(),
-            )
+            values
+                .clone()
+                .with("input_sequence_length", self.input_sequence_length.clone())
         };
         let context = sequenced.context(self.settings());
         let plain = values.context(self.settings());

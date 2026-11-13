@@ -8,7 +8,6 @@ import math
 import os
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from functools import partial
@@ -37,7 +36,6 @@ from litellm.exceptions import (
     validate_rate_limit_type,
 )
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.integrations.custom_logger_v2.native import NativeLogger
 from litellm.integrations.prometheus_helpers import (
     PrometheusLabelFactoryContext,
     get_cached_end_user_id_for_cost_tracking,
@@ -616,7 +614,6 @@ class PrometheusLogger(CustomLogger):
 
     _ADDITIVE_GUARDRAIL_MODES = frozenset((GuardrailEventHooks.pre_call.value, GuardrailEventHooks.post_call.value))
     _native_store: native_store.NativeStore | None = None
-    native_companion: NativeLogger | None = None
 
     @staticmethod
     def get_instance() -> PrometheusLogger | None:
@@ -1287,7 +1284,8 @@ class PrometheusLogger(CustomLogger):
                 labelnames=self.get_labels_for_metric("litellm_mcp_tool_call_spend_metric"),
             )
 
-            self.native_companion = None if self._native_store is None else self._native_store.attach(self)
+            if self._native_store is not None:
+                self._native_store.attach(self)
 
         except Exception as e:
             print_verbose(f"Got exception on init prometheus client {e}")
@@ -1874,10 +1872,12 @@ class PrometheusLogger(CustomLogger):
             user_api_key = hash_token(user_api_key)
 
         label_context: Final = PrometheusLabelFactoryContext(enum_values)  # amortized per request.
-        native_pending: Final = None if self._native_store is None else self._native_store.expect(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # the legacy logging kwargs are untyped
+        native_attempt: Final = None if self._native_store is None else self._native_store.attempt(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # the legacy logging kwargs are untyped
 
         # increment total LLM requests and spend metric
-        if self._native_store is None:
+        if native_attempt is not None:
+            native_store.record(native_attempt, "success_head")
+        else:
             self._increment_top_level_request_and_spend_metrics(
                 end_user_id=end_user_id,
                 user_api_key=user_api_key,
@@ -1890,15 +1890,13 @@ class PrometheusLogger(CustomLogger):
                 enum_values=enum_values,
                 label_context=label_context,
             )
-        if self._native_store is None:
             self._increment_zero_cost_requests_metric(
                 zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
                 enum_values=enum_values,
                 label_context=label_context,
             )
 
-        # input, output, total token metrics
-        if self._native_store is None:
+            # input, output, total token metrics
             self._increment_token_metrics(
                 # why type ignore below?
                 # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
@@ -1916,21 +1914,29 @@ class PrometheusLogger(CustomLogger):
             )
 
         # remaining budget metrics
-        with self._native_deferring(native_pending, native_store.budget_lookup_failed):
-            await self._increment_remaining_budget_metrics(
-                user_api_team=user_api_team,
-                user_api_team_alias=user_api_team_alias,
-                user_api_key=user_api_key,
-                user_api_key_alias=user_api_key_alias,
-                litellm_params=litellm_params,
-                response_cost=response_cost,
-                user_id=user_id,
-                user_api_key_org_id=user_api_key_org_id,
-                end_user_id=end_user_id,
-            )
+        await self._increment_remaining_budget_metrics(
+            user_api_team=user_api_team,
+            user_api_team_alias=user_api_team_alias,
+            user_api_key=user_api_key,
+            user_api_key_alias=user_api_key_alias,
+            litellm_params=litellm_params,
+            response_cost=response_cost,
+            user_id=user_id,
+            user_api_key_org_id=user_api_key_org_id,
+            end_user_id=end_user_id,
+        )
 
         # set proxy virtual key rpm/tpm metrics
-        if self._native_store is None:
+        if native_attempt is not None:
+            native_store.record(native_attempt, "success_limits")
+            native_store.record(
+                native_attempt,
+                "success_latency",
+                self._get_input_sequence_length(standard_logging_payload, kwargs, response_obj)  # pyright: ignore[reportArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
+                if self._emit_input_sequence_length_label
+                else None,
+            )
+        else:
             self._set_virtual_key_rate_limit_metrics(
                 user_api_key=user_api_key,
                 user_api_key_alias=user_api_key_alias,
@@ -1943,8 +1949,7 @@ class PrometheusLogger(CustomLogger):
                 enum_values=enum_values,
             )
 
-        # set latency metrics
-        if not self._native_owns_latency():
+            # set latency metrics
             self._set_latency_metrics(
                 kwargs=kwargs,
                 model=model,
@@ -1963,10 +1968,8 @@ class PrometheusLogger(CustomLogger):
                     else None
                 ),
             )
-        self._stash_input_sequence_length(native_pending, standard_logging_payload, kwargs, response_obj)  # pyright: ignore[reportArgumentType, reportUnknownArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
 
-        # set x-ratelimit headers
-        if self._native_store is None:
+            # set x-ratelimit headers
             self.set_llm_deployment_success_metrics(
                 kwargs,
                 start_time,
@@ -1987,34 +1990,33 @@ class PrometheusLogger(CustomLogger):
             label_context=label_context,
         )
 
-        # cache metrics
-        if self._native_store is None:
-            self._increment_cache_metrics(
-                standard_logging_payload=standard_logging_payload,
-                enum_values=enum_values,
-                label_context=label_context,
-            )
+        if native_attempt is not None:
+            native_store.record(native_attempt, "success_tail")
+            return
 
-        if self._native_store is None:
-            self._increment_media_generation_metrics(
-                standard_logging_payload=standard_logging_payload,
-                enum_values=enum_values,
-                label_context=label_context,
-            )
+        # cache metrics
+        self._increment_cache_metrics(
+            standard_logging_payload=standard_logging_payload,
+            enum_values=enum_values,
+            label_context=label_context,
+        )
+
+        self._increment_media_generation_metrics(
+            standard_logging_payload=standard_logging_payload,
+            enum_values=enum_values,
+            label_context=label_context,
+        )
 
         # MCP tool call metrics
-        if self._native_store is None:
-            self._increment_mcp_tool_call_metrics(
-                standard_logging_payload=standard_logging_payload,
-                enum_values=enum_values,
-                response_cost=response_cost,
-            )
+        self._increment_mcp_tool_call_metrics(
+            standard_logging_payload=standard_logging_payload,
+            enum_values=enum_values,
+            response_cost=response_cost,
+        )
 
         # increment litellm_proxy_total_requests_metric for all successful requests
         # (both streaming and non-streaming) in this single location to prevent
         # double-counting that occurs when async_post_call_success_hook also increments
-        if self._native_store is not None:
-            return
         request_metadata: Final = {
             **_REQUEST_METADATA_ADAPTER.validate_python(get_litellm_metadata_from_kwargs(kwargs)),
             **_REQUEST_METADATA_ADAPTER.validate_python(_metadata),
@@ -2035,35 +2037,6 @@ class PrometheusLogger(CustomLogger):
             request_enum_values,
             label_context=PrometheusLabelFactoryContext(request_enum_values),
         )
-
-    def _stash_input_sequence_length(
-        self,
-        pending: dict[str, object] | None,  # mutable-ok: the per-attempt hand-off the companion reads
-        standard_logging_payload: StandardLoggingPayload,
-        kwargs: Mapping[str, object],
-        response_obj: object,
-    ) -> None:
-        if pending is None or not self._emit_input_sequence_length_label:
-            return
-        try:
-            bucket: Final = self._get_input_sequence_length(standard_logging_payload, kwargs, response_obj)
-        except Exception as error:  # noqa: BLE001  # the companion raises it at the same step the legacy order would
-            raised: Final = f"{type(error).__name__}: {error}"
-            pending["input_sequence_length_error"] = raised  # rebind-ok: filled in for the companion
-            return
-        pending["input_sequence_length"] = bucket  # rebind-ok: filled in for the companion
-
-    def _native_owns_latency(self) -> bool:
-        return self._native_store is not None
-
-    def _native_deferring(
-        self,
-        pending: dict[str, object] | None,  # mutable-ok: the per-attempt hand-off the companion reads
-        on_error: Callable[[str, Mapping[str, object]], Mapping[str, object] | None],
-    ) -> AbstractContextManager[None]:
-        if pending is None or self._native_store is None:
-            return nullcontext()
-        return self._native_store.deferring(pending, on_error)
 
     def _increment_token_metrics(
         self,
@@ -2994,8 +2967,6 @@ class PrometheusLogger(CustomLogger):
         user_api_team: Final = standard_logging_payload["metadata"]["user_api_key_team_id"]
         user_api_team_alias: Final = standard_logging_payload["metadata"]["user_api_key_team_alias"]
         user_api_key_org_id: Final = standard_logging_payload["metadata"].get("user_api_key_org_id")
-        native_pending: Final = None if self._native_store is None else self._native_store.expect(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # the legacy logging kwargs are untyped
-
         try:
             enum_values: Final = UserAPIKeyLabelValues(
                 end_user=end_user_id,
@@ -3014,7 +2985,9 @@ class PrometheusLogger(CustomLogger):
                     )
                 ),
             )
-            if self._native_store is None:
+            if self._native_store is not None:
+                native_store.record(self._native_store.attempt(kwargs), "failure")  # pyright: ignore[reportUnknownArgumentType]  # the legacy logging kwargs are untyped
+            else:
                 PrometheusLogger._inc_labeled_counter(
                     self,
                     self.litellm_llm_api_failed_requests_metric,
@@ -3026,7 +2999,7 @@ class PrometheusLogger(CustomLogger):
                     enum_values=enum_values,
                     label_context=PrometheusLabelFactoryContext(enum_values),
                 )
-                self.set_llm_deployment_failure_metrics(kwargs)
+            self.set_llm_deployment_failure_metrics(kwargs)
             failure_metadata: Final = _REQUEST_METADATA_ADAPTER.validate_python(
                 get_litellm_metadata_from_kwargs(kwargs)
             )
@@ -3042,14 +3015,13 @@ class PrometheusLogger(CustomLogger):
                 response_cost=failure_cost,
                 read_timeout=_get_budget_metrics_per_request_timeout(),
             )
-            with self._native_deferring(native_pending, native_store.no_log):
-                await self._set_org_budget_metrics_after_api_request(
-                    org_id=user_api_key_org_id,
-                    response_cost=failure_cost,
-                    carried=failure_org,
-                    org_alias=failure_org_alias if isinstance(failure_org_alias, str) else None,
-                    committed_spend=failure_committed.org,
-                )
+            await self._set_org_budget_metrics_after_api_request(
+                org_id=user_api_key_org_id,
+                response_cost=failure_cost,
+                carried=failure_org,
+                org_alias=failure_org_alias if isinstance(failure_org_alias, str) else None,
+                committed_spend=failure_committed.org,
+            )
         except Exception as e:
             verbose_logger.exception("prometheus Layer Error(): Exception occured - %s", e)
 
@@ -3615,6 +3587,11 @@ class PrometheusLogger(CustomLogger):
                     api_base=labels.api_base,
                     api_provider=labels.api_provider,
                 )
+            if self._native_store is not None:
+                self._native_store.op(
+                    "deployment_failure", {"values": enum_values.model_dump(), "has_exception": labels.has_exception}
+                )
+                return
             _deployment_label_ctx: Final = PrometheusLabelFactoryContext(enum_values)
             if labels.has_exception:
                 PrometheusLogger._inc_labeled_counter(

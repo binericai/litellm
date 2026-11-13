@@ -2,7 +2,6 @@ import asyncio
 import copy
 import logging
 import re
-import time
 from collections.abc import Callable, Generator, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -16,24 +15,12 @@ from prometheus_client.registry import Collector
 
 import litellm
 from litellm._logging import verbose_logger
-from litellm.integrations.custom_logger_v2 import Hook
-from litellm.integrations.custom_logger_v2.host import get_dispatcher, reset_host_for_tests
-from litellm.integrations.custom_logger_v2.legacy import (
-    Admit,
-    KwargsFields,
-    clear_subscribers_cache_for_tests,
-    hook_subscribers,
-    run_subscribers,
-)
-from litellm.integrations.custom_logger_v2.offpath import InProcessSink
 from litellm.integrations.prometheus import PrometheusLogger
 from litellm.integrations.prometheus_helpers.native_store import (
     NATIVE_PROMETHEUS_ENV,
-    NativeStoreCollector,
+    NativeFamilyCollector,
     native_prometheus_enabled,
-    with_native_companions,
 )
-from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS
 from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable, Member, UserAPIKeyAuth
 from litellm.rust_bridge import _native
 
@@ -81,13 +68,9 @@ def _ours() -> CollectorRegistry:
 @pytest.fixture(autouse=True)
 def isolated() -> Generator[None]:
     saved: Final = {name: copy.deepcopy(getattr(litellm, name, None)) for name in _SETTINGS}
-    reset_host_for_tests()
-    clear_subscribers_cache_for_tests()
     _clear_registry()
     yield
     _clear_registry()
-    reset_host_for_tests()
-    clear_subscribers_cache_for_tests()
     for name, value in saved.items():
         setattr(litellm, name, value)
 
@@ -272,12 +255,6 @@ CORPUS: Final = (
 )
 
 
-async def _drained() -> None:
-    sink: Final = get_dispatcher().sink
-    assert isinstance(sink, InProcessSink)
-    await sink.drain()
-
-
 async def _drive(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setattr("time.time", lambda: 1_763_000_000.25)
     monkeypatch.setattr("litellm.integrations.prometheus.datetime", _FixedDatetime)
@@ -286,7 +263,7 @@ async def _drive(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
     else:
         monkeypatch.delenv(NATIVE_PROMETHEUS_ENV, raising=False)
     logger: Final = PrometheusLogger()
-    assert (logger.native_companion is not None) is native if hasattr(logger, "native_companion") else not native
+    assert (logger._native_store is not None) is native
     lines: Final = _Lines()
     verbose_logger.addHandler(lines)
     try:
@@ -312,27 +289,19 @@ _LOGGED: Final = re.compile(
 )
 
 
+async def _success_outcome(logger: PrometheusLogger, kwargs: dict[str, object]) -> str:
+    response: Final = kwargs.pop("_response", None)
+    try:
+        await logger.async_log_success_event(kwargs, response, kwargs["start_time"], kwargs["end_time"])
+    except Exception as error:  # noqa: BLE001  # parity compares what each side raises to the logging caller
+        return f"success raised: {error}"
+    return "success ok"
+
+
 async def _driven(logger: PrometheusLogger) -> str:
-    for kwargs in copy.deepcopy(CORPUS):
-        response: object = kwargs.pop("_response", None)
-        try:
-            await logger.async_log_success_event(kwargs, response, kwargs["start_time"], kwargs["end_time"])
-        except Exception as error:  # noqa: BLE001  # the legacy line logs it; the companion counts the same raise
-            verbose_logger.debug("parity: legacy success raised %s", error)
-        await _deliver(logger, kwargs)
+    raised: Final = [await _success_outcome(logger, kwargs) for kwargs in copy.deepcopy(CORPUS)]
     outcomes: Final = await _direct_calls(logger)
-    return generate_latest(_ours()).decode() + "\n".join(outcomes) + "\n"
-
-
-async def _deliver(logger: PrometheusLogger, kwargs: dict[str, object]) -> None:
-    if logger.native_companion is None:
-        return
-    _ = await run_subscribers(
-        hook_subscribers(Hook.attempt_ended, [logger.native_companion], admit=Admit.every_entry),
-        KwargsFields(kwargs, LOGGING_KEYS),
-        lambda _callback, _kwargs: None,
-    )
-    await _drained()
+    return generate_latest(_ours()).decode() + "\n".join(raised + outcomes) + "\n"
 
 
 async def _direct_calls(logger: PrometheusLogger) -> list[str]:
@@ -379,7 +348,6 @@ async def _direct_calls(logger: PrometheusLogger) -> list[str]:
     )
     for event in (failure, rejected, broken):
         await logger.async_log_failure_event(event, None, event["start_time"], event["end_time"])
-        await _deliver(logger, event)
     original: Final = litellm.RateLimitError(message="slow", llm_provider="openai", model="gpt-4o-mini")
     fallback_kwargs: Final = {
         "model": "gpt-4o",
@@ -563,8 +531,6 @@ async def test_the_native_store_and_handler_expose_exactly_what_the_python_logge
         setattr(litellm, name, copy.deepcopy(value))
     python_text: Final = await _drive(False, monkeypatch)
     _clear_registry()
-    reset_host_for_tests()
-    clear_subscribers_cache_for_tests()
     native_text: Final = await _drive(True, monkeypatch)
 
     assert "litellm_spend_metric" in python_text or config.startswith("excludes")
@@ -572,32 +538,23 @@ async def test_the_native_store_and_handler_expose_exactly_what_the_python_logge
     assert ('input_sequence_length="1k-4k"' in python_text) is (config == "input_sequence_length")
     if config == "defaults":
         assert "ERROR prometheus Layer Error(): Exception occured - 'reason'" in python_text
+        assert "success raised: could not convert string to float: 'ten'" in python_text
         assert "ERROR Prometheus Error: set_llm_deployment_success_metrics. Exception occured" in python_text
         assert 'team="team-raise"' in python_text
         assert 'litellm_remaining_team_budget_metric{team="team-raise"' not in python_text
         assert 'org_id="org-dst"} 3044.0' in python_text
 
 
-async def test_openmetrics_output_matches_too(monkeypatch: pytest.MonkeyPatch) -> None:
-    def openmetrics(native: bool) -> str:
-        return _masked(generate_openmetrics(_ours()).decode())
-
-    _ = await _drive(False, monkeypatch)
-    python_text: Final = openmetrics(False)
+async def _openmetrics(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
+    _ = await _drive(native, monkeypatch)
+    text: Final = _masked(generate_openmetrics(_ours()).decode())
     _clear_registry()
-    reset_host_for_tests()
-    _ = await _drive(True, monkeypatch)
-    assert openmetrics(True) == python_text
+    return text
 
 
-async def test_the_rust_encoder_writes_the_python_client_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    _ = await _drive(True, monkeypatch)
-    collector: Final = next(c for c in REGISTRY._collector_to_names if isinstance(c, NativeStoreCollector))
-    store: Final = collector._store
-    for created in (True, False):
-        monkeypatch.setattr("prometheus_client.metrics._use_created", created)
-        rendered = "".join(line for line in generate_latest(_ours()).decode().splitlines(keepends=True))
-        assert _masked(store.encode_text(created)) == _masked(rendered)
+async def test_openmetrics_output_matches_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    python_text: Final = await _openmetrics(False, monkeypatch)
+    assert await _openmetrics(True, monkeypatch) == python_text
 
 
 def test_a_counter_handle_keeps_the_prometheus_client_errors() -> None:
@@ -614,17 +571,7 @@ def test_a_counter_handle_keeps_the_prometheus_client_errors() -> None:
     gauge: Final = store.metric("gauge", "g", "doc", ["a"], [], [], True, False, False)
     with pytest.raises(RuntimeError, match="mostrecent"):
         gauge.labels("x").inc()
-    assert 'c_total{a="1"} 0.0' in store.encode_text(False)
-    time.sleep(0)
-
-
-async def test_the_native_companion_sits_right_after_the_legacy_logger_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
-    logger: Final = PrometheusLogger()
-    callbacks: Final = with_native_companions(["before", logger, "after"])
-
-    assert callbacks == ["before", logger, logger.native_companion, "after"]
-    assert with_native_companions(callbacks) == callbacks
+    assert counter.collect()[5] == [(["1"], 0.0, 0.0, [], counter.collect()[5][0][4])]
 
 
 _CALLBACK_LISTS: Final = (
@@ -639,7 +586,13 @@ _CALLBACK_LISTS: Final = (
 _TIMED: Final = re.compile(r"latency|seconds|duration|_time|_created|overhead")
 
 
-async def _completion_text(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
+_REGISTRATIONS: Final = {
+    "callbacks": ("callbacks",),
+    "success_and_failure_callback": ("success_callback", "failure_callback"),
+}
+
+
+async def _completion_text(native: bool, registration: str, monkeypatch: pytest.MonkeyPatch) -> str:
     if native:
         monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
     else:
@@ -647,8 +600,8 @@ async def _completion_text(native: bool, monkeypatch: pytest.MonkeyPatch) -> str
     for name in _CALLBACK_LISTS:
         monkeypatch.setattr(litellm, name, [])
     logger: Final = PrometheusLogger()
-    monkeypatch.setattr(litellm, "callbacks", with_native_companions([logger]))
-    assert len(litellm.callbacks) == (2 if native else 1)
+    for name in _REGISTRATIONS[registration]:
+        monkeypatch.setattr(litellm, name, [logger])
     _ = await litellm.acompletion(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": "hello"}],
@@ -656,27 +609,23 @@ async def _completion_text(native: bool, monkeypatch: pytest.MonkeyPatch) -> str
         metadata={"user_api_key_hash": "hashed", "user_api_key_team_id": "team-1", "tags": ["prod"]},
     )
     await asyncio.sleep(1)
-    await _drained()
     text: Final = generate_latest(_ours()).decode()
     return "\n".join(
         line for line in text.splitlines() if not line.startswith("#") and _TIMED.search(line.split("{")[0]) is None
     )
 
 
+@pytest.mark.parametrize("registration", list(_REGISTRATIONS))
 async def test_a_real_acompletion_emits_the_same_metrics_through_the_rust_store(
-    monkeypatch: pytest.MonkeyPatch,
+    registration: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _ = await _completion_text(False, monkeypatch)
+    _ = await _completion_text(False, registration, monkeypatch)
     _clear_registry()
-    reset_host_for_tests()
-    clear_subscribers_cache_for_tests()
-    python_text: Final = await _completion_text(False, monkeypatch)
+    python_text: Final = await _completion_text(False, registration, monkeypatch)
     _clear_registry()
-    reset_host_for_tests()
-    clear_subscribers_cache_for_tests()
-    native_text: Final = await _completion_text(True, monkeypatch)
+    native_text: Final = await _completion_text(True, registration, monkeypatch)
 
-    assert any(isinstance(collector, NativeStoreCollector) for collector in _logger_collectors())
+    assert any(isinstance(collector, NativeFamilyCollector) for collector in _logger_collectors())
     assert re.search(r"^litellm_total_tokens_metric_total\{.*\} \d+\.0$", native_text, re.MULTILINE)
     assert "litellm_deployment_success_responses_total{" in native_text
     assert "litellm_remaining_team_budget_metric{" in native_text

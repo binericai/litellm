@@ -6,28 +6,18 @@ use std::{
 
 use indexmap::IndexMap;
 
-use crate::{
-    success::LogLine,
-    tracker::{SeriesLimits, Tracker},
-};
+use crate::tracker::{SeriesLimits, Tracker};
 
 pub const OVERFLOW_LABEL_VALUE: &str = "other";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
 pub enum Kind {
+    #[strum(serialize = "counter")]
     Counter,
+    #[strum(serialize = "gauge")]
     Gauge,
+    #[strum(serialize = "histogram")]
     Histogram,
-}
-
-impl Kind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Counter => "counter",
-            Self::Gauge => "gauge",
-            Self::Histogram => "histogram",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -177,7 +167,6 @@ pub struct Store {
     inner: Mutex<Inner>,
     limits: SeriesLimits,
     clock: Box<dyn Clock>,
-    logs: Mutex<HashMap<u64, Vec<LogLine>>>,
 }
 
 fn counter_name(declared: &str) -> &str {
@@ -225,28 +214,7 @@ impl Store {
             }),
             limits,
             clock,
-            logs: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub fn put_logs(&self, token: u64, lines: Vec<LogLine>) {
-        if lines.is_empty() {
-            return;
-        }
-        self.logs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(token)
-            .or_default()
-            .extend(lines);
-    }
-
-    pub fn take_logs(&self, token: u64) -> Vec<LogLine> {
-        self.logs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&token)
-            .unwrap_or_default()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -425,7 +393,7 @@ impl Store {
             Target::NoOp => return Ok(()),
             Target::Parent => match family.unlabeled.as_mut() {
                 Some(series) => series,
-                None => return Err(StoreError::MissingLabels(kind.as_str())),
+                None => return Err(StoreError::MissingLabels(kind.into())),
             },
             Target::Child(values) => match family.series.get_mut(values) {
                 Some(series) => series,
@@ -513,25 +481,23 @@ impl Store {
         let _ = Self::remove_locked(&mut inner, id, &values);
     }
 
-    pub fn snapshot(&self) -> Vec<FamilySnapshot> {
-        self.lock()
-            .families
-            .iter()
-            .map(|family| FamilySnapshot {
-                name: family.name.clone(),
-                documentation: family.spec.documentation.clone(),
-                kind: family.spec.kind,
-                labelnames: family.kept_names.clone(),
-                buckets: family.spec.buckets.clone(),
-                series: match &family.unlabeled {
-                    Some(series) => vec![(Vec::new(), series.clone())],
-                    None => family
-                        .series
-                        .iter()
-                        .map(|(values, series)| (values.clone(), series.clone()))
-                        .collect(),
-                },
-            })
-            .collect()
+    pub fn snapshot(&self, id: FamilyId) -> FamilySnapshot {
+        let inner = self.lock();
+        let family = &inner.families[id.0];
+        FamilySnapshot {
+            name: family.name.clone(),
+            documentation: family.spec.documentation.clone(),
+            kind: family.spec.kind,
+            labelnames: family.kept_names.clone(),
+            buckets: family.spec.buckets.clone(),
+            series: match &family.unlabeled {
+                Some(series) => vec![(Vec::new(), series.clone())],
+                None => family
+                    .series
+                    .iter()
+                    .map(|(values, series)| (values.clone(), series.clone()))
+                    .collect(),
+            },
+        }
     }
 }

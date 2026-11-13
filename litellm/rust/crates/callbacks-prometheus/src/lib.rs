@@ -1,5 +1,4 @@
 mod emit;
-pub mod exposition;
 mod failure;
 pub mod labels;
 pub mod ops;
@@ -8,103 +7,84 @@ pub mod store;
 mod success;
 mod tracker;
 
-use std::{cell::RefCell, sync::Arc};
+use std::cell::RefCell;
 
-use futures_util::future::BoxFuture;
-use litellm_callbacks::{
-    Activation, Callback, CallbackError, Field, FieldSet, Hook, HookInput, HookOutput, Manifest,
-    OptOutBy, Selection, Subscription,
+use litellm_callbacks::CallbackError;
+use serde_json::Value;
+
+use crate::{
+    emit::Emitter,
+    failure::Failure,
+    success::{Success, SuccessStep},
 };
-
-use crate::{emit::Emitter, failure::Failure, success::Success};
 pub use crate::{
     store::{Clock, FamilySpec, Kind, ManualClock, Op, Store, StoreError, SystemClock, Target},
-    success::{AttemptFacts, LogLine},
+    success::{AttemptFacts, Level, LogLine, exception_text},
     tracker::SeriesLimits,
 };
 
-pub const NAME: &str = "prometheus";
-
-pub struct Prometheus {
-    store: Arc<Store>,
-    manifest: Manifest,
-    owns_latency: bool,
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray,
+)]
+pub enum Step {
+    #[strum(serialize = "success_head")]
+    SuccessHead,
+    #[strum(serialize = "success_limits")]
+    SuccessLimits,
+    #[strum(serialize = "success_latency")]
+    SuccessLatency,
+    #[strum(serialize = "success_tail")]
+    SuccessTail,
+    #[strum(serialize = "failure")]
+    Failure,
 }
 
-impl Prometheus {
-    pub fn new(store: Arc<Store>, owns_latency: bool) -> Self {
-        Self {
-            store,
-            manifest: Manifest {
-                selection: Selection {
-                    activation: Activation::DefaultOn,
-                    opt_out_by: vec![OptOutBy::Admin, OptOutBy::Caller],
-                    honors_no_log: true,
-                    ..Selection::named(NAME)
-                },
-                subscriptions: vec![Subscription {
-                    reads: FieldSet::of(&[Field::DeprecatedKwargs]),
-                    awaited: true,
-                    ..Subscription::on(Hook::AttemptEnded)
-                }],
-                has_request_state: false,
-            },
-            owns_latency,
+pub struct Recorded {
+    pub logs: Vec<LogLine>,
+    pub outcome: Result<(), CallbackError>,
+}
+
+pub fn record(
+    store: &Store,
+    facts: &AttemptFacts,
+    step: Step,
+    input_sequence_length: Option<String>,
+) -> Recorded {
+    let logs = RefCell::new(Vec::new());
+    let emit = Emitter {
+        store,
+        settings: &facts.settings,
+    };
+    let outcome = match step {
+        Step::Failure => Failure {
+            emit,
+            facts,
+            logs: &logs,
         }
-    }
-
-    pub fn store(&self) -> &Arc<Store> {
-        &self.store
-    }
-
-    fn attempt_ended(&self, input: &HookInput) -> Result<(), CallbackError> {
-        let Some(raw) = input.fields.raw(Field::DeprecatedKwargs)? else {
-            return Ok(());
-        };
-        let facts: AttemptFacts = serde_json::from_value(raw.clone())
-            .map_err(|error| CallbackError::Failed(format!("attempt facts: {error}")))?;
-        self.record_attempt(&facts)
-    }
-
-    pub fn record_attempt(&self, facts: &AttemptFacts) -> Result<(), CallbackError> {
-        let logs = RefCell::new(Vec::new());
-        let emit = Emitter {
-            store: &self.store,
-            settings: &facts.settings,
-        };
-        let outcome = match facts.event.as_str() {
-            "failure" => Failure {
-                emit,
-                facts,
-                logs: &logs,
-            }
-            .run(),
-            "success" => Success {
-                emit,
-                facts,
-                owns_latency: self.owns_latency,
-                logs: &logs,
-            }
-            .run(),
-            _ => Ok(()),
-        };
-        if let Some(token) = facts.token {
-            self.store.put_logs(token, logs.into_inner());
+        .run(),
+        Step::SuccessHead => success(emit, facts, None, &logs).run(SuccessStep::Head),
+        Step::SuccessLimits => success(emit, facts, None, &logs).run(SuccessStep::Limits),
+        Step::SuccessLatency => {
+            success(emit, facts, input_sequence_length, &logs).run(SuccessStep::Latency)
         }
-        outcome
+        Step::SuccessTail => success(emit, facts, None, &logs).run(SuccessStep::Tail),
+    };
+    Recorded {
+        logs: logs.into_inner(),
+        outcome,
     }
 }
 
-impl Callback for Prometheus {
-    fn manifest(&self) -> &Manifest {
-        &self.manifest
-    }
-
-    fn handle<'a>(&'a self, input: &'a HookInput) -> BoxFuture<'a, HookOutput> {
-        let outcome = match input.hook {
-            Hook::AttemptEnded => self.attempt_ended(input).map(|()| None),
-            _ => Ok(None),
-        };
-        Box::pin(async move { outcome })
+fn success<'a>(
+    emit: Emitter<'a>,
+    facts: &'a AttemptFacts,
+    input_sequence_length: Option<String>,
+    logs: &'a RefCell<Vec<LogLine>>,
+) -> Success<'a> {
+    Success {
+        emit,
+        facts,
+        input_sequence_length: input_sequence_length.map_or(Value::Null, Value::from),
+        logs,
     }
 }

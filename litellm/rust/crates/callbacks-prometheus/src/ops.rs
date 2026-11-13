@@ -30,21 +30,6 @@ impl OpError {
             message: message.into(),
         }
     }
-
-    pub fn text(&self) -> String {
-        match self.kind {
-            ErrorKind::Key => format!("'{}'", self.message),
-            _ => self.message.clone(),
-        }
-    }
-
-    pub fn prefixed(&self) -> String {
-        match self.kind {
-            ErrorKind::Key => format!("KeyError: '{}'", self.message),
-            ErrorKind::Type => format!("TypeError: {}", self.message),
-            _ => self.message.clone(),
-        }
-    }
 }
 
 impl From<StoreError> for OpError {
@@ -216,6 +201,24 @@ impl Ops<'_> {
             &values,
             Op::Set(self.number("state")?),
             false,
+        )
+    }
+
+    fn deployment_failure(&self) -> OpResult {
+        let values = values_of(self.facts);
+        if field(self.facts, "has_exception") == &Value::Bool(true) {
+            self.factory(
+                "litellm_deployment_failure_responses",
+                &values,
+                Op::Inc(1.0),
+                true,
+            )?;
+        }
+        self.factory(
+            "litellm_deployment_total_requests",
+            &values,
+            Op::Inc(1.0),
+            true,
         )
     }
 
@@ -591,6 +594,7 @@ impl Ops<'_> {
     fn run(&self, op: &str) -> OpResult {
         match op {
             "deployment_state" => self.deployment_state(),
+            "deployment_failure" => self.deployment_failure(),
             "cooled_down" => self.cooled_down(),
             "guardrail" => self.guardrail(),
             "managed_batch_created" => self.identity("litellm_managed_batch_created_total"),
@@ -631,20 +635,6 @@ pub fn apply(store: &Store, op: &str, facts: &str) -> OpResult {
         store,
         settings: &facts.settings,
         facts: &facts.rest,
-    }
-    .run(op)
-}
-
-pub fn apply_facts(
-    store: &Store,
-    settings: &Settings,
-    op: &str,
-    facts: &Map<String, Value>,
-) -> OpResult {
-    Ops {
-        store,
-        settings,
-        facts,
     }
     .run(op)
 }

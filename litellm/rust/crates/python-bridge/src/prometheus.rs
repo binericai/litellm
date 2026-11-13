@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
 use litellm_callbacks_prometheus::{
-    FamilySpec, Kind, ManualClock, Op, Prometheus, SeriesLimits, Store, StoreError, SystemClock,
-    Target,
-    exposition::encode_text,
+    AttemptFacts, FamilySpec, Kind, ManualClock, Op, SeriesLimits, Step, Store, StoreError,
+    SystemClock, Target, exception_text,
     ops::{self, ErrorKind, OpError},
-    store::Clock,
+    record,
+    store::{Clock, FamilyId},
 };
-use litellm_callbacks_python::NativeCallback;
 use pyo3::{
     exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
@@ -101,16 +100,9 @@ impl NativePrometheusStore {
         wrapped: bool,
         shares_overflow: bool,
     ) -> PyResult<NativePrometheusMetric> {
-        let kind = match kind {
-            "counter" => Kind::Counter,
-            "gauge" => Kind::Gauge,
-            "histogram" => Kind::Histogram,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown metric kind {other}"
-                )));
-            }
-        };
+        let kind: Kind = kind
+            .parse()
+            .map_err(|_| PyValueError::new_err(format!("unknown metric kind {kind}")))?;
         let id = self
             .store
             .register(FamilySpec {
@@ -159,67 +151,65 @@ impl NativePrometheusStore {
         );
     }
 
-    #[allow(clippy::type_complexity)]
-    fn collect(
-        &self,
-    ) -> Vec<(
-        String,
-        String,
-        &'static str,
-        Vec<String>,
-        Vec<f64>,
-        Vec<(Vec<String>, f64, f64, Vec<f64>, f64)>,
-    )> {
-        self.store
-            .snapshot()
-            .into_iter()
-            .map(|family| {
-                (
-                    family.name,
-                    family.documentation,
-                    family.kind.as_str(),
-                    family.labelnames,
-                    family.buckets,
-                    family
-                        .series
-                        .into_iter()
-                        .map(|(values, series)| {
-                            (
-                                values,
-                                series.value,
-                                series.sum,
-                                series.buckets,
-                                series.created,
-                            )
-                        })
-                        .collect(),
-                )
-            })
-            .collect()
-    }
-
     fn op(&self, name: &str, facts: &str) -> PyResult<()> {
         ops::apply(&self.store, name, facts).map_err(op_error)
     }
 
-    fn take_logs(&self, token: u64) -> Vec<(String, String, Vec<String>)> {
-        self.store
-            .take_logs(token)
-            .into_iter()
-            .map(|line| (line.level, line.format, line.args))
-            .collect()
-    }
-
-    #[pyo3(signature = (created=true))]
-    fn encode_text(&self, created: bool) -> String {
-        encode_text(&self.store.snapshot(), created)
+    fn attempt(&self, facts: &str) -> PyResult<NativePrometheusAttempt> {
+        let facts: AttemptFacts = serde_json::from_str(facts)
+            .map_err(|error| PyValueError::new_err(format!("prometheus attempt facts: {error}")))?;
+        Ok(NativePrometheusAttempt {
+            store: Arc::clone(&self.store),
+            facts,
+        })
     }
 }
+
+type LoggedLine = (&'static str, &'static str, Vec<String>);
+
+#[pyclass(frozen, name = "NativePrometheusAttempt")]
+pub struct NativePrometheusAttempt {
+    store: Arc<Store>,
+    facts: AttemptFacts,
+}
+
+#[pymethods]
+impl NativePrometheusAttempt {
+    #[pyo3(signature = (step, input_sequence_length=None))]
+    fn record(
+        &self,
+        step: &str,
+        input_sequence_length: Option<String>,
+    ) -> PyResult<(Vec<LoggedLine>, Option<String>)> {
+        let step: Step = step
+            .parse()
+            .map_err(|_| PyValueError::new_err(format!("unknown prometheus step {step}")))?;
+        let recorded = record(&self.store, &self.facts, step, input_sequence_length);
+        Ok((
+            recorded
+                .logs
+                .into_iter()
+                .map(|line| (line.level.into(), line.format, line.args))
+                .collect(),
+            recorded.outcome.err().map(|error| exception_text(&error)),
+        ))
+    }
+}
+
+type SeriesRow = (Vec<String>, f64, f64, Vec<f64>, f64);
+type FamilyRow = (
+    String,
+    String,
+    &'static str,
+    Vec<String>,
+    Vec<f64>,
+    Vec<SeriesRow>,
+);
 
 #[pyclass(frozen, name = "NativePrometheusMetric")]
 pub struct NativePrometheusMetric {
     store: Arc<Store>,
-    id: litellm_callbacks_prometheus::store::FamilyId,
+    id: FamilyId,
     kind: Kind,
     declared: String,
     labelnames: Vec<String>,
@@ -255,7 +245,7 @@ impl NativePrometheusMetric {
                 .unwrap_or(&self.declared),
             Kind::Gauge | Kind::Histogram => &self.declared,
         };
-        format!("{}:{name}", self.kind.as_str())
+        format!("{}:{name}", <&str>::from(self.kind))
     }
 
     fn apply(&self, op: Op) -> PyResult<()> {
@@ -411,19 +401,32 @@ impl NativePrometheusMetric {
     fn clear(&self) {
         self.store.clear(self.id);
     }
+
+    fn collect(&self) -> FamilyRow {
+        let family = self.store.snapshot(self.id);
+        (
+            family.name,
+            family.documentation,
+            family.kind.into(),
+            family.labelnames,
+            family.buckets,
+            family
+                .series
+                .into_iter()
+                .map(|(values, series)| {
+                    (
+                        values,
+                        series.value,
+                        series.sum,
+                        series.buckets,
+                        series.created,
+                    )
+                })
+                .collect(),
+        )
+    }
 }
 
 fn to_float(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<f64> {
     py.get_type::<PyFloat>().call1((value,))?.extract()
-}
-
-#[pyfunction]
-pub fn prometheus_callback(
-    store: &NativePrometheusStore,
-    owns_latency: bool,
-) -> PyResult<NativeCallback> {
-    Ok(NativeCallback::new(Arc::new(Prometheus::new(
-        Arc::clone(&store.store),
-        owns_latency,
-    )))?)
 }
