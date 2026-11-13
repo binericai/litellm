@@ -2,7 +2,8 @@ import asyncio
 import inspect
 import logging
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import reduce
 from itertools import chain
@@ -29,7 +30,7 @@ LegacyT: Final = TypeVar("LegacyT")
 Between: TypeAlias = Callable[[Mapping[Field, object]], Awaitable[Mapping[Field, object]]]
 SyncBinding: TypeAlias = Callable[[object, object], object]
 
-SWALLOWING_HOOKS: Final = frozenset({Hook.response_headers, Hook.post_call_failure})
+SWALLOWING_HOOKS: Final = frozenset({Hook.response_headers, Hook.post_call_failure, Hook.post_deployment_failure})
 
 _LOGGER: Final = logging.getLogger("LiteLLM")
 
@@ -106,6 +107,19 @@ def _loop_running() -> bool:
     return True
 
 
+@contextmanager
+def _private_loop() -> Generator[asyncio.AbstractEventLoop]:
+    loop: Final = asyncio.new_event_loop()
+    try:
+        yield loop
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        finally:
+            loop.close()
+
+
 def _fatal(error: BaseException) -> bool:
     return isinstance(error, ContractViolation) or not isinstance(error, Exception)
 
@@ -142,6 +156,15 @@ async def _gather_started(started: tuple[Awaitable[object] | None, ...], fail_fa
         await asyncio.gather(*pending) if fail_fast else await asyncio.gather(*pending, return_exceptions=True)
     )
     return tuple(None if run is None else next(done) for run in started)
+
+
+async def _settle(run: Awaitable[object], fail_fast: bool) -> object:
+    if fail_fast:
+        return await run
+    try:
+        return await run
+    except BaseException as error:  # noqa: BLE001  # mirrors gather(return_exceptions=True) for a one-entry stage
+        return error
 
 
 def _fail_fast(hook: Hook, stage: tuple[Entry, ...]) -> bool:
@@ -311,19 +334,20 @@ class RequestScope:
         if any(entry.subscription.parallel for entry in staged):
             raise ContractViolation("a synchronous hook cannot run parallel legacy entries")
         blocking: Final = not _loop_running()
-        ran: Final = reduce(
-            lambda done, entry: self._run_sync_entry(hook, entry, done, call, binding, blocking),
-            (*staged, *plan.inline),
-            _Chain(fields=fields),
-        )
-        deferred: Final = tuple(entry for entry in staged if not (blocking or entry.subscription.legacy))
-        if blocking and plan.awaited:
-            awaited: Final = plan.awaited
-            self._swallow(
-                hook,
-                awaited,
-                asyncio.run(self._gather(hook, awaited, ran.fields, call, self._states_of(awaited))),
+        with _private_loop() if blocking else nullcontext() as loop:
+            ran: Final = reduce(
+                lambda done, entry: self._run_sync_entry(hook, entry, done, call, binding, loop),
+                (*staged, *plan.inline),
+                _Chain(fields=fields),
             )
+            if loop is not None and plan.awaited:
+                awaited: Final = plan.awaited
+                self._swallow(
+                    hook,
+                    awaited,
+                    loop.run_until_complete(self._gather(hook, awaited, ran.fields, call, self._states_of(awaited))),
+                )
+        deferred: Final = tuple(entry for entry in staged if not (blocking or entry.subscription.legacy))
         self._submit_off_path(hook, (*deferred, *(() if blocking else plan.awaited), *plan.off_path), ran.fields, call)
         return ran.fields
 
@@ -334,13 +358,13 @@ class RequestScope:
         done: _Chain,
         call: CallFacts | None,
         binding: SyncBinding,
-        blocking: bool,
+        loop: asyncio.AbstractEventLoop | None,
     ) -> _Chain:
         if entry.subscription.legacy:
             return self._fold(hook, (entry,), (_legacy_start(entry, binding, done.fields),), done)
-        if not blocking:
+        if loop is None:
             return done
-        settled: Final = asyncio.run(
+        settled: Final = loop.run_until_complete(
             _gather_started((self._invoke(hook, entry, done.fields, call, self._state(entry)),), False)
         )
         folded: Final = self._fold(hook, (entry,), settled, done)
@@ -404,6 +428,22 @@ class RequestScope:
         )
         return await _gather_started(started, _fail_fast(hook, tuple(entries)))
 
+    async def _run_stage(
+        self,
+        hook: Hook,
+        stage: tuple[Entry, ...],
+        fields: Mapping[Field, object],
+        call: CallFacts | None,
+        binding: LegacyBinding | None,
+    ) -> tuple[object, ...]:
+        match stage:
+            case (only,) if not only.subscription.legacy:
+                return (
+                    await _settle(self._invoke(hook, only, fields, call, self._state(only)), _fail_fast(hook, stage)),
+                )
+            case _:
+                return await self._gather(hook, stage, fields, call, self._states_of(stage), binding)
+
     async def _run_stages(
         self,
         hook: Hook,
@@ -415,7 +455,7 @@ class RequestScope:
         if not stages:
             return chain
         stage: Final = stages[0]
-        results: Final = await self._gather(hook, stage, chain.fields, call, self._states_of(stage), binding)
+        results: Final = await self._run_stage(hook, stage, chain.fields, call, binding)
         folded: Final = self._fold(hook, stage, results, chain)
         if folded.terminal is not None:
             return folded
