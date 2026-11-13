@@ -285,6 +285,10 @@ impl NativeParallelRequestLimiter {
         state.0.stash().owner_call_id.clone()
     }
 
+    fn identity(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> Option<String> {
+        state.0.stash().identity.clone()
+    }
+
     fn hand_over(&self, state: PyRef<'_, NativeParallelRequestLimiterState>) -> PyResult<String> {
         let mut stash = state.0.stash();
         stash.owned = false;

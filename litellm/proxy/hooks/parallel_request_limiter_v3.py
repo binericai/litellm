@@ -821,6 +821,14 @@ def get_request_stash_for_call(litellm_call_id: str | None) -> RequestRateLimite
     return stash if litellm_call_id == stash.owner_litellm_call_id else None
 
 
+def request_identity(data: Mapping[str, object]) -> str | None:
+    call_id: Final = data.get("litellm_call_id")
+    if isinstance(call_id, str):
+        return call_id
+    logged: Final = getattr(data.get("litellm_logging_obj"), "litellm_call_id", None)
+    return logged if isinstance(logged, str) else None
+
+
 def _call_id_from_callback_kwargs(kwargs: object) -> str | None:
     if not isinstance(kwargs, dict):
         return None
@@ -986,7 +994,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         call_id: str | None,
     ) -> bool:
         native: Final = self.native_companion
-        if native is None or native.owner_call_id(native_state) == call_id:
+        if native is None or native.identity(native_state) == call_id:
             return False
         exported: Final = _NATIVE_STASH.validate_json(native.hand_over(native_state))
         slot: Final = exported["parallel_slot"]
@@ -4312,7 +4320,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
         stash: Final = claim_request_stash_for_data(data)
         native_state: Final = self._native_state(stash)
-        call_id: Final = _call_id_from_callback_kwargs(data)  # pyright: ignore[reportUnknownArgumentType]  # the hook's data is the untyped proxy body
+        call_id: Final = request_identity(data)  # pyright: ignore[reportUnknownArgumentType]  # the hook's data is the untyped proxy body
         if native_state is not None and not self._adopt_native_state(stash, native_state, call_id):
             return None
         stash.call_type = call_type

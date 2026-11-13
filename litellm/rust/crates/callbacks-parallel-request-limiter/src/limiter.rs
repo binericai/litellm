@@ -60,6 +60,8 @@ pub struct PreCallFacts {
     #[serde(default)]
     pub call_id: Option<String>,
     #[serde(default)]
+    pub identity: Option<String>,
+    #[serde(default)]
     pub descriptors: Vec<Descriptor>,
     #[serde(default)]
     pub requested_model: Option<String>,
@@ -348,6 +350,7 @@ impl ParallelRequestLimiter {
             if let Some(call_id) = &facts.call_id {
                 stash.owner_call_id = Some(call_id.clone());
             }
+            stash.identity = facts.identity.clone().or_else(|| facts.call_id.clone());
             stash.tpm_limited_tags = descriptors
                 .iter()
                 .filter(|descriptor| {

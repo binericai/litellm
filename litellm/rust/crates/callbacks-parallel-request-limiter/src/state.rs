@@ -25,6 +25,7 @@ pub struct Stash {
     pub first_pass_admitted: bool,
     pub io_reached: bool,
     pub owner_call_id: Option<String>,
+    pub identity: Option<String>,
     pub rate_limit_response: Option<Response>,
     pub parallel_slot: Option<SlotAcquisition>,
     pub reserved_tokens: i64,

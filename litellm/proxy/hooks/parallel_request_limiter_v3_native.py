@@ -3,6 +3,7 @@ import json
 import os
 import time
 from collections.abc import Mapping
+from contextvars import ContextVar, Token
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -37,6 +38,7 @@ from litellm.proxy.hooks.batch_enqueued_tokens import (
     resolve_batch_enqueued_token_scopes,
 )
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
+from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 from litellm.types.utils import CallTypes
 
 _IO_KEYS: Final = frozenset({"model_per_project_itpm", "model_per_project_otpm"})
@@ -63,7 +65,6 @@ BATCH_RATE_LIMITED_KIND: Final = "batch_rate_limit"
 _UNSUPPORTED_CALL_TYPES: Final = frozenset(
     {
         CallTypes.aresponses_websocket.value,
-        "pass_through_endpoint",
         "_arealtime",
     }
 )
@@ -73,6 +74,32 @@ _RESERVATION: Final = TypeAdapter(BatchEnqueuedTokenReservation)
 _OVER_LIMIT: Final = TypeAdapter(BatchEnqueuedTokenOverLimit)
 _OUTCOME: Final = TypeAdapter(dict[str, object])
 _PTU_FIELDS: Final = TypeAdapter(dict[str, str | int | float])
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PreCallInputs:
+    user_api_key_dict: UserAPIKeyAuth | None
+    endpoint_type: EndpointType
+
+
+_PRE_CALL_INPUTS: Final[ContextVar[PreCallInputs | None]] = ContextVar(
+    "native_parallel_request_limiter_pre_call_inputs", default=None
+)
+
+
+class PreCallInputsScope:
+    __slots__ = ("_inputs", "_token")
+
+    def __init__(self, user_api_key_dict: UserAPIKeyAuth | None, endpoint_type: EndpointType) -> None:
+        self._inputs: Final = PreCallInputs(user_api_key_dict, endpoint_type)
+        self._token: Token[PreCallInputs | None] | None = None
+
+    def __enter__(self) -> None:
+        self._token = _PRE_CALL_INPUTS.set(self._inputs)
+
+    def __exit__(self, *_: object) -> None:
+        if self._token is not None:
+            _PRE_CALL_INPUTS.reset(self._token)
 
 
 def native_parallel_request_limiter_enabled() -> bool:
@@ -160,6 +187,9 @@ def post_call_request() -> "NativeRequestRedis | None":
 
 
 def _auth(data: Mapping[str, object]) -> UserAPIKeyAuth | None:
+    inputs: Final = _PRE_CALL_INPUTS.get()
+    if inputs is not None and inputs.user_api_key_dict is not None:
+        return inputs.user_api_key_dict
     for key in ("metadata", "litellm_metadata"):
         metadata = data.get(key)
         if isinstance(metadata, dict):
@@ -238,21 +268,27 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         return await self._call(Hook.post_call_failure, failure_facts(self.limiter, data), ctx)
 
     def _declines(self, data: Mapping[str, object], call_type: str, auth: UserAPIKeyAuth | None) -> bool:
-        from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash
+        from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash, request_identity
 
         stash: Final = get_request_stash()
         return (
             auth is None
             or call_type in _UNSUPPORTED_CALL_TYPES
             or (stash is not None and stash.native_state is None and stash.call_type is not None)
-            or not isinstance(data.get("litellm_call_id"), str)
+            or request_identity(data) is None
         )
 
     async def _pre_call(self, data: dict[str, object], ctx: CallContext[object]) -> Patch | Abort | None:
         from litellm.litellm_core_utils.token_counter import offload_token_count
         from litellm.proxy.auth.auth_utils import get_estimated_output_tokens
-        from litellm.proxy.hooks.parallel_request_limiter_v3 import claim_request_stash_for_data, get_request_stash
+        from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+            claim_request_stash_for_data,
+            get_request_stash,
+            request_identity,
+        )
 
+        inputs: Final = _PRE_CALL_INPUTS.get()
+        endpoint_type: Final = EndpointType.GENERIC if inputs is None else inputs.endpoint_type
         call_type: Final = ctx.call.kind.call_type if ctx.call is not None else ""
         auth: Final = _auth(data)
         if auth is None or self._declines(data, call_type, auth):
@@ -286,6 +322,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
                 Hook.pre_call,
                 {
                     "call_id": data.get("litellm_call_id"),
+                    "identity": request_identity(data),
                     "requested_model": batch_model if isinstance(batch_model, str) else None,
                     "policy": policy(limiter),
                     "prior_response": _prior(prior_response),
@@ -334,6 +371,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
                 min_configured_limit=min(configured_tpm_limits),
                 call_type=call_type,
                 configured_output_tokens=configured_output_tokens,
+                endpoint_type=endpoint_type,
             )
             estimated_tokens = await offload_token_count(limiter._estimate_tokens_for_request)(  # pyright: ignore[reportPrivateUsage]  # the estimate is the Python limiter's
                 data=probe,
@@ -369,6 +407,7 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
         reserved_model: Final = limiter.rate_limited_model(requested_model)
         facts: Final = {
             "call_id": data.get("litellm_call_id"),
+            "identity": request_identity(data),
             "descriptors": [dict(descriptor) for descriptor in descriptors],
             "requested_model": requested_model,
             "estimated_tokens": estimated_tokens,
@@ -389,10 +428,11 @@ class ParallelRequestLimiterNativeLogger(NativeLogger):
                 min_configured_limit=min(configured_tpm_limits),
                 call_type=call_type,
                 configured_output_tokens=configured_output_tokens,
+                endpoint_type=endpoint_type,
             )
         if self.bridge.io_reached(state):
             limiter._apply_implicit_output_cap(  # pyright: ignore[reportPrivateUsage]  # the cap is the Python limiter's
-                data=data, min_configured_limit=min_otpm_limit, call_type=call_type
+                data=data, min_configured_limit=min_otpm_limit, call_type=call_type, endpoint_type=endpoint_type
             )
         mirror_rate_limit_response(self.bridge, state)
         return outcome
@@ -598,6 +638,7 @@ __all__ = [
     "NATIVE_PARALLEL_REQUEST_LIMITER_ENV",
     "NativeBatchEnqueuedTokenStore",
     "ParallelRequestLimiterNativeLogger",
+    "PreCallInputsScope",
     "failure_facts",
     "limiter_state",
     "mirror_rate_limit_response",

@@ -35,9 +35,11 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
     ParallelRequestLimiterNativeLogger,
     native_parallel_request_limiter,
+    PreCallInputsScope,
 )
 from litellm.proxy.utils import InternalUsageCache
 from litellm.redis.stores.rate_limits import RateLimitScope
+from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 from litellm.types.utils import ModelResponse, Usage
 
 pytest.importorskip("litellm.rust_bridge._native")
@@ -67,6 +69,7 @@ class Request:
     fallback: str | None = None
     nested: bool = False
     response: object = None
+    endpoint_type: EndpointType = EndpointType.GENERIC
 
 
 @dataclass
@@ -186,6 +189,8 @@ def _outcome(error: BaseException | None) -> object:
 
 
 def _data(index: int, request: Request) -> dict[str, object]:
+    if request.call_type == "pass_through_endpoint":
+        return {**request.body, "litellm_logging_obj": SimpleNamespace(litellm_call_id=f"call-{index}")}
     return {
         **request.body,
         "litellm_call_id": f"call-{index}",
@@ -221,12 +226,13 @@ async def _admit(side: Side, index: int, request: Request) -> object:
             request_state = side.native.request_state
             assert request_state is not None
             side.states[index] = request_state()
-            outcome = await side.native.run_native(
-                Hook.pre_call,
-                _READS,
-                SimpleNamespace(deprecated_kwargs=data),
-                _ctx(side, index, Hook.pre_call, request),
-            )
+            with PreCallInputsScope(request.auth, request.endpoint_type):
+                outcome = await side.native.run_native(
+                    Hook.pre_call,
+                    _READS,
+                    SimpleNamespace(deprecated_kwargs=data),
+                    _ctx(side, index, Hook.pre_call, request),
+                )
             state = side.states[index]
             assert isinstance(state, NativeState)
             stash = get_request_stash()
@@ -236,7 +242,13 @@ async def _admit(side: Side, index: int, request: Request) -> object:
             if isinstance(outcome, Abort):
                 assert outcome.exception is not None
                 raise outcome.exception
-        await side.limiter.async_pre_call_hook(request.auth, cache, data, request.call_type)
+        await side.limiter.async_pre_call_hook(
+            request.auth,
+            cache,
+            data,
+            request.call_type,
+            endpoint_type=request.endpoint_type,
+        )
         if request.fallback is not None:
             return ("fallback", await side.limiter.async_fallback_target_allowed(request.auth, request.fallback, data))
     except Exception as error:  # noqa: BLE001  # the refusal is the observable compared across sides
@@ -1014,3 +1026,38 @@ async def test_batch_enqueued_tokens_are_reserved_saved_and_refunded_like_python
     assert observed[0] is None
     assert (observed[2] is not None) == (end != "proxy_failure")
     assert observed[2] is None or "enqueued token limit" in str(observed[2])
+
+
+_PASS_THROUGH: Final = {"model": "gpt-4o", "messages": [{"role": "user", "content": "decide on this case please"}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_type", (EndpointType.GENERIC, EndpointType.DECISIONS))
+@pytest.mark.parametrize("end", ("success", "failure", "proxy_failure"))
+@pytest.mark.parametrize(
+    "limits",
+    (
+        {"tpm_limit": 100, "rpm_limit": 3},
+        {"max_parallel_requests": 1, "tpm_limit": 5000},
+        {
+            "project_id": "p1",
+            "project_metadata": {"model_otpm_limit": {"gpt-4o": 600}, "model_tpm_limit": {"gpt-4o": 900}},
+        },
+    ),
+)
+async def test_pass_through_requests_are_limited_natively_like_python(
+    endpoint_type: EndpointType,
+    end: str,
+    limits: dict[str, object],
+    backend: tuple[int | None, int | None],
+) -> None:
+    auth: Final = _auth(**limits)
+    observed: Final = await _differential(
+        [
+            Request(auth, _PASS_THROUGH, end=end, call_type="pass_through_endpoint", endpoint_type=endpoint_type)
+            for _ in range(5)
+        ],
+        [("api_key", _KEY), *_PROJECT_SCOPES],
+        backend,
+    )
+    assert observed[0] is None

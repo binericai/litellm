@@ -296,6 +296,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (  # noqa: F401, RUF
     _PROXY_MaxParallelRequestsHandler_v3,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
+    PreCallInputsScope,
     native_parallel_request_limiter,
     native_parallel_request_limiter_enabled,
 )
@@ -3565,13 +3566,14 @@ class ProxyLogging:
                 Hook.pre_call, caps.hook_callbacks, include_v2=not run.guardrails_only
             )
             try:
-                result: Final = await run_subscribers(
-                    subscribers,
-                    KwargsFields(run.latest, PROXY_REQUEST_KEYS),
-                    partial(self._pre_call_start, run),
-                    between=partial(self._pre_call_deferred_reroute, run),
-                    call=_proxy_call_facts(run.latest, run.call_type) if subscribers.has_v2 else None,
-                )
+                with PreCallInputsScope(run.user_api_key_dict, run.endpoint_type):
+                    result: Final = await run_subscribers(
+                        subscribers,
+                        KwargsFields(run.latest, PROXY_REQUEST_KEYS),
+                        partial(self._pre_call_start, run),
+                        between=partial(self._pre_call_deferred_reroute, run),
+                        call=_proxy_call_facts(run.latest, run.call_type) if subscribers.has_v2 else None,
+                    )
             finally:
                 run.settle_parallel()
             run.latest = _request_dict(kwargs_after(raise_v2_abort(result)))
