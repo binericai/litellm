@@ -3,6 +3,7 @@ use serde_json::Value;
 use crate::{
     error::CapacityError,
     model::{DEFAULT_CLASS, GroupInfo, Settings, TeamShare},
+    pyfmt,
 };
 
 const MEMBER_SEPARATOR: char = '\u{1f}';
@@ -48,10 +49,12 @@ pub fn convert_priority_to_percent(
     }
 }
 
+pub type Weights = Vec<(Value, f64)>;
+
 pub fn normalized_weights(
     settings: &Settings,
     group: &GroupInfo,
-) -> Result<Vec<(String, f64)>, CapacityError> {
+) -> Result<Weights, CapacityError> {
     let Some(reservation) = &settings.priority_reservation else {
         return Ok(Vec::new());
     };
@@ -64,7 +67,7 @@ pub fn normalized_weights(
             ))
         })
         .collect::<Result<Vec<_>, CapacityError>>()?;
-    let total: f64 = weights.iter().map(|(_, weight)| weight).sum();
+    let total = pyfmt::sum(weights.iter().map(|(_, weight)| *weight));
     if total > 1.0 {
         return Ok(weights
             .into_iter()
@@ -74,50 +77,56 @@ pub fn normalized_weights(
     Ok(weights)
 }
 
-pub fn weight_of(weights: &[(String, f64)], name: &str) -> Option<f64> {
+pub fn weight_of(weights: &[(Value, f64)], name: &Value) -> Option<f64> {
     weights
         .iter()
-        .find(|(candidate, _)| candidate == name)
+        .find(|(candidate, _)| pyfmt::equals(candidate, name))
         .map(|(_, weight)| *weight)
 }
 
 pub struct Allocation {
     pub weight: f64,
     pub key: String,
+    pub unlicensed: bool,
 }
 
 pub fn allocation(
     settings: &Settings,
     model: &str,
     priority: Option<&Value>,
-    weights: &[(String, f64)],
+    weights: &[(Value, f64)],
     group: &GroupInfo,
 ) -> Result<Allocation, CapacityError> {
-    match settings.reserves(priority) {
+    match settings.reserves(priority)? {
         Some(explicit) => {
             let fallback = explicit_weight(settings, explicit, group)?;
             Ok(Allocation {
                 weight: weight_of(weights, explicit).unwrap_or(fallback),
-                key: format!("{model}:{explicit}"),
+                key: format!("{model}:{}", pyfmt::value(Some(explicit))),
+                unlicensed: !settings.licensed,
             })
         }
         None => Ok(Allocation {
             weight: settings.default_priority,
             key: format!("{model}:default_pool"),
+            unlicensed: false,
         }),
     }
 }
 
 fn explicit_weight(
     settings: &Settings,
-    name: &str,
+    name: &Value,
     group: &GroupInfo,
 ) -> Result<f64, CapacityError> {
+    if !settings.licensed {
+        return Ok(settings.default_priority);
+    }
     let value = settings
         .priority_reservation
         .iter()
         .flatten()
-        .find(|(candidate, _)| candidate == name)
+        .find(|(candidate, _)| pyfmt::equals(candidate, name))
         .map(|(_, value)| value);
     match value {
         Some(value) => convert_priority_to_percent(value, Some(group)),
@@ -125,14 +134,21 @@ fn explicit_weight(
     }
 }
 
-pub fn priority_class(settings: &Settings, priority: Option<&Value>) -> String {
-    settings
-        .reserves(priority)
-        .map_or_else(|| DEFAULT_CLASS.to_owned(), str::to_owned)
+pub fn priority_class(
+    settings: &Settings,
+    priority: Option<&Value>,
+) -> Result<Value, CapacityError> {
+    Ok(settings
+        .reserves(priority)?
+        .cloned()
+        .unwrap_or_else(|| Value::from(DEFAULT_CLASS)))
 }
 
-pub fn pool_member(priority_class: &str) -> String {
-    format!("{MEMBER_SEPARATOR}pool{MEMBER_SEPARATOR}{priority_class}")
+pub fn pool_member(priority_class: &Value) -> String {
+    format!(
+        "{MEMBER_SEPARATOR}pool{MEMBER_SEPARATOR}{}",
+        pyfmt::value(Some(priority_class))
+    )
 }
 
 pub fn team_member(team_id: &str) -> String {
@@ -148,18 +164,18 @@ pub fn counter_value(model: &str, team_id: &str) -> String {
 }
 
 pub fn team_share(
-    priority: &str,
-    members: &[(String, String)],
-    class_weights: &[(String, f64)],
+    priority: &Value,
+    members: &[(String, Value)],
+    class_weights: &[(Value, f64)],
     default_weight: f64,
 ) -> TeamShare {
-    let mut present: Vec<&str> = Vec::new();
+    let mut present: Vec<&Value> = Vec::new();
     for (_, class) in members {
-        if !present.contains(&class.as_str()) {
+        if !present.iter().any(|seen| pyfmt::equals(seen, class)) {
             present.push(class);
         }
     }
-    let weights: Vec<(&str, f64)> = present
+    let weights: Vec<(&Value, f64)> = present
         .iter()
         .map(|class| {
             (
@@ -168,10 +184,10 @@ pub fn team_share(
             )
         })
         .collect();
-    let total: f64 = weights.iter().map(|(_, weight)| weight).sum();
+    let total = pyfmt::sum(weights.iter().map(|(_, weight)| *weight));
     let own = weights
         .iter()
-        .find(|(class, _)| *class == priority)
+        .find(|(class, _)| pyfmt::equals(class, priority))
         .map_or(0.0, |(_, weight)| *weight);
     let class_fraction = if total > 0.0 {
         own / total
@@ -180,7 +196,7 @@ pub fn team_share(
     };
     let teams_in_class = members
         .iter()
-        .filter(|(member, class)| class == priority && !is_pool_member(member))
+        .filter(|(member, class)| pyfmt::equals(class, priority) && !is_pool_member(member))
         .count() as i64;
     TeamShare {
         fraction: class_fraction / teams_in_class.max(1) as f64,
@@ -202,7 +218,7 @@ mod tests {
             priority_reservation: Some(
                 reservation
                     .iter()
-                    .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                    .map(|(name, value)| (Value::from(*name), value.clone()))
                     .collect(),
             ),
             default_priority: 0.25,
@@ -211,6 +227,7 @@ mod tests {
             saturation_check_cache_ttl: json!(60),
             window_size: 60,
             rate_limit_type: TokenRateLimitType::Total,
+            licensed: true,
         }
     }
 
@@ -258,8 +275,8 @@ mod tests {
             &group(Some(1000), None),
         )
         .unwrap();
-        assert!((weight_of(&weights, "a").unwrap() - 0.6 / 1.4).abs() < 1e-12);
-        assert!((weight_of(&weights, "b").unwrap() - 0.8 / 1.4).abs() < 1e-12);
+        assert!((weight_of(&weights, &json!("a")).unwrap() - 0.6 / 1.4).abs() < 1e-12);
+        assert!((weight_of(&weights, &json!("b")).unwrap() - 0.8 / 1.4).abs() < 1e-12);
     }
 
     #[rstest]
@@ -269,7 +286,7 @@ mod tests {
             &group(Some(1000), None),
         )
         .unwrap();
-        assert_eq!(weights, vec![("a".into(), 0.6), ("b".into(), 0.4)]);
+        assert_eq!(weights, vec![(json!("a"), 0.6), (json!("b"), 0.4)]);
     }
 
     #[rstest]
@@ -302,16 +319,16 @@ mod tests {
     #[rstest]
     fn a_class_share_splits_among_its_active_teams_and_absent_classes_give_theirs_away() {
         let members = vec![
-            ("team\u{1f}a".to_owned(), "high".to_owned()),
-            ("team\u{1f}b".to_owned(), "high".to_owned()),
-            ("team\u{1f}c".to_owned(), "low".to_owned()),
+            ("team\u{1f}a".to_owned(), json!("high")),
+            ("team\u{1f}b".to_owned(), json!("high")),
+            ("team\u{1f}c".to_owned(), json!("low")),
         ];
         let weights = vec![
-            ("high".to_owned(), 0.6),
-            ("low".to_owned(), 0.2),
-            ("idle".to_owned(), 0.2),
+            (json!("high"), 0.6),
+            (json!("low"), 0.2),
+            (json!("idle"), 0.2),
         ];
-        let share = team_share("high", &members, &weights, 0.1);
+        let share = team_share(&json!("high"), &members, &weights, 0.1);
         assert!((share.fraction - 0.375).abs() < 1e-12);
         assert_eq!((share.active_teams_in_class, share.active_classes), (2, 2));
     }
@@ -319,10 +336,10 @@ mod tests {
     #[rstest]
     fn a_pool_member_keeps_its_class_present_without_taking_a_slice() {
         let members = vec![
-            ("team\u{1f}a".to_owned(), "high".to_owned()),
-            (pool_member("high"), "high".to_owned()),
+            ("team\u{1f}a".to_owned(), json!("high")),
+            (pool_member(&json!("high")), json!("high")),
         ];
-        let share = team_share("high", &members, &[("high".to_owned(), 0.5)], 0.1);
+        let share = team_share(&json!("high"), &members, &[(json!("high"), 0.5)], 0.1);
         assert_eq!((share.fraction, share.active_teams_in_class), (1.0, 1));
     }
 

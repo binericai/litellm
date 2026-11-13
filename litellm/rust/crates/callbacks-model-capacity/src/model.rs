@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
+use crate::{error::CapacityError, pyfmt};
+
 pub const MODEL_SATURATION_CHECK: &str = "model_saturation_check";
 pub const PRIORITY_MODEL: &str = "priority_model";
 pub const TEAM_MODEL_LIMIT_AT_SATURATION: &str = "model_per_team_saturated";
@@ -137,25 +139,44 @@ pub enum TokenRateLimitType {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
-    pub priority_reservation: Option<Vec<(String, Value)>>,
+    pub priority_reservation: Option<Vec<(Value, Value)>>,
     pub default_priority: f64,
     pub saturation_threshold: f64,
     pub class_split: bool,
     pub saturation_check_cache_ttl: Value,
     pub window_size: i64,
     pub rate_limit_type: TokenRateLimitType,
+    #[serde(default)]
+    pub licensed: bool,
 }
 
 impl Settings {
-    pub fn reserves<'a>(&self, priority: Option<&'a Value>) -> Option<&'a str> {
-        let Some(Value::String(priority)) = priority else {
-            return None;
+    pub fn reserves<'a>(
+        &self,
+        priority: Option<&'a Value>,
+    ) -> Result<Option<&'a Value>, CapacityError> {
+        let (Some(priority), Some(reservation)) = (
+            priority.filter(|priority| !priority.is_null()),
+            &self.priority_reservation,
+        ) else {
+            return Ok(None);
         };
-        self.priority_reservation
-            .as_ref()?
+        if let Some(kind) = pyfmt::unhashable(priority) {
+            return Err(CapacityError::Unhashable(kind));
+        }
+        Ok(reservation
             .iter()
-            .any(|(name, _)| name == priority)
-            .then_some(priority.as_str())
+            .any(|(name, _)| pyfmt::equals(name, priority))
+            .then_some(priority))
+    }
+
+    pub fn reserves_name<'a>(&self, priority: Option<&'a str>) -> Option<&'a str> {
+        let reservation = self.priority_reservation.as_ref()?;
+        let priority = priority?;
+        reservation
+            .iter()
+            .any(|(name, _)| name.as_str() == Some(priority))
+            .then_some(priority)
     }
 }
 

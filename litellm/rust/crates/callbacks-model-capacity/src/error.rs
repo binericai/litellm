@@ -22,6 +22,8 @@ pub enum CapacityError {
     Raised(Raised),
     #[error("{0}")]
     Config(String),
+    #[error("unhashable type: '{0}'")]
+    Unhashable(&'static str),
     #[error("the host answered {method} with an unexpected shape: {detail}")]
     Shape {
         method: &'static str,
@@ -40,6 +42,10 @@ impl CapacityError {
     pub fn is_http(&self) -> bool {
         self.raised()
             .is_some_and(|raised| raised.kind == RaisedKind::Http)
+    }
+
+    pub fn unhashable(&self) -> bool {
+        matches!(self, Self::Unhashable(_))
     }
 
     pub fn is_registry_unavailable(&self) -> bool {

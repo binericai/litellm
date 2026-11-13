@@ -9,7 +9,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 use crate::{
-    capacity::{Engine, PreCall, Request, Settlement},
+    capacity::{Engine, Frame, PreCall, Request, Settlement},
     error::CapacityError,
     model::{KeyFacts, STEERED_FROM_HEADER, UsageTokens},
     pyfmt,
@@ -47,9 +47,13 @@ struct SettlementFacts {
     team_alias: Option<String>,
 }
 
+const SOCKET_CALL_TYPE: &str = "aresponses_websocket";
+
 #[derive(Debug, Default, Deserialize)]
 struct AttemptFacts {
     call_id: Option<String>,
+    call_type: Option<String>,
+    socket_call_id: Option<String>,
     #[serde(default)]
     failed: bool,
     #[serde(default)]
@@ -128,8 +132,22 @@ impl ModelCapacity {
         }
     }
 
-    fn stash(&self, call_id: Option<&str>) -> Option<SharedStash> {
-        self.stashes.find(call_id?)
+    fn stash_for_call(&self, input: &HookInput, call_id: Option<&str>) -> Option<SharedStash> {
+        input
+            .state::<Anchor>()
+            .and_then(|anchor| anchor.for_call(call_id))
+            .or_else(|| self.stashes.find(call_id?))
+    }
+
+    fn settled_stash(&self, input: &HookInput, facts: &AttemptFacts) -> Option<SharedStash> {
+        let call_id = facts.call_id.as_deref();
+        if let Some(stash) = self.stash_for_call(input, call_id) {
+            return Some(stash);
+        }
+        let (owner, connection) = input.state::<Anchor>()?.current()?;
+        let socket_turn = facts.call_type.as_deref() == Some(SOCKET_CALL_TYPE)
+            || (facts.socket_call_id.is_some() && facts.socket_call_id == owner);
+        socket_turn.then_some(connection)
     }
 
     async fn pre_call(&self, input: &HookInput) -> HookOutput {
@@ -137,14 +155,10 @@ impl ModelCapacity {
             return Ok(None);
         };
         let facts: PreCallFacts = facts(input)?;
-        let call_id = facts
-            .call_id
-            .clone()
-            .or_else(|| input.call.as_ref().map(|call| call.ids.call_id.clone()))
-            .unwrap_or_default();
+        let call_id = facts.call_id.as_deref();
         let stash = match input.state::<Anchor>() {
-            Some(anchor) => anchor.hold(&call_id),
-            None => self.stashes.claim(&call_id, false),
+            Some(anchor) => anchor.claim(call_id),
+            None => self.stashes.find_or_claim(call_id),
         };
         let group = match self.engine.host.group(&model).await {
             Ok(Some(group)) => group,
@@ -192,7 +206,7 @@ impl ModelCapacity {
 
     fn response_headers(&self, input: &HookInput) -> HookOutput {
         let facts: CallOnly = facts(input)?;
-        let Some(stash) = self.stash(facts.call_id.as_deref()) else {
+        let Some(stash) = self.stash_for_call(input, facts.call_id.as_deref()) else {
             return Ok(None);
         };
         let Some(steered_from) = stash.lock().steered_from.clone() else {
@@ -210,39 +224,37 @@ impl ModelCapacity {
 
     async fn attempt_ended(&self, input: &HookInput) -> HookOutput {
         let facts: AttemptFacts = facts(input)?;
+        let stash = self.settled_stash(input, &facts);
         if facts.failed {
-            return self.failure(facts).await;
+            return self.failure(facts, stash).await;
         }
-        let _ = self.success(facts).await;
+        let _ = self.success(facts, stash).await;
         Ok(None)
     }
 
-    async fn success(&self, facts: AttemptFacts) -> Result<(), CapacityError> {
+    async fn success(
+        &self,
+        facts: AttemptFacts,
+        stash: Option<SharedStash>,
+    ) -> Result<(), CapacityError> {
         if !facts.settlement.valid || !facts.model_group_known {
             return Ok(());
         }
         let settings = self.engine.host.settings().await?;
         let total = UsageTokens::settled(facts.usage.as_ref(), settings.rate_limit_type);
-        let stash = self.stash(facts.call_id.as_deref());
         let settlement = Settlement {
             model_group: facts.model_group.as_deref(),
             team_id: facts.settlement.team_id.as_deref(),
             team_alias: facts.settlement.team_alias.as_deref(),
         };
-        let priority = facts.settlement.priority.filter(Value::is_string);
+        let priority = facts.settlement.priority.as_ref().and_then(Value::as_str);
         self.engine
-            .settle_success(
-                &settings,
-                stash.as_ref(),
-                &settlement,
-                priority.as_ref(),
-                total,
-            )
+            .settle_success(&settings, stash.as_ref(), &settlement, priority, total)
             .await
     }
 
-    async fn failure(&self, facts: AttemptFacts) -> HookOutput {
-        let Some(stash) = self.stash(facts.call_id.as_deref()) else {
+    async fn failure(&self, facts: AttemptFacts, stash: Option<SharedStash>) -> HookOutput {
+        let Some(stash) = stash else {
             return Ok(None);
         };
         if !facts.model_group_known {
@@ -286,7 +298,7 @@ impl ModelCapacity {
         model: &str,
         commit: bool,
     ) -> Result<bool, CapacityError> {
-        let stash = self.stashes.claim(call_id.unwrap_or_default(), false);
+        let stash = self.stashes.find_or_claim(call_id);
         let settings = self.engine.host.settings().await?;
         let request = Request {
             key,
@@ -296,6 +308,26 @@ impl ModelCapacity {
         };
         self.engine
             .fallback_target_allowed(&request, model, commit)
+            .await
+    }
+
+    pub async fn enforce_frame(
+        &self,
+        connection_call_id: Option<&str>,
+        key: &KeyFacts,
+        model: &str,
+    ) -> Result<Frame, CapacityError> {
+        let connection = connection_call_id.and_then(|call_id| self.stashes.find(call_id));
+        let stash = connection.clone().unwrap_or_default();
+        let settings = self.engine.host.settings().await?;
+        let request = Request {
+            key,
+            call_type: None,
+            settings: &settings,
+            stash: &stash,
+        };
+        self.engine
+            .enforce_frame(&request, model, connection.as_ref())
             .await
     }
 }

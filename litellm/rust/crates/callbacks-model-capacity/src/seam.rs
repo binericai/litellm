@@ -56,7 +56,7 @@ pub struct Throttle {
     pub model_group: String,
     pub team: String,
     pub team_alias: Option<String>,
-    pub priority: String,
+    pub priority: Value,
     pub rate_limit_type: String,
     pub reason: String,
 }
@@ -78,9 +78,9 @@ pub trait CapacityHost: Send + Sync {
         &'a self,
         model: &'a str,
         member: &'a str,
-        priority_class: &'a str,
+        priority_class: &'a Value,
         window: i64,
-    ) -> SeamFuture<'a, Vec<(String, String)>>;
+    ) -> SeamFuture<'a, Vec<(String, Value)>>;
     fn steerable<'a>(
         &'a self,
         model: &'a str,
@@ -94,6 +94,7 @@ pub trait CapacityHost: Send + Sync {
     fn metrics_enabled(&self) -> SeamFuture<'_, bool>;
     fn throttled<'a>(&'a self, event: &'a Throttle) -> SeamFuture<'a, ()>;
     fn set_share<'a>(&'a self, gauge: &'a ShareGauge) -> SeamFuture<'a, ()>;
+    fn unlicensed_priority(&self) -> SeamFuture<'_, ()>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,9 +227,9 @@ impl<D: Delegate> CapacityHost for Delegated<D> {
         &'a self,
         model: &'a str,
         member: &'a str,
-        priority_class: &'a str,
+        priority_class: &'a Value,
         window: i64,
-    ) -> SeamFuture<'a, Vec<(String, String)>> {
+    ) -> SeamFuture<'a, Vec<(String, Value)>> {
         self.invoke(
             "touch",
             json!({"model": model, "member": member, "priority_class": priority_class, "window": window}),
@@ -270,5 +271,9 @@ impl<D: Delegate> CapacityHost for Delegated<D> {
 
     fn set_share<'a>(&'a self, gauge: &'a ShareGauge) -> SeamFuture<'a, ()> {
         self.invoke("set_share", json!(gauge))
+    }
+
+    fn unlicensed_priority(&self) -> SeamFuture<'_, ()> {
+        self.invoke("unlicensed_priority", json!({}))
     }
 }

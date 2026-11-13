@@ -1,3 +1,4 @@
+use litellm_python_compat::{json, repr, truthy};
 use serde_json::{Number, Value};
 
 pub fn float_repr(value: f64) -> String {
@@ -33,13 +34,68 @@ pub fn number(value: &Number) -> String {
 
 pub fn value(value: Option<&Value>) -> String {
     match value {
-        None | Some(Value::Null) => "None".into(),
-        Some(Value::Bool(true)) => "True".into(),
-        Some(Value::Bool(false)) => "False".into(),
-        Some(Value::Number(number)) => self::number(number),
-        Some(Value::String(text)) => text.clone(),
-        Some(other) => other.to_string(),
+        None => "None".into(),
+        Some(value) => repr::to_str(&json::from_json(value.clone())),
     }
+}
+
+pub fn unhashable(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Array(_) => Some("list"),
+        Value::Object(_) => Some("dict"),
+        _ => None,
+    }
+}
+
+fn integral(number: &Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+fn numeric(value: &Value) -> Option<Result<i128, f64>> {
+    match value {
+        Value::Bool(flag) => Some(Ok(i128::from(*flag))),
+        Value::Number(number) => {
+            Some(integral(number).map_or_else(|| Err(number.as_f64().unwrap_or(f64::NAN)), Ok))
+        }
+        _ => None,
+    }
+}
+
+fn int_equals_float(int: i128, float: f64) -> bool {
+    float.is_finite() && float.fract() == 0.0 && float.abs() < 1.7e38 && float as i128 == int
+}
+
+pub fn equals(left: &Value, right: &Value) -> bool {
+    match (numeric(left), numeric(right)) {
+        (Some(Ok(a)), Some(Ok(b))) => a == b,
+        (Some(Err(a)), Some(Err(b))) => a == b,
+        (Some(Ok(int)), Some(Err(float))) | (Some(Err(float)), Some(Ok(int))) => {
+            int_equals_float(int, float)
+        }
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => left == right,
+    }
+}
+
+pub fn sum(values: impl IntoIterator<Item = f64>) -> f64 {
+    let mut total = 0.0_f64;
+    let mut compensation = 0.0_f64;
+    for value in values {
+        let next = total + value;
+        if total.abs() >= value.abs() {
+            compensation += (total - next) + value;
+        } else {
+            compensation += (value - next) + total;
+        }
+        total = next;
+    }
+    if compensation != 0.0 && compensation.is_finite() {
+        total += compensation;
+    }
+    total
 }
 
 pub fn optional_int(value: Option<i64>) -> String {
@@ -58,14 +114,7 @@ pub fn percent(value: f64, places: usize) -> String {
 }
 
 pub fn truthy(value: Option<&Value>) -> bool {
-    match value {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
-        Some(Value::Number(number)) => number.as_f64().is_some_and(|number| number != 0.0),
-        Some(Value::String(text)) => !text.is_empty(),
-        Some(Value::Array(items)) => !items.is_empty(),
-        Some(Value::Object(map)) => !map.is_empty(),
-        Some(Value::Bool(true)) => true,
-    }
+    value.is_some_and(|value| truthy::truthy(&json::from_json(value.clone())))
 }
 
 pub fn is_latin1(text: &str) -> bool {
@@ -75,6 +124,7 @@ pub fn is_latin1(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
 
@@ -88,6 +138,34 @@ mod tests {
     #[case(-3.25, "-3.25")]
     fn floats_render_like_python_repr(#[case] value: f64, #[case] expected: &str) {
         assert_eq!(float_repr(value), expected);
+    }
+
+    #[rstest]
+    #[case::ints(json!(5), "5")]
+    #[case::bool(json!(true), "True")]
+    #[case::list(json!([1, "a", null, 1.5]), "[1, 'a', None, 1.5]")]
+    #[case::dict(json!({"b": 1, "a": "it's"}), "{'b': 1, 'a': \"it's\"}")]
+    #[case::text(json!("plain"), "plain")]
+    fn values_render_like_python_str(#[case] value: Value, #[case] expected: &str) {
+        assert_eq!(super::value(Some(&value)), expected);
+    }
+
+    #[rstest]
+    #[case::int_float(json!(1), json!(1.0), true)]
+    #[case::bool_int(json!(true), json!(1), true)]
+    #[case::text_int(json!("1"), json!(1), false)]
+    #[case::null(Value::Null, Value::Null, true)]
+    #[case::half(json!(0.5), json!(0), false)]
+    fn keys_compare_like_python(#[case] left: Value, #[case] right: Value, #[case] expected: bool) {
+        assert_eq!(equals(&left, &right), expected);
+    }
+
+    #[rstest]
+    #[case::tenths(vec![0.1; 10], 1.0)]
+    #[case::thirds(vec![0.3, 0.3, 0.3, 0.1], 1.0)]
+    #[case::mixed(vec![0.6, 8.0 / 30.0, 0.3], 1.1666666666666665)]
+    fn sums_compensate_like_python(#[case] values: Vec<f64>, #[case] expected: f64) {
+        assert_eq!(sum(values).to_bits(), expected.to_bits());
     }
 
     #[rstest]

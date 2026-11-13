@@ -6,6 +6,7 @@ import httpx
 from pydantic import JsonValue
 from typing_extensions import disjoint_base
 
+from litellm.integrations.custom_logger_v2.native import NativeHandle
 from litellm.redis.store_settings import RedisBreakerSettings, RedisStoreSettings
 from litellm.rust_bridge.execution import Execution
 from litellm.rust_bridge.public_call import NativeCall
@@ -544,6 +545,17 @@ def amessages(
     call: NativeCall,
 ) -> Execution: ...
 @final
+class NativeModelCapacity:
+    def __new__(cls, delegate: object) -> NativeModelCapacity: ...
+    def callback(self) -> NativeHandle: ...
+    def fallback_target_allowed(
+        self, call_id: str | None, key: Mapping[str, object], model: str, commit: bool
+    ) -> Future[dict[str, object]]: ...
+    def enforce_frame(
+        self, connection_call_id: str | None, key: Mapping[str, object], model: str
+    ) -> Future[dict[str, object]]: ...
+
+@final
 class ResponsesWebSocketConnection:
     def __new__(cls, _uninstantiable: Never, /) -> Never: ...
     @classmethod
@@ -685,6 +697,7 @@ __all__ = [
     "NativeFetchPolicy",
     "NativeFetched",
     "NativeInstalled",
+    "NativeModelCapacity",
     "NativeModelCostMap",
     "NativeModelCostMapState",
     "NativePending",

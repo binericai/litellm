@@ -43,6 +43,40 @@ pub struct Steered {
     pub access_groups: Vec<String>,
 }
 
+pub enum Frame {
+    Allow,
+    Refuse(Refusal),
+    Unverifiable(CapacityError),
+}
+
+const SOCKET_TURN_UNCOUNTED: [&str; 3] = [
+    "model_per_project_itpm",
+    "model_per_project_otpm",
+    "model_per_team_ptu",
+];
+
+fn socket_turn_tpm_windows(descriptors: &[Descriptor]) -> Vec<Descriptor> {
+    descriptors
+        .iter()
+        .filter(|descriptor| !SOCKET_TURN_UNCOUNTED.contains(&descriptor.key.as_str()))
+        .filter_map(|descriptor| {
+            let tokens = descriptor.tokens_per_unit()?;
+            Some(Descriptor {
+                key: descriptor.key.clone(),
+                value: descriptor.value.clone(),
+                rate_limit: Some(RateLimit {
+                    requests_per_unit: None,
+                    tokens_per_unit: Some(tokens),
+                    window_size: descriptor
+                        .rate_limit
+                        .as_ref()
+                        .and_then(|limit| limit.window_size),
+                }),
+            })
+        })
+        .collect()
+}
+
 pub enum PreCall {
     Allow,
     Steer(Steered),
@@ -293,14 +327,14 @@ impl Engine {
         &self,
         request: &Request<'_>,
         model: &str,
-        weights: &[(String, f64)],
+        weights: &[(Value, f64)],
     ) -> Result<Option<TeamShare>, CapacityError> {
         let settings = request.settings;
         if settings.priority_reservation.is_none() || !settings.class_split {
             return Ok(None);
         }
         let priority = request.priority();
-        let class = priority_class(settings, priority.as_ref());
+        let class = priority_class(settings, priority.as_ref())?;
         let member = request
             .key
             .team_id
@@ -326,7 +360,8 @@ impl Engine {
         )))
     }
 
-    fn priority_descriptors(
+    async fn priority_descriptors(
+        &self,
         request: &Request<'_>,
         model: &str,
         group: &GroupInfo,
@@ -339,6 +374,9 @@ impl Engine {
         let weights = normalized_weights(settings, group)?;
         let priority = request.priority();
         let allocated = allocation(settings, model, priority.as_ref(), &weights, group)?;
+        if allocated.unlicensed {
+            self.host.unlicensed_priority().await?;
+        }
         let weight = share.map_or(allocated.weight, |share| share.fraction);
         let floor = if share.is_some() { 1 } else { 0 };
         let tokens = group.tpm.map(|tpm| floor.max((tpm as f64 * weight) as i64));
@@ -444,8 +482,9 @@ impl Engine {
         let model_wide = Self::model_wide(settings, model, group);
         let weights = normalized_weights(settings, group)?;
         let share = self.class_share(request, model, &weights).await?;
-        let priority_descriptors =
-            Self::priority_descriptors(request, model, group, share.as_ref())?;
+        let priority_descriptors = self
+            .priority_descriptors(request, model, group, share.as_ref())
+            .await?;
         {
             let mut stash = request.stash.lock();
             stash.priority_class_share = priority_descriptors
@@ -691,21 +730,100 @@ impl Engine {
         else {
             return;
         };
-        let nonempty = |value: Option<&str>, default: &str| {
-            value
-                .filter(|value| !value.is_empty())
-                .unwrap_or(default)
-                .to_owned()
+        let or_default = |value: Option<&Value>, default: &str| match value {
+            Some(value) if pyfmt::truthy(Some(value)) => value.clone(),
+            _ => Value::from(default),
         };
         let event = Throttle {
             model_group: model.to_owned(),
             team: team.to_owned(),
             team_alias: key.team_alias.clone(),
-            priority: nonempty(refusal.header("x-litellm-priority"), "default"),
-            rate_limit_type: nonempty(refusal.header("rate_limit_type"), "tokens"),
-            reason: reason.to_owned(),
+            priority: or_default(refusal.header("x-litellm-priority"), "default"),
+            rate_limit_type: pyfmt::value(Some(&or_default(
+                refusal.header("rate_limit_type"),
+                "tokens",
+            ))),
+            reason: pyfmt::value(Some(reason)),
         };
         let _ = self.host.throttled(&event).await;
+    }
+
+    pub async fn enforce_frame(
+        &self,
+        request: &Request<'_>,
+        model: &str,
+        connection: Option<&SharedStash>,
+    ) -> Result<Frame, CapacityError> {
+        let Some(group) = self.host.group(model).await? else {
+            return Ok(Frame::Allow);
+        };
+        let settings = request.settings;
+        let weights = normalized_weights(settings, &group)?;
+        let share = self.class_share(request, model, &weights).await?;
+        let share_descriptors = match &share {
+            None => Vec::new(),
+            Some(share) => {
+                self.priority_descriptors(request, model, &group, Some(share))
+                    .await?
+            }
+        };
+        let frame_share = share_descriptors
+            .iter()
+            .find(|descriptor| descriptor.key == PRIORITY_CLASS_SHARE_AT_SATURATION)
+            .cloned();
+        if let (Some(stash), Some(frame_share)) = (connection, frame_share) {
+            stash.lock().priority_class_share = Some(frame_share);
+        }
+        let borrowing = self.borrowing_share(request, model).await?;
+        if share_descriptors.is_empty() && borrowing.is_none() {
+            return Ok(Frame::Allow);
+        }
+        let saturation = self.saturation(settings, model, &group).await;
+        let saturated = saturation >= settings.saturation_threshold;
+        let enforced_team = borrowing
+            .as_ref()
+            .and_then(|borrowing| borrowing.enforced(saturated))
+            .cloned();
+        if let (Some(stash), Some(_)) = (connection, &borrowing) {
+            stash.lock().borrowing_limit = enforced_team.clone();
+        }
+        let mut descriptors = if saturated {
+            share_descriptors
+        } else {
+            Vec::new()
+        };
+        descriptors.extend(enforced_team);
+        if descriptors.is_empty() {
+            return Ok(Frame::Allow);
+        }
+        let windows = socket_turn_tpm_windows(&descriptors);
+        let response = match self.limiter.should_rate_limit(&windows, true, true).await {
+            Ok(response) => response,
+            Err(error) => return Ok(Frame::Unverifiable(error)),
+        };
+        let Some(over_limit) = response.statuses.iter().find(|status| status.over_limit()) else {
+            return Ok(Frame::Allow);
+        };
+        let priority = request.priority();
+        let context = Context {
+            model,
+            priority: priority.as_ref(),
+            team_id: request.key.team_id.as_deref(),
+            saturation,
+            window_size: settings.window_size,
+        };
+        let over_class_share = over_limit.descriptor_key == PRIORITY_CLASS_SHARE_AT_SATURATION;
+        let refusal = match (&share, &borrowing) {
+            (Some(share), _) if over_class_share || borrowing.is_none() => {
+                context.class_share(over_limit, share)
+            }
+            (_, Some(borrowing)) => {
+                context.team_share(over_limit, settings.saturation_threshold, &borrowing.limits)
+            }
+            _ => return Ok(Frame::Allow),
+        };
+        self.throttled(&refusal, model, request.key).await;
+        Ok(Frame::Refuse(refusal))
     }
 
     pub async fn fallback_target_allowed(
@@ -823,7 +941,7 @@ impl Engine {
         settings: &Settings,
         stash: Option<&SharedStash>,
         settlement: &Settlement<'_>,
-        priority: Option<&Value>,
+        priority: Option<&str>,
         total_tokens: i64,
     ) -> Result<(), CapacityError> {
         let ttl = settings.window_size;
@@ -879,7 +997,7 @@ impl Engine {
         if total_tokens == 0 && team_tokens.is_empty() {
             return Ok(());
         }
-        let priority_key = match settings.reserves(priority) {
+        let priority_key = match settings.reserves_name(priority) {
             Some(explicit) => format!("{model_group}:{explicit}"),
             None => format!("{model_group}:default_pool"),
         };

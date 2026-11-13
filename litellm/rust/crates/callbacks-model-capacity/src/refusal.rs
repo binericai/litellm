@@ -17,17 +17,17 @@ pub const RERAISE: &str = "reraise";
 #[derive(Clone, Debug, PartialEq)]
 pub struct Refusal {
     pub detail: Vec<(String, Value)>,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, Value)>,
     pub rate_limit_type: Option<String>,
     pub model: String,
 }
 
 impl Refusal {
-    pub fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&Value> {
         self.headers
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
+            .map(|(_, value)| value)
     }
 
     pub fn into_abort(self) -> Abort {
@@ -38,7 +38,11 @@ impl Refusal {
             .and_then(|(_, value)| value.as_str())
             .unwrap_or_default()
             .to_owned();
-        let headers: BTreeMap<String, String> = self.headers.iter().cloned().collect();
+        let headers: BTreeMap<String, String> = self
+            .headers
+            .iter()
+            .map(|(key, value)| (key.clone(), pyfmt::value(Some(value))))
+            .collect();
         let fields = json!({
             "detail": self.detail,
             "headers": self.headers,
@@ -78,18 +82,23 @@ pub struct Context<'a> {
 }
 
 impl Context<'_> {
-    fn priority_or_default(&self) -> String {
-        if pyfmt::truthy(self.priority) {
-            pyfmt::value(self.priority)
-        } else {
-            "default".into()
+    fn priority_or_default(&self) -> Value {
+        match self.priority {
+            Some(priority) if pyfmt::truthy(Some(priority)) => priority.clone(),
+            _ => Value::from("default"),
         }
     }
 
-    fn headers(&self, status: &Status, extra: &[(&str, String)]) -> Vec<(String, String)> {
+    fn headers(&self, status: &Status, extra: &[(&str, Value)]) -> Vec<(String, Value)> {
         let mut headers = vec![
-            ("retry-after".to_owned(), self.window_size.to_string()),
-            ("rate_limit_type".to_owned(), status.rate_limit_type.clone()),
+            (
+                "retry-after".to_owned(),
+                Value::from(self.window_size.to_string()),
+            ),
+            (
+                "rate_limit_type".to_owned(),
+                Value::from(status.rate_limit_type.clone()),
+            ),
         ];
         headers.extend(
             extra
@@ -99,7 +108,7 @@ impl Context<'_> {
         headers
     }
 
-    fn refusal(&self, error: String, status: &Status, headers: Vec<(String, String)>) -> Refusal {
+    fn refusal(&self, error: String, status: &Status, headers: Vec<(String, Value)>) -> Refusal {
         Refusal {
             detail: vec![("error".into(), Value::String(error))],
             headers,
@@ -115,13 +124,16 @@ impl Context<'_> {
             .map_or_else(|| "None".into(), pyfmt::number)
     }
 
-    fn saturation_headers(&self, rate_limited_by: Option<&str>) -> Vec<(&'static str, String)> {
+    fn saturation_headers(&self, rate_limited_by: Option<&str>) -> Vec<(&'static str, Value)> {
         let mut headers = Vec::new();
         if let Some(reason) = rate_limited_by {
-            headers.push(("rate_limited_by", reason.to_owned()));
+            headers.push(("rate_limited_by", Value::from(reason)));
         }
         headers.push(("x-litellm-priority", self.priority_or_default()));
-        headers.push(("x-litellm-saturation", pyfmt::percent(self.saturation, 2)));
+        headers.push((
+            "x-litellm-saturation",
+            Value::from(pyfmt::percent(self.saturation, 2)),
+        ));
         headers
     }
 
@@ -222,7 +234,7 @@ impl Context<'_> {
             "Priority class share reached for {} and the model is saturated. Team: {}, Priority: {}, Active teams in class: {}, Active classes: {}, Rate limit type: {}, Team share: {}, Remaining: {}, Model saturation: {}",
             self.model,
             pyfmt::value(self.team_id.map(Value::from).as_ref()),
-            self.priority_or_default(),
+            pyfmt::value(Some(&self.priority_or_default())),
             share.active_teams_in_class,
             share.active_classes,
             status.rate_limit_type,
@@ -247,7 +259,10 @@ impl Context<'_> {
                 ("rate_limit_type".into(), Value::from(rate_limit_type)),
             ],
             headers: vec![
-                ("retry-after".into(), self.window_size.to_string()),
+                (
+                    "retry-after".into(),
+                    Value::from(self.window_size.to_string()),
+                ),
                 ("x-litellm-priority".into(), self.priority_or_default()),
             ],
             rate_limit_type: offending.map(|status| status.rate_limit_type.clone()),

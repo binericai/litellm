@@ -9,8 +9,10 @@ mod seam;
 mod state;
 
 pub use callback::{ModelCapacity, NAME};
+pub use capacity::Frame;
 pub use error::{CapacityError, Raised, RaisedKind};
 pub use model::KeyFacts;
+pub use refusal::Refusal;
 pub use refusal::{PROXY_RATE_LIMIT_ERROR, RERAISE};
 pub use seam::{
     CapacityHost, Delegate, Delegated, Estimate, SeamFuture, ShareGauge, Throttle, V3Limiter,

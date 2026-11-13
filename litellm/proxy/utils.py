@@ -312,6 +312,7 @@ from litellm.proxy.policy_engine.pipeline_executor import (
 )
 from litellm.proxy.policy_engine.policy_registry import get_policy_registry
 from litellm.proxy.policy_engine.policy_resolver import PolicyResolver
+from litellm.proxy.request_auth_context import REQUEST_AUTH
 from litellm.proxy.spend_tracking.session_spend_total import SessionSpendTotals
 from litellm.repositories.budget_repository import BudgetRepository
 from litellm.repositories.config_repository import ConfigRepository
@@ -3515,17 +3516,21 @@ class ProxyLogging:
             independent_snapshot(data) if needs_raw_request_snapshot else None
         )
 
-        return await self._dispatch_pre_call(
-            _PreCallRun(
-                user_api_key_dict=user_api_key_dict,
-                call_type=call_type,
-                guardrails_only=guardrails_only,
-                skip_guardrails=skip_guardrails,
-                endpoint_type=endpoint_type,
-                raw_request_snapshot=raw_request_snapshot,
-                latest=data,
+        auth_token: Final = REQUEST_AUTH.set(user_api_key_dict)
+        try:
+            return await self._dispatch_pre_call(
+                _PreCallRun(
+                    user_api_key_dict=user_api_key_dict,
+                    call_type=call_type,
+                    guardrails_only=guardrails_only,
+                    skip_guardrails=skip_guardrails,
+                    endpoint_type=endpoint_type,
+                    raw_request_snapshot=raw_request_snapshot,
+                    latest=data,
+                )
             )
-        )
+        finally:
+            REQUEST_AUTH.reset(auth_token)
 
     async def _dispatch_pre_call(self, run: "_PreCallRun") -> dict[str, object] | None:  # mutable-ok: request dict
         try:
