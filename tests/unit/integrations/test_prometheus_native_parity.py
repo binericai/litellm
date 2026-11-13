@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import re
 import time
@@ -556,6 +557,62 @@ async def test_the_native_companion_sits_right_after_the_legacy_logger_once(monk
 
     assert callbacks == ["before", logger, logger.native_companion, "after"]
     assert with_native_companions(callbacks) == callbacks
+
+
+_CALLBACK_LISTS: Final = (
+    "callbacks",
+    "input_callback",
+    "success_callback",
+    "failure_callback",
+    "_async_input_callback",
+    "_async_success_callback",
+    "_async_failure_callback",
+)
+_TIMED: Final = re.compile(r"latency|seconds|duration|_time|_created|overhead")
+
+
+async def _completion_text(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
+    if native:
+        monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
+    else:
+        monkeypatch.delenv(NATIVE_PROMETHEUS_ENV, raising=False)
+    for name in _CALLBACK_LISTS:
+        monkeypatch.setattr(litellm, name, [])
+    logger: Final = PrometheusLogger()
+    monkeypatch.setattr(litellm, "callbacks", with_native_companions([logger]))
+    assert len(litellm.callbacks) == (2 if native else 1)
+    _ = await litellm.acompletion(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "hello"}],
+        mock_response="hi there",
+        metadata={"user_api_key_hash": "hashed", "user_api_key_team_id": "team-1", "tags": ["prod"]},
+    )
+    await asyncio.sleep(1)
+    await _drained()
+    text: Final = generate_latest(_ours()).decode()
+    return "\n".join(
+        line for line in text.splitlines() if not line.startswith("#") and _TIMED.search(line.split("{")[0]) is None
+    )
+
+
+async def test_a_real_acompletion_emits_the_same_metrics_through_the_rust_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = await _completion_text(False, monkeypatch)
+    _clear_registry()
+    reset_host_for_tests()
+    clear_subscribers_cache_for_tests()
+    python_text: Final = await _completion_text(False, monkeypatch)
+    _clear_registry()
+    reset_host_for_tests()
+    clear_subscribers_cache_for_tests()
+    native_text: Final = await _completion_text(True, monkeypatch)
+
+    assert any(isinstance(collector, NativeStoreCollector) for collector in _logger_collectors())
+    assert re.search(r"^litellm_total_tokens_metric_total\{.*\} \d+\.0$", native_text, re.MULTILINE)
+    assert "litellm_deployment_success_responses_total{" in native_text
+    assert "litellm_remaining_team_budget_metric{" in native_text
+    assert native_text == python_text
 
 
 def test_multiprocess_mode_keeps_the_python_logger(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
