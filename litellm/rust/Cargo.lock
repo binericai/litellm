@@ -3709,6 +3709,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "litellm-callbacks-parallel-request-limiter"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "litellm-callbacks",
+ "litellm-redis-store",
+ "rstest",
+ "serde",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "litellm-callbacks-python"
 version = "0.1.0"
 dependencies = [

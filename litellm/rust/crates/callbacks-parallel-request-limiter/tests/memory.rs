@@ -1,0 +1,248 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
+use litellm_callbacks::Abort;
+use litellm_callbacks_parallel_request_limiter::{
+    Code, Descriptor, Engine, LimiterState, ParallelRequestLimiter, PolicyFacts,
+    PostCallFailureFacts, PreCallFacts, Settings, SuccessFacts, TargetFacts,
+};
+use litellm_redis_store::{
+    Number,
+    rate_limits::{Counter, Entry, Kind, Local, RateLimits, Scope},
+};
+use rstest::rstest;
+use serde_json::json;
+
+struct Clock(AtomicU64);
+
+impl Clock {
+    fn at(seconds: f64) -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(seconds.to_bits())))
+    }
+
+    fn now(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::SeqCst))
+    }
+}
+
+fn limiter(reservation: bool) -> (ParallelRequestLimiter, Arc<RateLimits>, Arc<Clock>) {
+    let store = Arc::new(RateLimits::new(None, None));
+    let clock = Clock::at(1_700_000_000.5);
+    let now = Arc::clone(&clock);
+    let engine = Engine::new(
+        Arc::clone(&store),
+        Settings {
+            window_size: 60,
+            tpm_reservation_enabled: reservation,
+        },
+        Arc::new(move || now.now()),
+    );
+    (ParallelRequestLimiter::new(engine), store, clock)
+}
+
+fn descriptors(value: serde_json::Value) -> Vec<Descriptor> {
+    serde_json::from_value(value).unwrap()
+}
+
+fn facts(descriptors: Vec<Descriptor>, estimated: Option<i64>) -> PreCallFacts {
+    PreCallFacts {
+        call_id: Some("call".into()),
+        descriptors,
+        requested_model: Some("gpt".into()),
+        estimated_tokens: estimated,
+        reserved_model: None,
+        policy: PolicyFacts::default(),
+    }
+}
+
+fn count(store: &RateLimits, key: &str, value: &str, kind: Kind) -> Option<Local> {
+    store
+        .get_local(&Entry::Counter(Counter {
+            scope: Scope {
+                descriptor: key.into(),
+                value: value.into(),
+            },
+            kind,
+        }))
+        .unwrap()
+}
+
+#[rstest]
+#[tokio::test]
+async fn the_rpm_limit_admits_up_to_the_limit_then_refuses_with_the_python_detail() {
+    let (limiter, _, _) = limiter(true);
+    let rpm = descriptors(
+        json!([{"key": "api_key", "value": "k", "rate_limit": {"requests_per_unit": 2}}]),
+    );
+    for _ in 0..2 {
+        let state = LimiterState::default();
+        assert_eq!(
+            limiter
+                .pre_call(&state, facts(rpm.clone(), None), None)
+                .await,
+            None
+        );
+    }
+    let refused: Abort = limiter
+        .pre_call(&LimiterState::default(), facts(rpm, None), None)
+        .await
+        .unwrap();
+    assert_eq!(refused.status, 429);
+    assert_eq!(
+        refused.message,
+        "Rate limit exceeded for api_key: k. Limit type: requests. Current limit: 2, Remaining: 0. Limit resets at: 2023-11-14 22:14:20 UTC"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_parallel_slot_is_held_until_post_call_success_releases_it() {
+    let (limiter, _, _) = limiter(true);
+    let parallel = descriptors(
+        json!([{"key": "api_key", "value": "k", "rate_limit": {"max_parallel_requests": 1}}]),
+    );
+    let first = LimiterState::default();
+    assert_eq!(
+        limiter
+            .pre_call(&first, facts(parallel.clone(), None), None)
+            .await,
+        None
+    );
+    let refused = limiter
+        .pre_call(
+            &LimiterState::default(),
+            facts(parallel.clone(), None),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.headers["rate_limit_type"], "max_parallel_requests");
+    limiter.post_call_success(&first, Default::default()).await;
+    assert_eq!(
+        limiter
+            .pre_call(&LimiterState::default(), facts(parallel, None), None)
+            .await,
+        None
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_reservation_is_settled_to_actual_usage_and_refunded_on_failure() {
+    let (limiter, store, _) = limiter(true);
+    let tpm = descriptors(
+        json!([{"key": "api_key", "value": "k", "rate_limit": {"tokens_per_unit": 1000}}]),
+    );
+    let state = LimiterState::default();
+    assert_eq!(
+        limiter
+            .pre_call(&state, facts(tpm.clone(), Some(300)), None)
+            .await,
+        None
+    );
+    assert_eq!(
+        count(&store, "api_key", "k", Kind::Tokens),
+        Some(Local::Number(Number::Int(300)))
+    );
+    limiter
+        .settle_success(
+            &state,
+            SuccessFacts {
+                call_id: Some("call".into()),
+                total_tokens: 120,
+                targets: TargetFacts {
+                    user_api_key_hash: Some("k".into()),
+                    ..TargetFacts::default()
+                },
+                ..SuccessFacts::default()
+            },
+            None,
+        )
+        .await;
+    assert_eq!(
+        count(&store, "api_key", "k", Kind::Tokens),
+        Some(Local::Number(Number::Int(120)))
+    );
+
+    let failed = LimiterState::default();
+    assert_eq!(
+        limiter.pre_call(&failed, facts(tpm, Some(500)), None).await,
+        None
+    );
+    limiter
+        .post_call_failure(&failed, PostCallFailureFacts { tpm_actual: 0 })
+        .await;
+    assert_eq!(
+        count(&store, "api_key", "k", Kind::Tokens),
+        Some(Local::Number(Number::Int(120)))
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_tpm_refusal_releases_the_slot_and_names_tokens() {
+    let (limiter, _, _) = limiter(true);
+    let both = descriptors(
+        json!([{"key": "api_key", "value": "k", "rate_limit": {"tokens_per_unit": 100, "max_parallel_requests": 1}}]),
+    );
+    let state = LimiterState::default();
+    let refused = limiter
+        .pre_call(&state, facts(both.clone(), Some(500)), None)
+        .await
+        .unwrap();
+    assert_eq!(refused.headers["rate_limit_type"], "tokens");
+    assert!(state.snapshot().parallel_slot.is_none());
+    assert!(state.snapshot().first_pass_admitted);
+    assert_eq!(
+        limiter
+            .pre_call(&LimiterState::default(), facts(both, Some(50)), None)
+            .await,
+        None
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn the_memory_precheck_refuses_after_the_window_until_the_memory_entry_expires() {
+    let (limiter, _, clock) = limiter(true);
+    let rpm =
+        descriptors(json!([{"key": "user", "value": "u", "rate_limit": {"requests_per_unit": 1}}]));
+    assert_eq!(
+        limiter
+            .pre_call(&LimiterState::default(), facts(rpm.clone(), None), None)
+            .await,
+        None
+    );
+    assert!(
+        limiter
+            .pre_call(&LimiterState::default(), facts(rpm.clone(), None), None)
+            .await
+            .is_some()
+    );
+    clock
+        .0
+        .store((1_700_000_061.0_f64).to_bits(), Ordering::SeqCst);
+    assert!(
+        limiter
+            .pre_call(&LimiterState::default(), facts(rpm, None), None)
+            .await
+            .is_some()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn the_statuses_reach_the_logging_payload_headers() {
+    let (limiter, _, _) = limiter(true);
+    let rpm = descriptors(
+        json!([{"key": "api_key", "value": "k", "rate_limit": {"requests_per_unit": 5}}]),
+    );
+    let state = Arc::new(LimiterState::default());
+    assert_eq!(limiter.pre_call(&state, facts(rpm, None), None).await, None);
+    let response = state.snapshot().rate_limit_response.unwrap();
+    assert_eq!(response.overall, Code::Ok);
+    let headers = litellm_callbacks_parallel_request_limiter::header_map(&response.statuses);
+    assert_eq!(headers["x-ratelimit-api_key-remaining-requests"], json!(4));
+}
