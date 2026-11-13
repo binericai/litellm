@@ -550,7 +550,7 @@ from litellm.integrations.custom_logger_v2.legacy import (
     run_subscribers,
 )
 from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2
-from litellm.integrations.custom_logger_v2.outcomes import Patch
+from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 
 ####### ENVIRONMENT VARIABLES ####################
 # Adjust to your specific application needs / system capabilities.
@@ -766,6 +766,15 @@ def _is_same_registered_custom_logger(existing: object, callback_class: CustomLo
     """
     return type(existing) is type(callback_class) and getattr(existing, "callback_name", None) == getattr(
         callback_class, "callback_name", None
+    )
+
+
+def _same_v2_callback(existing: object, callback: object) -> bool:
+    return (
+        isinstance(existing, CustomLoggerV2)
+        and isinstance(callback, CustomLoggerV2)
+        and litellm.logging_callback_manager.get_custom_logger_key(existing)
+        == litellm.logging_callback_manager.get_custom_logger_key(callback)
     )
 
 
@@ -1331,7 +1340,8 @@ def function_setup(
                             llm_router=None,
                         )
                         if callback is None or any(
-                            type(cb) is type(callback) for cb in litellm._async_success_callback
+                            type(cb) is type(callback) or _same_v2_callback(cb, callback)
+                            for cb in litellm._async_success_callback
                         ):  # don't double add a callback
                             continue
                     if callback not in litellm.input_callback:
@@ -2035,11 +2045,16 @@ async def async_post_call_failure_deployment_hook(
         and (subscribers := hook_subscribers(Hook.post_deployment_failure, callbacks, admit=Admit.every_logger)).has_v2
     ):
         fields: Final = ResultFields(safe_request_data, PROXY_REQUEST_KEYS, Field.error, safe_exception)
-        _ = kwargs_after(
-            await run_subscribers(
-                subscribers, fields, partial(_start_post_deployment_failure, fields, typed_call_type, fallback_depth)
-            )
+        result: Final = await run_subscribers(
+            subscribers, fields, partial(_start_post_deployment_failure, fields, typed_call_type, fallback_depth)
         )
+        if isinstance(result.outcome, Abort):
+            verbose_logger.debug(
+                "async_post_call_failure_deployment_hook: a v2 abort keeps the original failure: %s",
+                result.outcome.message,
+            )
+            return
+        _ = kwargs_after(result)
         return
     for callback in callbacks:
         if isinstance(callback, CustomLogger):
