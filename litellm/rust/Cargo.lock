@@ -3693,6 +3693,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "litellm-callbacks-budgets"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "litellm-callbacks",
+ "litellm-python-compat",
+ "litellm-redis-store",
+ "rstest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "litellm-callbacks-legacy-python"
 version = "0.1.0"
 dependencies = [
