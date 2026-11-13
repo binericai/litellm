@@ -27,6 +27,7 @@ from litellm.integrations.custom_logger_v2.legacy import (
     kwargs_after,
     run_subscribers,
 )
+from litellm.integrations.custom_logger_v2.native import ABORT_ERRORS
 from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks import parallel_request_limiter_v3
@@ -480,6 +481,20 @@ async def test_the_group_is_held_to_its_deployments_requests(monkeypatch: pytest
     python: Final = await _differential(monkeypatch, isolated, router, steps, [("model_saturation_check", "capped")])
     refusals: Final = [step[0].raised for step in python[:5] if step[0].raised is not None]
     assert len(refusals) == 2
+
+
+async def test_capacity_refusals_keep_their_own_error_beside_the_parallel_limiters(
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock
+):
+    def limiters_refusal(_wire: object) -> Exception:
+        return RuntimeError("the parallel limiter's refusal")
+
+    monkeypatch.setitem(ABORT_ERRORS, "proxy_rate_limit", limiters_refusal)
+    router: Final = _router(("capped", None, 1))
+    steps: Final = [Step(Request(_key("a"), "capped", f"k{i}")) for i in range(2)]
+    python: Final = await _differential(monkeypatch, isolated, router, steps, [("model_saturation_check", "capped")])
+    assert python[1][0].raised[0] == "ProxyRateLimitError", python[1]
+    assert ABORT_ERRORS["proxy_rate_limit"] is limiters_refusal
 
 
 async def test_busy_groups_hold_priorities_to_their_share_and_tokens_settle(

@@ -75,6 +75,8 @@ UNLICENSED_PRIORITY_MESSAGE: Final = (
     ".env to enable this.\nGet a license: https://docs.litellm.ai/docs/enterprise."
 )
 _METADATA_BUCKETS: Final = ("metadata", "litellm_metadata")
+RATE_LIMIT_KIND: Final = "model_capacity_rate_limit"
+RERAISE_KIND: Final = "model_capacity_reraise"
 _TOKENS: Final = count(1)
 
 
@@ -637,10 +639,6 @@ def _reraise(wire: WireAbort) -> Exception:
     return HTTPException(status_code=wire.status, detail={"error": wire.message}, headers=dict(wire.headers))
 
 
-register_abort_error("proxy_rate_limit", _rate_limit_error)
-register_abort_error("reraise", _reraise)
-
-
 def _native_answer(answer: Mapping[str, object], live: LiveRequest) -> Mapping[str, object]:
     raised_token: Final = answer.get("raised")
     if isinstance(raised_token, int) and raised_token in live.raised:
@@ -739,6 +737,8 @@ def build_native_dynamic_rate_limiter(
 ) -> NativeDynamicRateLimiter:
     from litellm.rust_bridge._native import NativeModelCapacity
 
+    register_abort_error(RATE_LIMIT_KIND, _rate_limit_error)
+    register_abort_error(RERAISE_KIND, _reraise)
     v3_limiter: Final = PROXY_MaxParallelRequestsHandler_v3(
         InternalUsageCache(dual_cache=internal_usage_cache),
         time_provider=time_provider,  # pyright: ignore[reportArgumentType]  # the handler's clock

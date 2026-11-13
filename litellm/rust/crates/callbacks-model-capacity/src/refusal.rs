@@ -11,8 +11,8 @@ use crate::{
     pyfmt,
 };
 
-pub const PROXY_RATE_LIMIT_ERROR: &str = "proxy_rate_limit";
-pub const RERAISE: &str = "reraise";
+pub const RATE_LIMIT_ERROR: &str = "model_capacity_rate_limit";
+pub const RERAISE: &str = "model_capacity_reraise";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Refusal {
@@ -52,7 +52,7 @@ impl Refusal {
         Abort {
             headers,
             error: Some(AbortError {
-                kind: PROXY_RATE_LIMIT_ERROR.into(),
+                kind: RATE_LIMIT_ERROR.into(),
                 fields: fields.as_object().cloned().unwrap_or_default(),
             }),
             ..Abort::new(429, message)
