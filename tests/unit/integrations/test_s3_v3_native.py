@@ -741,3 +741,67 @@ async def test_an_acompletion_reaches_both_loggers_alike(
     expected: Final = 0 if no_log and not global_disable else 1
     _assert_same_puts(buckets, expected)
     assert all(put.path.startswith("/logs/team-a/") for put in buckets[1].puts())
+
+
+class _Mutating:
+    def __init__(self, target: dict[str, object]) -> None:
+        self.target: Final = target
+
+    def __str__(self) -> str:
+        self.target[f"grown-{len(self.target)}"] = True
+        return "mutating"
+
+
+@pytest.mark.asyncio
+async def test_a_payload_that_changes_while_it_is_rendered_is_kept_for_retry_by_both_loggers(
+    buckets: tuple[FakeBucket, FakeBucket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, {})
+    payloads: Final = (_payload("racing"), _payload("racing"))
+    for payload in payloads:
+        metadata = payload["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["mutating"] = _Mutating(metadata)  # pyright: ignore[reportUnknownArgumentType]  # the metadata dict _payload builds
+    with (
+        patch.object(S3Logger, "handle_callback_failure") as python_failures,
+        patch.object(s3_v3._Host, "callback_failed") as rust_failures,
+    ):
+        await _log_each(python_logger, rust_logger, payloads)
+        await _log(python_logger, rust_logger, _payload("steady"))
+        await _flush(python_logger, rust_logger)
+        await asyncio.sleep(0.2)
+    assert rust_logger.sink.queued_keys() == [element.s3_object_key for element in python_logger.log_queue]
+    assert len(rust_logger.sink.queued_keys()) == 1
+    assert python_failures.call_count == rust_failures.call_count == 1
+    _assert_same_puts(buckets, 1)
+    assert not rust_logger.periodic_flush_task.done()
+
+
+class _FlakySink:
+    def __init__(self, failures: tuple[BaseException, ...]) -> None:
+        self.failures: Final = list(failures)
+        self.flushed = 0
+
+    async def flush(self) -> None:
+        self.flushed += 1
+        if self.failures:
+            raise self.failures.pop(0)
+
+
+class _Panic(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_the_periodic_flush_keeps_running_after_a_flush_fails() -> None:
+    sink: Final = _FlakySink((RuntimeError("bucket gone"), _Panic("a PanicException is a BaseException too")))
+    task: Final = asyncio.create_task(s3_v3._periodic_flush(sink, 0.01))  # pyright: ignore[reportArgumentType]  # the loop only calls flush
+    for _ in range(100):
+        if sink.flushed >= 3:
+            break
+        await asyncio.sleep(0.01)
+    assert sink.flushed >= 3
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

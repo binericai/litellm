@@ -2,12 +2,13 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use litellm_callbacks_s3_log::{Constants, Host, S3Log, S3LogParts, Settings};
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -22,7 +23,10 @@ struct Recorder {
     next: AtomicU64,
     payloads: Mutex<HashMap<u64, Option<String>>>,
     region: Mutex<Option<Result<Option<String>, String>>>,
+    region_panics: AtomicBool,
 }
+
+const PANICS: &str = "panics while rendering";
 
 impl Recorder {
     fn stash(&self, body: Option<&str>) -> u64 {
@@ -59,11 +63,27 @@ impl Host for Recorder {
         false
     }
 
-    fn render(&self, payload: u64) -> Result<Bytes, String> {
-        match self.payloads.lock().unwrap().get(&payload) {
-            Some(Some(body)) => Ok(Bytes::from(body.clone())),
-            _ => Err("the payload cannot be encoded".to_owned()),
-        }
+    fn render(&self, payloads: Vec<u64>) -> BoxFuture<'static, Result<Vec<Bytes>, String>> {
+        let bodies: Vec<Option<String>> = payloads
+            .iter()
+            .map(|payload| {
+                self.payloads
+                    .lock()
+                    .unwrap()
+                    .get(payload)
+                    .cloned()
+                    .flatten()
+            })
+            .collect();
+        let rendered = bodies
+            .into_iter()
+            .map(|body| match body {
+                Some(body) if body == PANICS => panic!("dictionary changed size during iteration"),
+                Some(body) => Ok(Bytes::from(body)),
+                None => Err("the payload cannot be encoded".to_owned()),
+            })
+            .collect();
+        Box::pin(std::future::ready(rendered))
     }
 
     fn release(&self, payload: u64) {
@@ -71,6 +91,10 @@ impl Host for Recorder {
     }
 
     fn region_from_environment(&self) -> Result<Option<String>, String> {
+        assert!(
+            !self.region_panics.load(Ordering::Relaxed),
+            "the host panicked"
+        );
         self.region.lock().unwrap().clone().unwrap_or(Ok(None))
     }
 
@@ -381,4 +405,84 @@ async fn a_reply_slower_than_the_attempt_timeout_is_retried_then_kept() {
     assert_eq!(server.received_requests().await.unwrap().len(), 3);
     assert_eq!(sink.queued_keys().len(), 1);
     assert_eq!(host.failures(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_panic_while_rendering_keeps_that_object_and_the_flush_goes_on() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (sink, host) = sink(&server, json!({}));
+    let racing = host.stash(Some(PANICS));
+    sink.submit(&event_with(racing, "a"));
+    sink.submit(&event(&host, "b", "{}"));
+    sink.flush().await;
+
+    let paths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|put| put.url.path().to_owned())
+        .collect();
+    assert_eq!(paths, ["/logs/base/2026-11-13/time-09-05-07-000042_b.json"]);
+    assert_eq!(
+        sink.queued_keys(),
+        ["base/2026-11-13/time-09-05-07-000042_a.json"]
+    );
+    assert_eq!(host.failures(), 1);
+
+    host.rewrite(racing, "{}");
+    sink.flush().await;
+    assert!(sink.queued_keys().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_panic_while_rendering_a_batch_file_keeps_the_whole_queue() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (sink, host) = sink(&server, json!({"s3_batch_file_upload": true}));
+    let racing = host.stash(Some(PANICS));
+    sink.submit(&event_with(racing, "a"));
+    sink.submit(&event(&host, "b", "{}"));
+    sink.flush().await;
+
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(sink.queued_keys().len(), 2);
+
+    host.rewrite(racing, "{}");
+    sink.flush().await;
+    assert!(sink.queued_keys().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_panic_in_a_host_call_keeps_the_object_and_later_flushes_deliver_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (sink, host) = sink(&server, json!({"s3_region_name": null}));
+    host.region_panics.store(true, Ordering::Relaxed);
+    sink.submit(&event(&host, "a", "{}"));
+    sink.flush().await;
+
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(sink.queued_keys().len(), 1);
+    assert_eq!(host.failures(), 1);
+
+    host.region_panics.store(false, Ordering::Relaxed);
+    sink.flush().await;
+    assert!(sink.queued_keys().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

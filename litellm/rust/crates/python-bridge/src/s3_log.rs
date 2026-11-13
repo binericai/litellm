@@ -8,26 +8,89 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 
 use litellm_callbacks::Callback;
 use litellm_callbacks_python::NativeCallback;
 use litellm_callbacks_s3_log::{
-    Constants, Host, S3Log, S3LogParts, Settings, float_repr, python_backoff, system_clock,
-    write_str,
+    Constants, Host, S3Log, S3LogParts, Settings, float_repr, panic_message, python_backoff,
+    system_clock, write_str,
 };
 use litellm_host_python::{from_py, json_from_py};
 use litellm_http::ClientVariant;
 use pyo3::{
     exceptions::PyValueError,
     prelude::*,
-    types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple},
+    types::{PyBool, PyCFunction, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple},
 };
+use tokio::sync::oneshot;
+
+type Payloads = Arc<Mutex<HashMap<u64, Py<PyAny>>>>;
+type Rendered = Result<Vec<Bytes>, String>;
+
+tokio::task_local! {
+    static RENDER_LOOP: Option<Arc<Py<PyAny>>>;
+}
 
 struct PythonHost {
     host: Arc<Py<PyAny>>,
-    payloads: Mutex<HashMap<u64, Py<PyAny>>>,
+    payloads: Payloads,
     next: AtomicU64,
     max_depth: usize,
+}
+
+fn encode_all(py: Python<'_>, payloads: &Payloads, ids: &[u64], max_depth: usize) -> Rendered {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ids.iter()
+            .map(|id| {
+                let value = payloads
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(id)
+                    .map(|value| value.clone_ref(py))
+                    .ok_or_else(|| "the payload was already released".to_owned())?;
+                let mut out = Vec::new();
+                Encoder::new(py, max_depth)
+                    .and_then(|mut encoder| encoder.encode(value.bind(py), 0, &mut out))
+                    .map_err(|error| error.to_string())?;
+                Ok(Bytes::from(out))
+            })
+            .collect()
+    }))
+    .unwrap_or_else(|panic| Err(panic_message(panic.as_ref())))
+}
+
+fn render_on_loop(
+    py: Python<'_>,
+    event_loop: &Py<PyAny>,
+    payloads: Payloads,
+    ids: Vec<u64>,
+    max_depth: usize,
+    reply: oneshot::Sender<Rendered>,
+) -> PyResult<()> {
+    let reply = Mutex::new(Some(reply));
+    let render = PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, PyTuple>, _: Option<&Bound<'_, PyDict>>| {
+            let rendered = encode_all(args.py(), &payloads, &ids, max_depth);
+            if let Some(reply) = reply.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                drop(reply.send(rendered));
+            }
+        },
+    )?;
+    event_loop
+        .bind(py)
+        .call_method1("call_soon_threadsafe", (render,))?;
+    Ok(())
+}
+
+fn running_loop(py: Python<'_>) -> Option<Arc<Py<PyAny>>> {
+    py.import("asyncio")
+        .and_then(|asyncio| asyncio.call_method0("get_running_loop"))
+        .ok()
+        .map(|event_loop| Arc::new(event_loop.unbind()))
 }
 
 impl PythonHost {
@@ -83,20 +146,30 @@ impl Host for PythonHost {
         })
     }
 
-    fn render(&self, payload: u64) -> Result<Bytes, String> {
-        Python::attach(|py| {
-            let value = self
-                .payloads
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&payload)
-                .map(|value| value.clone_ref(py))
-                .ok_or_else(|| "the payload was already released".to_owned())?;
-            let mut out = Vec::new();
-            Encoder::new(py, self.max_depth)
-                .and_then(|mut encoder| encoder.encode(value.bind(py), 0, &mut out))
+    fn render(&self, ids: Vec<u64>) -> BoxFuture<'static, Rendered> {
+        let payloads = Arc::clone(&self.payloads);
+        let max_depth = self.max_depth;
+        let event_loop = RENDER_LOOP.try_with(Clone::clone).ok().flatten();
+        Box::pin(async move {
+            let Some(event_loop) = event_loop else {
+                return tokio::task::spawn_blocking(move || {
+                    Python::attach(|py| encode_all(py, &payloads, &ids, max_depth))
+                })
+                .await
                 .map_err(|error| error.to_string())?;
-            Ok(Bytes::from(out))
+            };
+            let (reply, rendered) = oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    render_on_loop(py, &event_loop, payloads, ids, max_depth, reply)
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            rendered
+                .await
+                .map_err(|_| "the event loop closed before the payload was rendered".to_owned())?
         })
     }
 
@@ -324,7 +397,7 @@ impl NativeS3Log {
         let constants: Constants = from_py(constants)?;
         let host = Arc::new(PythonHost {
             host: Arc::new(host),
-            payloads: Mutex::default(),
+            payloads: Payloads::default(),
             next: AtomicU64::new(0),
             max_depth,
         });
@@ -387,10 +460,14 @@ impl NativeS3Log {
         id: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let sink = Arc::clone(&self.sink);
-        crate::execution::run_async_value(py, async move {
-            sink.submit_audit(payload, &id).await;
-            Ok(())
-        })
+        let event_loop = running_loop(py);
+        crate::execution::run_async_value(
+            py,
+            RENDER_LOOP.scope(event_loop, async move {
+                sink.submit_audit(payload, &id).await;
+                Ok(())
+            }),
+        )
     }
 
     fn upload_line_items<'py>(
@@ -418,9 +495,13 @@ impl NativeS3Log {
 
     fn flush<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let sink = Arc::clone(&self.sink);
-        crate::execution::run_async_value(py, async move {
-            sink.flush().await;
-            Ok(())
-        })
+        let event_loop = running_loop(py);
+        crate::execution::run_async_value(
+            py,
+            RENDER_LOOP.scope(event_loop, async move {
+                sink.flush().await;
+                Ok(())
+            }),
+        )
     }
 }

@@ -8,6 +8,7 @@ use std::{
 
 use base64::Engine;
 use bytes::Bytes;
+use futures_util::FutureExt;
 use litellm_auth_aws::{AwsAuthService, Credentials};
 use litellm_s3::signed::{Reply, SendError, SignedRequest, send};
 use reqwest::Method;
@@ -74,23 +75,61 @@ pub struct Object {
 pub async fn on_host<T: Send + 'static>(
     host: &Arc<dyn Host>,
     call: impl FnOnce(&dyn Host) -> T + Send + 'static,
-) -> T {
+) -> Result<T, String> {
     let host = Arc::clone(host);
-    match tokio::task::spawn_blocking(move || call(host.as_ref())).await {
-        Ok(value) => value,
-        Err(error) => std::panic::resume_unwind(error.into_panic()),
-    }
+    tokio::task::spawn_blocking(move || call(host.as_ref()))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".to_owned())
+}
+
+pub async fn render_bodies(bodies: &[&Body]) -> Result<Vec<Bytes>, String> {
+    let stashed: Vec<&Arc<Stash>> = bodies
+        .iter()
+        .filter_map(|body| match body {
+            Body::Stashed(stash) => Some(stash),
+            Body::Ready(_) => None,
+        })
+        .collect();
+    let mut rendered = match stashed.first() {
+        Some(first) => {
+            let ids = stashed.iter().map(|stash| stash.id).collect();
+            let host = Arc::clone(&first.host);
+            let encoded = std::panic::AssertUnwindSafe(async move { host.render(ids).await })
+                .catch_unwind()
+                .await
+                .map_err(|panic| panic_message(panic.as_ref()))??;
+            if encoded.len() != stashed.len() {
+                return Err("the host rendered a different number of payloads".to_owned());
+            }
+            encoded.into_iter()
+        }
+        None => Vec::new().into_iter(),
+    };
+    bodies
+        .iter()
+        .map(|body| match body {
+            Body::Ready(bytes) => Ok(bytes.clone()),
+            Body::Stashed(_) => rendered
+                .next()
+                .ok_or_else(|| "the host rendered too few payloads".to_owned()),
+        })
+        .collect()
 }
 
 impl Body {
     pub async fn render(&self) -> Result<Bytes, String> {
-        match self {
-            Self::Ready(bytes) => Ok(bytes.clone()),
-            Self::Stashed(stash) => {
-                let id = stash.id;
-                on_host(&stash.host, move |host| host.render(id)).await
-            }
-        }
+        render_bodies(&[self])
+            .await?
+            .pop()
+            .ok_or_else(|| "the host rendered no payload".to_owned())
     }
 }
 
@@ -190,7 +229,9 @@ impl Uploader {
         let credentials = self.credentials().await?;
         let from_environment = match self.settings.region_name {
             Some(_) => Ok(None),
-            None => on_host(&self.host, |host| host.region_from_environment()).await,
+            None => on_host(&self.host, |host| host.region_from_environment())
+                .await
+                .and_then(|region| region),
         };
         let region = self.settings.signing_region(|| from_environment)?;
         let sent = send(

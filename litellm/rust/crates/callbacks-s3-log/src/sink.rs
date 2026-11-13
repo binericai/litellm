@@ -5,7 +5,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::future::{BoxFuture, join_all};
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, join_all},
+};
 use litellm_auth_aws::AwsAuthService;
 use litellm_callbacks::{
     Activation, Callback, Field, FieldSet, Hook, HookInput, HookOutput, Manifest, OptOutBy,
@@ -19,7 +22,9 @@ use crate::{
     key::{Stamp, download_name, logging_id, object_key, parent},
     limiter::Limiter,
     settings::{Environment, Granularity, Settings},
-    upload::{Backoff, Body, Clock, Object, Outcome, Stash, Uploader},
+    upload::{
+        Backoff, Body, Clock, Object, Outcome, Stash, Uploader, panic_message, render_bodies,
+    },
 };
 
 pub const NAME: &str = "s3_v2";
@@ -29,7 +34,7 @@ const NDJSON: &str = "application/x-ndjson";
 pub trait Host: Send + Sync {
     fn callback_failed(&self);
     fn cold_storage_is_s3_v2(&self) -> bool;
-    fn render(&self, payload: u64) -> Result<Bytes, String>;
+    fn render(&self, payloads: Vec<u64>) -> BoxFuture<'static, Result<Vec<Bytes>, String>>;
     fn release(&self, payload: u64);
     fn region_from_environment(&self) -> Result<Option<String>, String>;
     fn web_identity_token(&self, reference: &str) -> Result<String, String>;
@@ -319,9 +324,19 @@ impl S3Log {
             (queue.items.clone(), queue.requeued)
         };
         let length = batch.len();
-        if self.send_batch(batch, requeued).await {
-            self.queue().items.drain(..length);
-            return;
+        match std::panic::AssertUnwindSafe(self.send_batch(batch, requeued))
+            .catch_unwind()
+            .await
+        {
+            Ok(true) => {
+                self.queue().items.drain(..length);
+                return;
+            }
+            Ok(false) => {}
+            Err(panic) => tracing::error!(
+                "CustomLogger: async_send_batch raised; preserving {length} events in queue for retry: {}",
+                panic_message(panic.as_ref())
+            ),
         }
         let max_queue_size = self.settings().max_queue_size;
         let mut queue = self.queue();
@@ -356,15 +371,21 @@ impl S3Log {
                 .or_default()
                 .push(element);
         }
+        let bodies: Vec<&Body> = groups
+            .values()
+            .flatten()
+            .map(|element| &element.object.body)
+            .collect();
+        let mut rendered = render_bodies(&bodies).await?.into_iter();
         let mut files = Vec::with_capacity(groups.len());
         for (folder, elements) in groups {
             let name = format!("batch_{}_{}", now.clock(), uuid::Uuid::new_v4().simple());
             let mut body = Vec::new();
-            for (index, element) in elements.iter().enumerate() {
+            for index in 0..elements.len() {
                 if index > 0 {
                     body.push(b'\n');
                 }
-                body.extend_from_slice(&element.object.body.render().await?);
+                body.extend_from_slice(&rendered.next().unwrap_or_default());
             }
             files.push(Element {
                 object: Object {

@@ -180,7 +180,12 @@ def project_kwargs(sink: "NativeS3Log", kwargs: object) -> object:
 async def _periodic_flush(sink: "NativeS3Log", interval: float) -> None:
     while True:
         await asyncio.sleep(interval)
-        await sink.flush()
+        try:
+            await sink.flush()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:  # noqa: BLE001  # a failed flush keeps the queue and the next interval tries again, as flush_queue does
+            verbose_logger.exception("CustomLogger: periodic flush failed: %s", e)
 
 
 class S3LoggerV3(NativeLogger):
