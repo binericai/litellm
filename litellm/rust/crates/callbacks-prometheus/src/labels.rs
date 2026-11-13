@@ -202,7 +202,73 @@ pub struct LabelValues {
     pub custom_metadata_labels: Vec<(String, String)>,
 }
 
+pub const ENUM_FIELDS: [&str; 37] = [
+    "end_user",
+    "user",
+    "user_email",
+    "user_alias",
+    "hashed_api_key",
+    "api_key_alias",
+    "team",
+    "team_alias",
+    "project_id",
+    "project_alias",
+    "model_group",
+    "requested_model",
+    "model",
+    "litellm_model_name",
+    "model_id",
+    "api_base",
+    "api_provider",
+    "exception_status",
+    "exception_class",
+    "rate_limit_category",
+    "rate_limit_type",
+    "reason",
+    "priority",
+    "status_code",
+    "fallback_model",
+    "route",
+    "client_ip",
+    "user_agent",
+    "stream",
+    "org_id",
+    "org_alias",
+    "mcp_tool_name",
+    "mcp_server_name",
+    "service_tier",
+    "input_sequence_length",
+    "tags",
+    "custom_metadata_labels",
+];
+
 impl LabelValues {
+    pub fn from_enum(values: &Map<String, Value>) -> Self {
+        let tags = match values.get("tags") {
+            Some(Value::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        };
+        let custom_metadata_labels = values
+            .get("custom_metadata_labels")
+            .and_then(is_py_dict)
+            .map(|map| {
+                map.iter()
+                    .map(|(key, value)| (key.clone(), py_str(value)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fields = ENUM_FIELDS
+            .iter()
+            .filter(|name| !matches!(**name, "tags" | "custom_metadata_labels"))
+            .map(|name| (*name, values.get(*name).cloned().unwrap_or(Value::Null)))
+            .collect();
+        Self {
+            fields,
+            tags,
+            custom_metadata_labels,
+        }
+    }
+
     #[must_use]
     pub fn with(mut self, field: &'static str, value: Value) -> Self {
         self.fields.insert(field, value);

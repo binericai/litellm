@@ -2,11 +2,14 @@ use std::sync::Arc;
 
 use litellm_callbacks_prometheus::{
     FamilySpec, Kind, ManualClock, Op, Prometheus, SeriesLimits, Store, StoreError, SystemClock,
-    Target, exposition::encode_text, store::Clock,
+    Target,
+    exposition::encode_text,
+    ops::{self, ErrorKind, OpError},
+    store::Clock,
 };
 use litellm_callbacks_python::NativeCallback;
 use pyo3::{
-    exceptions::{PyKeyError, PyRuntimeError, PyValueError},
+    exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
     types::{PyDict, PyFloat, PyTuple},
 };
@@ -27,6 +30,15 @@ fn store_error(error: StoreError) -> PyErr {
     match error {
         StoreError::MostRecent(_) => PyRuntimeError::new_err(error.to_string()),
         _ => PyValueError::new_err(error.to_string()),
+    }
+}
+
+fn op_error(error: OpError) -> PyErr {
+    match error.kind {
+        ErrorKind::Value => PyValueError::new_err(error.message),
+        ErrorKind::Key => PyKeyError::new_err(error.message),
+        ErrorKind::Type => PyTypeError::new_err(error.message),
+        ErrorKind::Runtime => PyRuntimeError::new_err(error.message),
     }
 }
 
@@ -184,6 +196,10 @@ impl NativePrometheusStore {
                 )
             })
             .collect()
+    }
+
+    fn op(&self, name: &str, facts: &str) -> PyResult<()> {
+        ops::apply(&self.store, name, facts).map_err(op_error)
     }
 
     #[pyo3(signature = (created=true))]

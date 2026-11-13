@@ -8,7 +8,7 @@ import math
 import os
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from functools import partial
 from types import MappingProxyType
@@ -185,6 +185,17 @@ class _CustomerBudgetRow(Protocol):
 
 def _customer_budget_metrics_enabled() -> bool:
     return litellm.enable_end_user_cost_tracking_prometheus_only is True and not litellm.disable_end_user_cost_tracking
+
+
+@dataclass(frozen=True)
+class DeploymentFailureLabels:
+    enum_values: UserAPIKeyLabelValues
+    deployment_selected: bool
+    litellm_model_name: str
+    model_id: str | None
+    api_base: str | None
+    api_provider: str
+    has_exception: bool
 
 
 class _LabeledMetric:
@@ -1916,15 +1927,14 @@ class PrometheusLogger(CustomLogger):
         )
 
         # set proxy virtual key rpm/tpm metrics
-        self._set_virtual_key_rate_limit_metrics(
-            user_api_key=user_api_key,
-            user_api_key_alias=user_api_key_alias,
-            kwargs=kwargs,
-            metadata=_metadata,
-            model_id=enum_values.model_id,
-        )
-
         if self._native_store is None:
+            self._set_virtual_key_rate_limit_metrics(
+                user_api_key=user_api_key,
+                user_api_key_alias=user_api_key_alias,
+                kwargs=kwargs,
+                metadata=_metadata,
+                model_id=enum_values.model_id,
+            )
             self._set_v3_rate_limit_allowed_and_used_metrics(
                 standard_logging_payload=standard_logging_payload,  # pyright: ignore[reportArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
                 enum_values=enum_values,
@@ -1952,14 +1962,15 @@ class PrometheusLogger(CustomLogger):
             )
 
         # set x-ratelimit headers
-        self.set_llm_deployment_success_metrics(
-            kwargs,
-            start_time,
-            end_time,
-            enum_values,
-            output_tokens,
-            label_context=label_context,
-        )
+        if self._native_store is None:
+            self.set_llm_deployment_success_metrics(
+                kwargs,
+                start_time,
+                end_time,
+                enum_values,
+                output_tokens,
+                label_context=label_context,
+            )
 
         # Provider-agnostic fallback: providers like Bedrock and Vertex don't return
         # x-ratelimit-remaining-* headers, so the gauges above only fire for OpenAI /
@@ -2529,6 +2540,9 @@ class PrometheusLogger(CustomLogger):
         self.litellm_zero_cost_requests_total.labels(**labels).inc()
 
     def set_spend_capture_rate(self, api_provider: str, capture_rate: float | None) -> None:
+        if self._native_store is not None:
+            self._native_store.op("spend_capture_rate", {"api_provider": api_provider, "capture_rate": capture_rate})
+            return
         labels: Final = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric("litellm_spend_capture_rate"),
             enum_values=UserAPIKeyLabelValues(api_provider=api_provider),
@@ -2969,18 +2983,19 @@ class PrometheusLogger(CustomLogger):
                     )
                 ),
             )
-            PrometheusLogger._inc_labeled_counter(
-                self,
-                self.litellm_llm_api_failed_requests_metric,
-                "litellm_llm_api_failed_requests_metric",
-                enum_values,
-            )
-            self._increment_zero_cost_requests_metric(
-                zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
-                enum_values=enum_values,
-                label_context=PrometheusLabelFactoryContext(enum_values),
-            )
-            self.set_llm_deployment_failure_metrics(kwargs)
+            if self._native_store is None:
+                PrometheusLogger._inc_labeled_counter(
+                    self,
+                    self.litellm_llm_api_failed_requests_metric,
+                    "litellm_llm_api_failed_requests_metric",
+                    enum_values,
+                )
+                self._increment_zero_cost_requests_metric(
+                    zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
+                    enum_values=enum_values,
+                    label_context=PrometheusLabelFactoryContext(enum_values),
+                )
+                self.set_llm_deployment_failure_metrics(kwargs)
             failure_metadata: Final = _REQUEST_METADATA_ADAPTER.validate_python(
                 get_litellm_metadata_from_kwargs(kwargs)
             )
@@ -3298,6 +3313,9 @@ class PrometheusLogger(CustomLogger):
                 api_provider=api_provider,
                 stream=(str(request_data.get("stream")) if litellm.prometheus_emit_stream_label else None),
             )
+            if self._native_store is not None:
+                self._native_store.op("proxy_failure", {"values": enum_values.model_dump()})
+                return
             _label_ctx: Final = PrometheusLabelFactoryContext(enum_values)
             PrometheusLogger._inc_labeled_counter(
                 self,
@@ -3425,6 +3443,114 @@ class PrometheusLogger(CustomLogger):
             "user_agent": _metadata.get("user_agent") or _litellm_params_metadata.get("user_agent"),
         }
 
+    def deployment_failure_labels(
+        self,
+        request_kwargs: dict,  # pyright: ignore[reportMissingTypeArgument, reportUnknownParameterType]  # the legacy logging kwargs are untyped  # mutable-ok: the legacy helpers below take the logging kwargs dict
+    ) -> DeploymentFailureLabels | None:
+        verbose_logger.debug("setting remaining tokens requests metric")
+        standard_logging_payload: Final[StandardLoggingPayload] = request_kwargs.get("standard_logging_object", {})
+        _litellm_params: Final = request_kwargs.get("litellm_params", {}) or {}
+        litellm_model_name: Final = request_kwargs.get("model", None)
+        model_group = standard_logging_payload.get("model_group", None)
+        api_base: Final = standard_logging_payload.get("api_base", None)
+        model_id = standard_logging_payload.get("model_id", None)
+        exception: Final = request_kwargs.get("exception", None)
+
+        # Fallback: model_id from litellm_metadata.model_info
+        if model_id is None:
+            _model_info: Final = (
+                (_litellm_params.get("litellm_metadata") or {}).get("model_info")
+                or (_litellm_params.get("metadata") or {}).get("model_info")
+                or {}
+            )
+            model_id = _model_info.get("id")
+
+        # Fallback: model_group from litellm_metadata
+        if model_group is None:
+            model_group = (_litellm_params.get("litellm_metadata") or {}).get("model_group") or (
+                _litellm_params.get("metadata") or {}
+            ).get("model_group")
+
+        llm_provider: Final = _litellm_params.get("custom_llm_provider", None)
+
+        if self._should_skip_metrics_for_invalid_key(
+            kwargs=request_kwargs,
+            standard_logging_payload=standard_logging_payload,
+        ):
+            return None
+
+        # Extract context labels from all available sources (fix for None labels)
+        fallback_values: Final = self._extract_deployment_failure_label_values(request_kwargs)
+        _metadata: Final = standard_logging_payload.get("metadata", {}) or {}
+        hashed_api_key: Final = fallback_values.get("hashed_api_key") or _metadata.get("user_api_key_hash")
+        api_key_alias: Final = fallback_values.get("api_key_alias") or _metadata.get("user_api_key_alias")
+        user_email: Final = fallback_values.get("user_email")
+        team: Final = fallback_values.get("team") or _metadata.get("user_api_key_team_id")
+        team_alias: Final = fallback_values.get("team_alias") or _metadata.get("user_api_key_team_alias")
+        client_ip: Final = fallback_values.get("client_ip") or _metadata.get("requester_ip_address")
+        user_agent: Final = fallback_values.get("user_agent") or _metadata.get("user_agent")
+
+        # exception_status: prefer status_code, fallback to exception class for known types
+        exception_status = None
+        if exception is not None:
+            exception_status = str(getattr(exception, "status_code", None))
+            if exception_status == "None" or not exception_status:
+                code: Final[object] = getattr(exception, "code", None)
+                if code is not None:
+                    exception_status = str(code)
+
+        # On LiteLLM-side rejects (no deployment picked), route request_kwargs["model"]
+        # into requested_model and leave deployment-scoped labels empty.
+        deployment_selected: Final = (
+            bool(model_id)
+            and not _litellm_params.get(PROXY_REJECTED_BEFORE_ROUTING_KEY)
+            and not isinstance(exception, MalformedRequestFieldError)
+        )
+        if deployment_selected:
+            label_litellm_model_name = litellm_model_name
+            label_model_id = model_id
+            label_api_base = api_base
+            label_api_provider = self._extract_deployment_api_provider(_LOGGED_FIELDS.validate_python(request_kwargs))
+            label_requested_model = model_group or litellm_model_name
+            label_model_group = model_group
+        else:
+            label_litellm_model_name = ""
+            label_model_id = ""
+            label_api_base = ""
+            label_api_provider = ""
+            label_requested_model = (
+                _bounded_requested_model_label(litellm_model_name or model_group, router_originated=True) or ""
+            )
+            label_model_group = _bounded_requested_model_label(model_group, router_originated=True)
+
+        enum_values: Final = UserAPIKeyLabelValues(
+            litellm_model_name=label_litellm_model_name,
+            model_id=label_model_id,
+            api_base=label_api_base,
+            api_provider=label_api_provider,
+            exception_status=exception_status,
+            exception_class=(self._get_exception_class_name(exception) if exception else None),
+            requested_model=label_requested_model,
+            model_group=label_model_group,
+            hashed_api_key=hashed_api_key,
+            api_key_alias=api_key_alias,
+            user_email=user_email,
+            team=team,
+            team_alias=team_alias,
+            tags=standard_logging_payload.get("request_tags", []),
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+        return DeploymentFailureLabels(
+            enum_values=enum_values,
+            deployment_selected=deployment_selected,
+            litellm_model_name=litellm_model_name or "",
+            model_id=model_id,
+            api_base=api_base,
+            api_provider=llm_provider or "",
+            has_exception=exception is not None,
+        )
+
     def set_llm_deployment_failure_metrics(self, request_kwargs: dict):
         """
         Sets Failure metrics when an LLM API call fails
@@ -3445,117 +3571,20 @@ class PrometheusLogger(CustomLogger):
 
         """
         try:
-            verbose_logger.debug("setting remaining tokens requests metric")
-            standard_logging_payload: Final[StandardLoggingPayload] = request_kwargs.get("standard_logging_object", {})
-            _litellm_params: Final = request_kwargs.get("litellm_params", {}) or {}
-            litellm_model_name: Final = request_kwargs.get("model", None)
-            model_group = standard_logging_payload.get("model_group", None)
-            api_base: Final = standard_logging_payload.get("api_base", None)
-            model_id = standard_logging_payload.get("model_id", None)
-            exception: Final = request_kwargs.get("exception", None)
-
-            # Fallback: model_id from litellm_metadata.model_info
-            if model_id is None:
-                _model_info: Final = (
-                    (_litellm_params.get("litellm_metadata") or {}).get("model_info")
-                    or (_litellm_params.get("metadata") or {}).get("model_info")
-                    or {}
-                )
-                model_id = _model_info.get("id")
-
-            # Fallback: model_group from litellm_metadata
-            if model_group is None:
-                model_group = (_litellm_params.get("litellm_metadata") or {}).get("model_group") or (
-                    _litellm_params.get("metadata") or {}
-                ).get("model_group")
-
-            llm_provider: Final = _litellm_params.get("custom_llm_provider", None)
-
-            if self._should_skip_metrics_for_invalid_key(
-                kwargs=request_kwargs,
-                standard_logging_payload=standard_logging_payload,
-            ):
+            labels: Final = self.deployment_failure_labels(request_kwargs)  # pyright: ignore[reportUnknownMemberType]  # the legacy logging kwargs are untyped
+            if labels is None:
                 return
-
-            # Extract context labels from all available sources (fix for None labels)
-            fallback_values: Final = self._extract_deployment_failure_label_values(request_kwargs)
-            _metadata: Final = standard_logging_payload.get("metadata", {}) or {}
-            hashed_api_key: Final = fallback_values.get("hashed_api_key") or _metadata.get("user_api_key_hash")
-            api_key_alias: Final = fallback_values.get("api_key_alias") or _metadata.get("user_api_key_alias")
-            user_email: Final = fallback_values.get("user_email")
-            team: Final = fallback_values.get("team") or _metadata.get("user_api_key_team_id")
-            team_alias: Final = fallback_values.get("team_alias") or _metadata.get("user_api_key_team_alias")
-            client_ip: Final = fallback_values.get("client_ip") or _metadata.get("requester_ip_address")
-            user_agent: Final = fallback_values.get("user_agent") or _metadata.get("user_agent")
-
-            # exception_status: prefer status_code, fallback to exception class for known types
-            exception_status = None
-            if exception is not None:
-                exception_status = str(getattr(exception, "status_code", None))
-                if exception_status == "None" or not exception_status:
-                    code: Final[object] = getattr(exception, "code", None)
-                    if code is not None:
-                        exception_status = str(code)
-
-            # On LiteLLM-side rejects (no deployment picked), route request_kwargs["model"]
-            # into requested_model and leave deployment-scoped labels empty.
-            deployment_selected: Final = (
-                bool(model_id)
-                and not _litellm_params.get(PROXY_REJECTED_BEFORE_ROUTING_KEY)
-                and not isinstance(exception, MalformedRequestFieldError)
-            )
-            if deployment_selected:
-                label_litellm_model_name = litellm_model_name
-                label_model_id = model_id
-                label_api_base = api_base
-                label_api_provider = self._extract_deployment_api_provider(
-                    _LOGGED_FIELDS.validate_python(request_kwargs)
-                )
-                label_requested_model = model_group or litellm_model_name
-                label_model_group = model_group
-            else:
-                label_litellm_model_name = ""
-                label_model_id = ""
-                label_api_base = ""
-                label_api_provider = ""
-                label_requested_model = (
-                    _bounded_requested_model_label(litellm_model_name or model_group, router_originated=True) or ""
-                )
-                label_model_group = _bounded_requested_model_label(model_group, router_originated=True)
-
-            enum_values: Final = UserAPIKeyLabelValues(
-                litellm_model_name=label_litellm_model_name,
-                model_id=label_model_id,
-                api_base=label_api_base,
-                api_provider=label_api_provider,
-                exception_status=exception_status,
-                exception_class=(self._get_exception_class_name(exception) if exception else None),
-                requested_model=label_requested_model,
-                model_group=label_model_group,
-                hashed_api_key=hashed_api_key,
-                api_key_alias=api_key_alias,
-                user_email=user_email,
-                team=team,
-                team_alias=team_alias,
-                tags=standard_logging_payload.get("request_tags", []),
-                client_ip=client_ip,
-                user_agent=user_agent,
-            )
-
-            """
-            log these labels
-            ["litellm_model_name", "model_id", "api_base", "api_provider"]
-            """
+            enum_values: Final = labels.enum_values
             # Only mark a deployment outage when one was actually picked.
-            if deployment_selected:
+            if labels.deployment_selected:
                 self.set_deployment_partial_outage(
-                    litellm_model_name=litellm_model_name or "",
-                    model_id=model_id,
-                    api_base=api_base,
-                    api_provider=llm_provider or "",
+                    litellm_model_name=labels.litellm_model_name,
+                    model_id=labels.model_id,
+                    api_base=labels.api_base,
+                    api_provider=labels.api_provider,
                 )
             _deployment_label_ctx: Final = PrometheusLabelFactoryContext(enum_values)
-            if exception is not None:
+            if labels.has_exception:
                 PrometheusLogger._inc_labeled_counter(
                     self,
                     self.litellm_deployment_failure_responses,
@@ -3865,6 +3894,18 @@ class PrometheusLogger(CustomLogger):
             error_type: Type of error if any, None otherwise
             hook_type: "pre_call", "during_call", or "post_call"
         """
+        if self._native_store is not None:
+            self._native_store.op(
+                "guardrail",
+                {
+                    "guardrail_name": guardrail_name,
+                    "latency_seconds": latency_seconds,
+                    "status": status,
+                    "error_type": error_type,
+                    "hook_type": hook_type,
+                },
+            )
+            return
         try:
             # Record latency
             self.litellm_guardrail_latency_metric.labels(
@@ -3903,6 +3944,18 @@ class PrometheusLogger(CustomLogger):
         user_email: str | None,
         api_key_alias: str | None,
     ):
+        if self._native_store is not None:
+            self._native_store.op(
+                "managed_batch_created",
+                {
+                    "model": model,
+                    "api_provider": api_provider,
+                    "user": user,
+                    "user_email": user_email,
+                    "api_key_alias": api_key_alias,
+                },
+            )
+            return
         try:
             self.litellm_managed_batch_created_total.labels(
                 model=model,
@@ -3924,6 +3977,19 @@ class PrometheusLogger(CustomLogger):
         user: str | None = None,
     ):
         """Record the size of a managed file. Uses a gauge (last-seen value per label combination)."""
+        if self._native_store is not None:
+            self._native_store.op(
+                "managed_file_size",
+                {
+                    "size_bytes": size_bytes,
+                    "purpose": purpose,
+                    "file_type": file_type,
+                    "model": model,
+                    "api_provider": api_provider,
+                    "user": user,
+                },
+            )
+            return
         try:
             self.litellm_managed_file_size_bytes.labels(
                 purpose=purpose,
@@ -3941,6 +4007,12 @@ class PrometheusLogger(CustomLogger):
         model: str | None = None,
         api_provider: str | None = None,
     ):
+        if self._native_store is not None:
+            self._native_store.op(
+                "managed_batch_duration",
+                {"duration_seconds": duration_seconds, "model": model, "api_provider": api_provider},
+            )
+            return
         try:
             self.litellm_managed_batch_duration_seconds.labels(
                 model=model or "",
@@ -3957,6 +4029,18 @@ class PrometheusLogger(CustomLogger):
         user_email: str | None,
         api_key_alias: str | None,
     ):
+        if self._native_store is not None:
+            self._native_store.op(
+                "managed_file_created",
+                {
+                    "model": model,
+                    "api_provider": api_provider,
+                    "user": user,
+                    "user_email": user_email,
+                    "api_key_alias": api_key_alias,
+                },
+            )
+            return
         try:
             self.litellm_managed_file_created_total.labels(
                 model=model,
@@ -3970,6 +4054,9 @@ class PrometheusLogger(CustomLogger):
 
     def record_managed_file_deleted(self, result: str):
         """Record a managed file deletion attempt. result is 'success' or 'blocked'."""
+        if self._native_store is not None:
+            self._native_store.op("managed_file_deleted", {"result": result})
+            return
         try:
             self.litellm_managed_file_deleted_total.labels(result=result).inc()
         except Exception as e:
@@ -3989,6 +4076,12 @@ class PrometheusLogger(CustomLogger):
         """
         import time
 
+        if self._native_store is not None:
+            self._native_store.op(
+                "check_batch_cost_run",
+                {"now": time.time(), "jobs_polled": jobs_polled, "processed_models": processed_models},
+            )
+            return
         try:
             self.litellm_check_batch_cost_last_run_timestamp.set(time.time())
             self.litellm_check_batch_cost_jobs_polled.set(jobs_polled)
@@ -4003,6 +4096,9 @@ class PrometheusLogger(CustomLogger):
             verbose_logger.warning("Error recording check batch cost metrics: %s", e)
 
     def record_check_batch_cost_error(self, error_type: str):
+        if self._native_store is not None:
+            self._native_store.op("check_batch_cost_error", {"error_type": error_type})
+            return
         try:
             self.litellm_check_batch_cost_errors_total.labels(
                 error_type=error_type,
@@ -4105,6 +4201,9 @@ class PrometheusLogger(CustomLogger):
             exception_class=self._get_exception_class_name(original_exception),
             tags=_tags,
         )
+        if self._native_store is not None:
+            self._native_store.op("fallback", {"success": True, "values": enum_values.model_dump()})
+            return
         PrometheusLogger._inc_labeled_counter(
             self,
             self.litellm_deployment_successful_fallbacks,
@@ -4147,6 +4246,9 @@ class PrometheusLogger(CustomLogger):
             tags=_tags,
         )
 
+        if self._native_store is not None:
+            self._native_store.op("fallback", {"success": False, "values": enum_values.model_dump()})
+            return
         PrometheusLogger._inc_labeled_counter(
             self,
             self.litellm_deployment_failed_fallbacks,
@@ -4166,6 +4268,18 @@ class PrometheusLogger(CustomLogger):
         """
         Set the deployment state.
         """
+        if self._native_store is not None:
+            self._native_store.op(
+                "deployment_state",
+                {
+                    "state": state,
+                    "litellm_model_name": litellm_model_name,
+                    "model_id": model_id,
+                    "api_base": api_base,
+                    "api_provider": api_provider,
+                },
+            )
+            return
         ### get labels
         _labels: Final = prometheus_label_factory(
             supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_deployment_state"),
@@ -4216,6 +4330,11 @@ class PrometheusLogger(CustomLogger):
         """
         increment metric when litellm.Router / load balancing logic places a deployment in cool down
         """
+        if self._native_store is not None:
+            self._native_store.op(
+                "cooled_down", {"values": [litellm_model_name, model_id, api_base, api_provider, exception_status]}
+            )
+            return
         self.litellm_deployment_cooled_down.labels(
             sanitize_prometheus_label_value(litellm_model_name),
             sanitize_prometheus_label_value(model_id),
@@ -4233,6 +4352,19 @@ class PrometheusLogger(CustomLogger):
         share_tokens: int,
         borrowed_tokens: int,
     ) -> None:
+        if self._native_store is not None:
+            self._native_store.op(
+                "dynamic_limiter_share",
+                {
+                    "model_group": model_group,
+                    "team": team,
+                    "team_alias": team_alias,
+                    "priority": priority,
+                    "share_tokens": share_tokens,
+                    "borrowed_tokens": borrowed_tokens,
+                },
+            )
+            return
         enum_values: Final = UserAPIKeyLabelValues(
             model_group=model_group, team=team, team_alias=team_alias, priority=priority
         )
@@ -4271,6 +4403,19 @@ class PrometheusLogger(CustomLogger):
         rate_limit_type: str,
         reason: str,
     ) -> None:
+        if self._native_store is not None:
+            self._native_store.op(
+                "dynamic_limiter_throttled",
+                {
+                    "model_group": model_group,
+                    "team": team,
+                    "team_alias": team_alias,
+                    "priority": priority,
+                    "rate_limit_type": rate_limit_type,
+                    "reason": reason,
+                },
+            )
+            return
         self._inc_labeled_counter(
             self.litellm_dynamic_limiter_throttled_total,
             "litellm_dynamic_limiter_throttled_total",
@@ -4291,12 +4436,20 @@ class PrometheusLogger(CustomLogger):
         """
         Increment metric when logging to a callback fails (e.g., s3_v2, langfuse, etc.)
         """
+        if self._native_store is not None:
+            self._native_store.op("callback_failure", {"callback_name": callback_name})
+            return
         self.litellm_callback_logging_failures_metric.labels(callback_name=callback_name).inc()
 
     def track_provider_remaining_budget(self, provider: str, spend: float, budget_limit: float):
         """
         Track provider remaining budget in Prometheus
         """
+        if self._native_store is not None:
+            self._native_store.op(
+                "provider_budget", {"provider": provider, "spend": spend, "budget_limit": budget_limit}
+            )
+            return
         self.litellm_provider_remaining_budget_metric.labels(provider).set(
             self._safe_get_remaining_budget(
                 max_budget=budget_limit,

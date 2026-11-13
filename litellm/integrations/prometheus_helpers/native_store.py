@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Final, Literal, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias, TypeVar, get_args
 
 import openai
 from prometheus_client import metrics as prometheus_metrics
@@ -26,7 +27,7 @@ from litellm.litellm_core_utils.core_helpers import (
 )
 from litellm.litellm_core_utils.service_tier_utils import get_service_tier_from_standard_logging_payload
 from litellm.rust_bridge import _native
-from litellm.types.integrations.prometheus import NoOpMetric
+from litellm.types.integrations.prometheus import DEFINED_PROMETHEUS_METRICS, NoOpMetric, PrometheusMetricLabels
 
 if TYPE_CHECKING:
     from litellm.integrations.prometheus import PrometheusLogger
@@ -36,40 +37,6 @@ PrometheusKind: TypeAlias = Literal["counter", "gauge", "histogram"]
 
 NATIVE_PROMETHEUS_ENV: Final = "LITELLM_NATIVE_PROMETHEUS"
 NativePrometheusMetric: Final = _native.NativePrometheusMetric
-
-NATIVE_SUCCESS_METRICS: Final = (
-    "litellm_requests_metric",
-    "litellm_spend_metric",
-    "litellm_zero_cost_requests_total",
-    "litellm_total_tokens_metric",
-    "litellm_input_tokens_metric",
-    "litellm_output_tokens_metric",
-    "litellm_input_cached_tokens_metric",
-    "litellm_input_cache_creation_tokens_metric",
-    "litellm_input_audio_tokens_metric",
-    "litellm_output_reasoning_tokens_metric",
-    "litellm_output_audio_tokens_metric",
-    "litellm_api_key_rate_limit_allowed_metric",
-    "litellm_api_key_rate_limit_used_metric",
-    "litellm_team_rate_limit_allowed_metric",
-    "litellm_team_rate_limit_used_metric",
-    "litellm_project_model_rate_limit_allowed_metric",
-    "litellm_project_model_rate_limit_used_metric",
-    "litellm_llm_api_time_to_first_token_metric",
-    "litellm_llm_api_latency_metric",
-    "litellm_request_total_latency_metric",
-    "litellm_request_queue_time_seconds",
-    "litellm_cache_hits_metric",
-    "litellm_cache_misses_metric",
-    "litellm_cached_tokens_metric",
-    "litellm_provider_cache_read_input_tokens_metric",
-    "litellm_provider_cache_creation_input_tokens_metric",
-    "litellm_video_duration_seconds_metric",
-    "litellm_images_generated_metric",
-    "litellm_mcp_tool_calls_total",
-    "litellm_mcp_tool_call_spend_metric",
-    "litellm_proxy_total_requests_metric",
-)
 
 _PAYLOAD_KEYS: Final = (
     "metadata",
@@ -85,7 +52,9 @@ _PAYLOAD_KEYS: Final = (
     "stream",
     "zero_cost_diagnostic",
     "cache_hit",
+    "guardrail_information",
 )
+_HIDDEN_KEYS: Final = ("additional_headers", "litellm_overhead_time_ms")
 _EPOCH_NAIVE: Final = datetime(1970, 1, 1)  # noqa: DTZ001  # callback timestamps use the legacy naive contract
 _EPOCH_AWARE: Final = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _ONE_MICROSECOND: Final = timedelta(microseconds=1)
@@ -99,6 +68,9 @@ _LIST: Final[TypeAdapter[list[object]]] = TypeAdapter(  # mutable-ok: pydantic h
     list[object], config=_STRICT
 )
 _TUPLE: Final[TypeAdapter[tuple[object, ...]]] = TypeAdapter(tuple[object, ...], config=_STRICT)
+_DEFINED_METRICS: Final = TypeAdapter(tuple[DEFINED_PROMETHEUS_METRICS, ...]).validate_python(
+    get_args(DEFINED_PROMETHEUS_METRICS)
+)
 _KINDS: Final[Mapping[str, PrometheusKind]] = {"counter": "counter", "gauge": "gauge", "histogram": "histogram"}
 
 
@@ -153,7 +125,7 @@ def _payload(value: object) -> object:
     hidden_view: Final = (
         json_safe(hidden)
         if hidden_mapping is None
-        else {"additional_headers": json_safe(hidden_mapping.get("additional_headers"))}
+        else {key: json_safe(hidden_mapping[key]) for key in _HIDDEN_KEYS if key in hidden_mapping}
     )
     return {**projected, "hidden_params": hidden_view}
 
@@ -176,6 +148,14 @@ def _mapping_or_empty(value: object) -> Mapping[str, object]:
         return _MAPPING.validate_python(value)
     except ValidationError:
         return {}
+
+
+def _hashed_key(key: object) -> object:
+    if not isinstance(key, str) or not key.startswith("sk-"):
+        return json_safe(key)
+    from litellm.proxy.utils import hash_token
+
+    return hash_token(key)
 
 
 class AttemptFacts:
@@ -230,7 +210,62 @@ class AttemptFacts:
                 "completion_start_time": _moment(call.get("completion_start_time")),
             },
             "exception": self._exception(call),
+            "key": self._key(call, litellm_params, call.get("standard_logging_object")),
+            "deployment": self._deployment(call, litellm_params),
+            "deployment_failure": self._deployment_failure(call),
             "settings": _settings(),
+        }
+
+    def _key(
+        self, call: Mapping[str, object], litellm_params: Mapping[str, object], payload: object
+    ) -> Mapping[str, object] | None:
+        from litellm.proxy.common_utils.callback_utils import (
+            get_model_group_from_litellm_kwargs,  # pyright: ignore[reportUnknownVariableType]  # the helper takes untyped kwargs
+        )
+
+        parsed: Final = _parsed(_DICT, payload)
+        metadata: Final = _parsed(_DICT, parsed.get("metadata")) if parsed is not None else None
+        if metadata is None:
+            return None
+        hashed: Final = metadata.get("user_api_key_hash")
+        model_group: Final = get_model_group_from_litellm_kwargs(dict(call))
+        request_metadata: Final = _mapping_or_empty(litellm_params.get("metadata"))
+        return {
+            "hashed": _hashed_key(hashed),
+            "model_group": json_safe(model_group),
+            "remaining_requests": json_safe(request_metadata.get(f"litellm-key-remaining-requests-{model_group}")),
+            "remaining_tokens": json_safe(request_metadata.get(f"litellm-key-remaining-tokens-{model_group}")),
+        }
+
+    def _deployment(self, call: Mapping[str, object], litellm_params: Mapping[str, object]) -> Mapping[str, object]:
+        metadata: Final = _mapping_or_empty(get_litellm_metadata_from_kwargs(dict(call)))  # pyright: ignore[reportUnknownArgumentType]  # validated to a mapping here
+        return {
+            "model_info": json_safe(metadata.get("model_info")),
+            "params_truthy": bool(litellm_params),
+            "provider": json_safe(litellm_params.get("custom_llm_provider")),
+            "params_tpm": json_safe(litellm_params.get("tpm")),
+            "params_rpm": json_safe(litellm_params.get("rpm")),
+            "completion_start_present": "completion_start_time" in call,
+        }
+
+    def _deployment_failure(self, call: Mapping[str, object]) -> Mapping[str, object] | None:
+        if call.get("log_event_type") != "failed_api_call":
+            return None
+        try:
+            labels: Final = self._logger.deployment_failure_labels(dict(call))  # pyright: ignore[reportUnknownMemberType]  # the legacy logging kwargs are untyped
+        except Exception as error:  # noqa: BLE001  # the legacy helper logs and drops the same failures
+            verbose_logger.debug("Prometheus Error: set_llm_deployment_failure_metrics. Exception occured - %s", error)
+            return None
+        if labels is None:
+            return None
+        return {
+            "values": json_safe(labels.enum_values.model_dump()),
+            "selected": labels.deployment_selected,
+            "litellm_model_name": labels.litellm_model_name,
+            "model_id": json_safe(labels.model_id),
+            "api_base": json_safe(labels.api_base),
+            "provider": labels.api_provider,
+            "has_exception": labels.has_exception,
         }
 
 
@@ -361,11 +396,17 @@ class NativeStore:
     def attach(self, logger: PrometheusLogger) -> NativeLogger:
         from prometheus_client import REGISTRY
 
-        for metric in NATIVE_SUCCESS_METRICS:
-            self.store.declare_labels(metric, list(logger.get_labels_for_metric(metric)))  # pyright: ignore[reportArgumentType]  # every name is a defined metric
+        for metric in _DEFINED_METRICS:
+            if hasattr(PrometheusMetricLabels, metric):
+                self.store.declare_labels(metric, list(logger.get_labels_for_metric(metric)))
         REGISTRY.register(NativeStoreCollector(self.store))
         self.owns_latency = not logger._emit_input_sequence_length_label  # pyright: ignore[reportPrivateUsage]  # that label needs the response object, which V2 attempt_ended does not carry
         return native_companion(self.store, logger, self.owns_latency)
+
+    def op(self, name: str, facts: Mapping[str, object]) -> None:
+        self.store.op(
+            name, json.dumps({**{key: json_safe(value) for key, value in facts.items()}, "settings": _settings()})
+        )
 
     def track_end_user(
         self, metric: str, values: Sequence[object], max_series: int | None, ttl_seconds: float | None

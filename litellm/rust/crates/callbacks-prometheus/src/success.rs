@@ -52,7 +52,59 @@ pub struct AttemptFacts {
     pub times: Times,
     #[serde(default)]
     pub exception: Option<ExceptionFacts>,
+    #[serde(default)]
+    pub key: Option<KeyFacts>,
+    #[serde(default)]
+    pub deployment: Option<DeploymentFacts>,
+    #[serde(default)]
+    pub deployment_failure: Option<DeploymentFailure>,
     pub settings: Settings,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct KeyFacts {
+    #[serde(default)]
+    pub hashed: Value,
+    #[serde(default)]
+    pub model_group: Value,
+    #[serde(default)]
+    pub remaining_requests: Value,
+    #[serde(default)]
+    pub remaining_tokens: Value,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeploymentFacts {
+    #[serde(default)]
+    pub model_info: Value,
+    #[serde(default)]
+    pub params_truthy: bool,
+    #[serde(default)]
+    pub provider: Value,
+    #[serde(default)]
+    pub params_tpm: Value,
+    #[serde(default)]
+    pub params_rpm: Value,
+    #[serde(default)]
+    pub completion_start_present: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DeploymentFailure {
+    #[serde(default)]
+    pub values: Value,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub litellm_model_name: Value,
+    #[serde(default)]
+    pub model_id: Value,
+    #[serde(default)]
+    pub api_base: Value,
+    #[serde(default)]
+    pub provider: Value,
+    #[serde(default)]
+    pub has_exception: bool,
 }
 
 const AUTH_ERROR_PATTERNS: [&str; 5] = [
@@ -76,7 +128,7 @@ pub fn skips_invalid_key(exception: Option<&ExceptionFacts>) -> bool {
             .any(|pattern| exception.text.contains(pattern))
 }
 
-fn duration(start: Option<Moment>, end: Option<Moment>) -> Result<Option<f64>, CallbackError> {
+pub fn duration(start: Option<Moment>, end: Option<Moment>) -> Result<Option<f64>, CallbackError> {
     match (start, end) {
         (Some(start), Some(end)) if start.aware != end.aware => Err(failed(
             "can't subtract offset-naive and offset-aware datetimes",
@@ -87,7 +139,7 @@ fn duration(start: Option<Moment>, end: Option<Moment>) -> Result<Option<f64>, C
     }
 }
 
-fn required<'a>(map: &'a Map<String, Value>, key: &str) -> Result<&'a Value, CallbackError> {
+pub fn required<'a>(map: &'a Map<String, Value>, key: &str) -> Result<&'a Value, CallbackError> {
     map.get(key)
         .ok_or_else(|| failed(format!("KeyError: '{key}'")))
 }
@@ -104,7 +156,7 @@ fn tag_values(tags: &Value) -> Result<Vec<Value>, CallbackError> {
     }
 }
 
-fn get<'a>(map: &'a Map<String, Value>, key: &str) -> &'a Value {
+pub fn get<'a>(map: &'a Map<String, Value>, key: &str) -> &'a Value {
     map.get(key).unwrap_or(&Value::Null)
 }
 
@@ -198,17 +250,19 @@ impl Success<'_> {
             .inc("litellm_spend_metric", &context, py_float(response_cost)?)?;
         self.zero_cost(payload, &values)?;
         self.tokens(payload, metadata, &values)?;
+        self.virtual_key(payload, &values, &combined)?;
         self.rate_limits(payload, &values)?;
         if self.owns_latency {
             self.latency(&values)?;
         }
+        let _ = self.deployment(payload, &values);
         self.cache(payload, metadata, &values)?;
         self.media(metadata, &values)?;
         self.mcp(metadata, &values, response_cost)?;
         self.proxy_total(model_group, &values)
     }
 
-    fn zero_cost(
+    pub fn zero_cost(
         &self,
         payload: &Map<String, Value>,
         values: &LabelValues,
@@ -528,6 +582,198 @@ impl Success<'_> {
         Ok(())
     }
 
+    fn virtual_key(
+        &self,
+        payload: &Map<String, Value>,
+        values: &LabelValues,
+        combined: &Map<String, Value>,
+    ) -> Result<(), CallbackError> {
+        let Some(key) = &self.facts.key else {
+            return Ok(());
+        };
+        let remaining = |given: &Value, kind: &str| -> Result<Value, CallbackError> {
+            if !given.is_null() {
+                return Ok(given.clone());
+            }
+            let header = v3_header(
+                payload,
+                &format!("x-ratelimit-model_per_key-remaining-{kind}"),
+            )?;
+            Ok(header.map_or_else(|| Value::from(i64::MAX), Value::from))
+        };
+        let requests = remaining(&key.remaining_requests, "requests")?;
+        let tokens = remaining(&key.remaining_tokens, "tokens")?;
+        let key_values = LabelValues {
+            custom_metadata_labels: custom_labels_from_metadata(
+                combined,
+                &self.settings().custom_metadata_labels,
+            ),
+            ..LabelValues::default()
+        }
+        .with("hashed_api_key", key.hashed.clone())
+        .with("api_key_alias", values.get("api_key_alias").clone())
+        .with("model", key.model_group.clone())
+        .with("model_id", values.get("model_id").clone());
+        let context = key_values.context(self.settings());
+        for (name, value) in [
+            ("litellm_remaining_api_key_requests_for_model", requests),
+            ("litellm_remaining_api_key_tokens_for_model", tokens),
+        ] {
+            let labels = self.emit.labels(name, &context);
+            self.emit
+                .record(name, &labels, Op::Set(py_float(&value)?), false)?;
+        }
+        Ok(())
+    }
+
+    fn deployment(
+        &self,
+        payload: &Map<String, Value>,
+        values: &LabelValues,
+    ) -> Result<(), CallbackError> {
+        let Some(deployment) = &self.facts.deployment else {
+            return Ok(());
+        };
+        let api_base = required(payload, "api_base")?;
+        let model = &self.facts.model;
+        let model_info = &deployment.model_info;
+        let info = |key: &str| -> Result<Value, CallbackError> {
+            match model_info {
+                other if !py_truthy(other) => Ok(Value::Null),
+                other => is_py_dict(other)
+                    .map(|map| get(map, key).clone())
+                    .ok_or_else(|| failed("'model_info' has no attribute 'get'")),
+            }
+        };
+        let model_id = info("id")?;
+        if py_truthy(model_info) || deployment.params_truthy {
+            let deployment_values = LabelValues::default()
+                .with("litellm_model_name", model.clone())
+                .with("model_id", model_id.clone())
+                .with("api_base", api_base.clone())
+                .with("api_provider", deployment.provider.clone())
+                .with("model_group", values.get("model_group").clone());
+            let context = deployment_values.context(self.settings());
+            for (name, key, fallback) in [
+                (
+                    "litellm_deployment_tpm_limit",
+                    "tpm",
+                    &deployment.params_tpm,
+                ),
+                (
+                    "litellm_deployment_rpm_limit",
+                    "rpm",
+                    &deployment.params_rpm,
+                ),
+            ] {
+                let own = info(key)?;
+                let limit = if py_truthy(&own) {
+                    own
+                } else {
+                    fallback.clone()
+                };
+                if limit.is_null() {
+                    continue;
+                }
+                let labels = self.emit.labels(name, &context);
+                self.emit
+                    .record(name, &labels, Op::Set(py_float(&limit)?), false)?;
+            }
+        }
+        let hidden = required(payload, "hidden_params")?;
+        let hidden =
+            is_py_dict(hidden).ok_or_else(|| failed("hidden_params is not subscriptable"))?;
+        let headers = required(hidden, "additional_headers")?;
+        let headers = if py_truthy(headers) {
+            is_py_dict(headers)
+                .cloned()
+                .ok_or_else(|| failed("additional_headers is not a mapping"))?
+        } else {
+            Map::new()
+        };
+        let remaining_requests = gauge_reading(get(&headers, "x_ratelimit_remaining_requests"));
+        let remaining_tokens = gauge_reading(get(&headers, "x_ratelimit_remaining_tokens"));
+        let context = values.context(self.settings());
+        let overhead = get(hidden, "litellm_overhead_time_ms");
+        if py_truthy(overhead) {
+            let seconds = py_divide(overhead, 1000.0)?;
+            let name = "litellm_overhead_latency_metric";
+            let labels = self.emit.labels(name, &context);
+            self.emit
+                .record(name, &labels, Op::Observe(seconds), false)?;
+        }
+        let guardrail = guardrail_overhead_seconds(payload)?;
+        if !overhead.is_null() || guardrail > 0.0 {
+            let base = if py_truthy(overhead) {
+                py_divide(overhead, 1000.0)?
+            } else {
+                0.0
+            };
+            let name = "litellm_overhead_with_guardrails_latency_metric";
+            let labels = self.emit.labels(name, &context);
+            self.emit
+                .record(name, &labels, Op::Observe(base + guardrail), false)?;
+        }
+        for (name, reading) in [
+            ("litellm_remaining_requests_metric", remaining_requests),
+            ("litellm_remaining_tokens_metric", remaining_tokens),
+        ] {
+            if let Some(reading) = reading {
+                let labels = self.emit.labels(name, &context);
+                self.emit.record(name, &labels, Op::Set(reading), false)?;
+            }
+        }
+        set_deployment_state(
+            &self.emit,
+            0.0,
+            &or_text(model),
+            &or_text(&model_id),
+            &or_text(api_base),
+            &or_text(&deployment.provider),
+        )?;
+        self.emit
+            .inc("litellm_deployment_success_responses", &context, 1.0)?;
+        self.emit
+            .inc("litellm_deployment_total_requests", &context, 1.0)?;
+        let times = &self.facts.times;
+        let response = duration(times.start_time, times.end_time)?
+            .ok_or_else(|| failed("unsupported operand type(s) for -"))?;
+        let mut latency = response;
+        if self.facts.stream == Value::Bool(true) {
+            let first = if deployment.completion_start_present {
+                times.completion_start_time.ok_or_else(|| {
+                    failed("unsupported operand type(s) for -: 'NoneType' and 'datetime.datetime'")
+                })?
+            } else {
+                times
+                    .end_time
+                    .ok_or_else(|| failed("unsupported operand type(s) for -"))?
+            };
+            let ttft = duration(times.start_time, Some(first))?.unwrap_or(0.0);
+            if ttft != 0.0 {
+                latency = ttft;
+            }
+        }
+        let output_tokens = required(payload, "completion_tokens")?;
+        if output_tokens.is_null() {
+            return Ok(());
+        }
+        let tokens = py_number(output_tokens)
+            .or_else(|| {
+                output_tokens
+                    .as_bool()
+                    .map(|flag| if flag { 1.0 } else { 0.0 })
+            })
+            .ok_or_else(|| failed("'>' not supported for completion_tokens"))?;
+        if tokens > 0.0 {
+            let name = "litellm_deployment_latency_per_output_token";
+            let labels = self.emit.labels(name, &context);
+            self.emit
+                .record(name, &labels, Op::Observe(latency / tokens), false)?;
+        }
+        Ok(())
+    }
+
     fn proxy_total(&self, model_group: &Value, values: &LabelValues) -> Result<(), CallbackError> {
         let original = &self.facts.original_model_group;
         let requested = match original {
@@ -541,6 +787,131 @@ impl Success<'_> {
         self.emit
             .inc("litellm_proxy_total_requests_metric", &context, 1.0)
     }
+}
+
+fn or_text(value: &Value) -> Value {
+    if py_truthy(value) {
+        value.clone()
+    } else {
+        Value::from("")
+    }
+}
+
+pub fn set_deployment_state(
+    emit: &Emitter<'_>,
+    state: f64,
+    litellm_model_name: &Value,
+    model_id: &Value,
+    api_base: &Value,
+    api_provider: &Value,
+) -> Result<(), CallbackError> {
+    let values = LabelValues::default()
+        .with("litellm_model_name", litellm_model_name.clone())
+        .with("model_id", model_id.clone())
+        .with("api_base", api_base.clone())
+        .with("api_provider", api_provider.clone());
+    let name = "litellm_deployment_state";
+    let labels = emit.labels(name, &values.context(emit.settings));
+    emit.record(name, &labels, Op::Set(state), false)
+}
+
+fn v3_header(payload: &Map<String, Value>, name: &str) -> Result<Option<i64>, CallbackError> {
+    let hidden = get(payload, "hidden_params");
+    if hidden.is_null() {
+        return Ok(None);
+    }
+    let hidden =
+        is_py_dict(hidden).ok_or_else(|| failed("hidden_params has no attribute 'get'"))?;
+    let headers = get(hidden, "additional_headers");
+    if headers.is_null() {
+        return Ok(None);
+    }
+    let headers =
+        is_py_dict(headers).ok_or_else(|| failed("additional_headers has no attribute 'get'"))?;
+    Ok(match headers.get(name) {
+        Some(Value::Number(number)) if number.is_i64() => number.as_i64(),
+        _ => None,
+    })
+}
+
+fn py_float_text(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    let unsigned = lowered.trim_start_matches(['+', '-']);
+    if matches!(unsigned, "inf" | "infinity" | "nan") {
+        return lowered.parse::<f64>().ok();
+    }
+    if trimmed.contains('_') {
+        let bytes = trimmed.as_bytes();
+        let valid = bytes.iter().enumerate().all(|(index, byte)| {
+            *byte != b'_'
+                || (index > 0
+                    && index + 1 < bytes.len()
+                    && bytes[index - 1].is_ascii_digit()
+                    && bytes[index + 1].is_ascii_digit())
+        });
+        if !valid {
+            return None;
+        }
+        return trimmed.replace('_', "").parse::<f64>().ok();
+    }
+    trimmed.parse::<f64>().ok()
+}
+
+fn gauge_reading(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(_) => py_number(value),
+        Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
+        Value::String(text) => py_float_text(text),
+        _ => None,
+    }
+}
+
+fn py_divide(value: &Value, by: f64) -> Result<f64, CallbackError> {
+    match value {
+        Value::Number(_) => py_number(value).map(|number| number / by),
+        Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 } / by),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        failed(format!(
+            "unsupported operand type(s) for /: '{}' and 'int'",
+            py_str(value)
+        ))
+    })
+}
+
+fn guardrail_overhead_seconds(payload: &Map<String, Value>) -> Result<f64, CallbackError> {
+    let information = get(payload, "guardrail_information");
+    let entries: Vec<&Value> = match information {
+        Value::Object(_) if is_py_dict(information).is_some() => vec![information],
+        Value::Array(items) => items.iter().collect(),
+        other if !py_truthy(other) => Vec::new(),
+        _ => return Err(failed("guardrail_information is not iterable")),
+    };
+    let mut total = 0.0;
+    for entry in entries {
+        let info =
+            is_py_dict(entry).ok_or_else(|| failed("guardrail info has no attribute 'get'"))?;
+        let mode = get(info, "guardrail_mode");
+        let modes: Vec<&Value> = match mode {
+            Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        let names: Vec<&str> = modes.iter().filter_map(|mode| mode.as_str()).collect();
+        let additive = !names.is_empty()
+            && names
+                .iter()
+                .all(|name| matches!(*name, "pre_call" | "post_call"));
+        if !additive {
+            continue;
+        }
+        let duration = get(info, "duration");
+        if py_truthy(duration) {
+            total += py_float(duration)?;
+        }
+    }
+    Ok(total)
 }
 
 fn cache_write_tokens(details: &Value) -> Option<i64> {

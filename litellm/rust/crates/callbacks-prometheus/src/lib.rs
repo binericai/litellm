@@ -1,6 +1,8 @@
 mod emit;
 pub mod exposition;
+mod failure;
 pub mod labels;
+pub mod ops;
 pub mod pyfmt;
 pub mod store;
 mod success;
@@ -14,7 +16,7 @@ use litellm_callbacks::{
     OptOutBy, Selection, Subscription,
 };
 
-use crate::{emit::Emitter, success::Success};
+use crate::{emit::Emitter, failure::Failure, success::Success};
 pub use crate::{
     store::{Clock, FamilySpec, Kind, ManualClock, Op, Store, StoreError, SystemClock, Target},
     success::AttemptFacts,
@@ -64,6 +66,16 @@ impl Prometheus {
     }
 
     pub fn record_attempt(&self, facts: &AttemptFacts) -> Result<(), CallbackError> {
+        if facts.event == "failure" {
+            return Failure {
+                emit: Emitter {
+                    store: &self.store,
+                    settings: &facts.settings,
+                },
+                facts,
+            }
+            .run();
+        }
         if facts.event != "success" {
             return Ok(());
         }

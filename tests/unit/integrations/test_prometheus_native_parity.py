@@ -106,6 +106,10 @@ def _event(
     exception: Exception | None = None,
     aware: bool = False,
     key_hash: str = "hashed",
+    params: Mapping[str, object] | None = None,
+    request_metadata: Mapping[str, object] | None = None,
+    hidden: Mapping[str, object] | None = None,
+    guardrails: object = None,
 ) -> dict[str, object]:
     base: Final = START.replace(tzinfo=timezone.utc) if aware else START
     start: Final = base + timedelta(seconds=index)
@@ -149,17 +153,19 @@ def _event(
             "usage_object": usage_object,
             **(metadata or {}),
         },
-        "hidden_params": {"litellm_overhead_time_ms": None, "additional_headers": headers},
+        "hidden_params": {"litellm_overhead_time_ms": None, "additional_headers": headers, **(hidden or {})},
+        "guardrail_information": guardrails,
     }
     litellm_metadata: Final[dict[str, object]] = {"user_api_key_end_user_id": end_user}
     if queue is not None:
         litellm_metadata["queue_time_seconds"] = queue
     if original_model_group is not None:
         litellm_metadata["original_model_group"] = original_model_group
+    litellm_metadata.update(request_metadata or {})
     kwargs: Final[dict[str, object]] = {
         "model": "gpt-4o-mini",
         "standard_logging_object": payload,
-        "litellm_params": {"metadata": litellm_metadata, "user_api_key_end_user_id": end_user},
+        "litellm_params": {"metadata": litellm_metadata, "user_api_key_end_user_id": end_user, **(params or {})},
         "start_time": start,
         "end_time": end,
         "api_call_start_time": api_start,
@@ -222,6 +228,35 @@ CORPUS: Final = (
     _event(5, exception=Exception("Authentication Error: invalid api key")),
     _event(6, key_hash="sk-raw-key", stream=True, tags=["dev"], end_user="customer-c", queue=1),
     _event(7, user="w", cache_hit="unknown", end_user="customer-d"),
+    _event(
+        8,
+        stream=True,
+        params={"custom_llm_provider": "openai", "tpm": 9000},
+        request_metadata={
+            "model_group": "gpt-group",
+            "model_info": {"id": "model-0", "rpm": 60, "tpm": 0},
+            "litellm-key-remaining-requests-gpt-group": 5,
+            "litellm-key-remaining-tokens-gpt-group": "250",
+        },
+        hidden={
+            "litellm_overhead_time_ms": 12.5,
+            "additional_headers": {"x_ratelimit_remaining_requests": " 77 ", "x_ratelimit_remaining_tokens": 1000},
+        },
+        guardrails=[
+            {"guardrail_mode": "pre_call", "duration": 0.2},
+            {"guardrail_mode": ["pre_call", "during_call"], "duration": 5},
+            {"guardrail_mode": ["post_call"], "duration": "0.05"},
+        ],
+    ),
+    _event(
+        9,
+        params={"custom_llm_provider": "azure"},
+        hidden={
+            "litellm_overhead_time_ms": 0,
+            "additional_headers": {"x-ratelimit-model_per_key-remaining-tokens": 17},
+        },
+        guardrails={"guardrail_mode": "post_call", "duration": 0.4},
+    ),
 )
 
 
@@ -232,6 +267,7 @@ async def _drained() -> None:
 
 
 async def _drive(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setattr("time.time", lambda: 1_763_000_000.25)
     if native:
         monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
     else:
@@ -240,22 +276,31 @@ async def _drive(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
     assert (logger.native_companion is not None) is native if hasattr(logger, "native_companion") else not native
     for kwargs in copy.deepcopy(CORPUS):
         await logger.async_log_success_event(kwargs, None, kwargs["start_time"], kwargs["end_time"])
-        if native:
-            _ = await run_subscribers(
-                hook_subscribers(Hook.attempt_ended, [logger.native_companion], admit=Admit.every_entry),
-                KwargsFields(kwargs, LOGGING_KEYS),
-                lambda _callback, _kwargs: None,
-            )
-            await _drained()
+        await _deliver(logger, kwargs)
     outcomes: Final = await _direct_calls(logger)
     return generate_latest(_ours()).decode() + "\n".join(outcomes)
 
 
+async def _deliver(logger: PrometheusLogger, kwargs: dict[str, object]) -> None:
+    if logger.native_companion is None:
+        return
+    _ = await run_subscribers(
+        hook_subscribers(Hook.attempt_ended, [logger.native_companion], admit=Admit.every_entry),
+        KwargsFields(kwargs, LOGGING_KEYS),
+        lambda _callback, _kwargs: None,
+    )
+    await _drained()
+
+
 async def _direct_calls(logger: PrometheusLogger) -> list[str]:
-    failure: Final = _event(9)
-    failure["log_event_type"] = "failed_api_call"
-    failure["exception"] = litellm.RateLimitError(message="slow down", llm_provider="openai", model="gpt-4o-mini")
-    failure["standard_logging_object"]["status"] = "failure"
+    failure: Final = _failure(
+        10, litellm.RateLimitError(message="slow down", llm_provider="openai", model="gpt-4o-mini")
+    )
+    rejected: Final = _failure(11, litellm.BadRequestError(message="bad", model="gpt-4o-mini", llm_provider="openai"))
+    rejected["standard_logging_object"]["model_id"] = None
+    rejected["standard_logging_object"]["model_group"] = None
+    rejected["litellm_params"]["metadata"]["model_group"] = "gpt-group"
+    rejected["standard_logging_object"]["zero_cost_diagnostic"] = {"reason": "failed_call"}
     calls: Final = (
         lambda: logger.set_deployment_complete_outage("gpt-4o-mini", "model-0", "https://api.example.com/v1", "openai"),
         lambda: logger.increment_deployment_cooled_down(
@@ -269,15 +314,41 @@ async def _direct_calls(logger: PrometheusLogger) -> list[str]:
         lambda: logger.set_spend_capture_rate("anthropic", 0.97),
         lambda: logger.set_dynamic_limiter_share("gpt-group", "team-1", "Team One", "high", 1200, 30),
         lambda: logger.increment_dynamic_limiter_throttled("gpt-group", "team-1", None, "high", "tokens", "team"),
+        lambda: logger.record_managed_batch_created("gpt-4o-mini", "openai", "u", None, "alias"),
+        lambda: logger.record_managed_file_created("gpt-4o-mini", None, "u", "u@example.com", None),
+        lambda: logger.record_managed_file_size(2048, "batch", "jsonl", None, "openai", "u"),
+        lambda: logger.record_managed_batch_duration(12.5, "gpt-4o-mini"),
+        lambda: logger.record_managed_file_deleted("blocked"),
+        lambda: logger.record_check_batch_cost_run(3, [("gpt-4o-mini", "openai"), (None, None)]),
+        lambda: logger.record_check_batch_cost_error("timeout"),
+        lambda: logger.set_deployment_healthy("gpt-4o-mini", "model-1", "https://api.example.com/v1", "openai"),
     )
     outcomes: Final = [_outcome(call) for call in calls]
-    await logger.async_log_failure_event(failure, None, failure["start_time"], failure["end_time"])
+    for event in (failure, rejected):
+        await logger.async_log_failure_event(event, None, event["start_time"], event["end_time"])
+        await _deliver(logger, event)
+    original: Final = litellm.RateLimitError(message="slow", llm_provider="openai", model="gpt-4o-mini")
+    fallback_kwargs: Final = {
+        "model": "gpt-4o",
+        "metadata": {"user_api_key_hash": "hashed", "user_api_key_team_id": "team-1"},
+        "tags": ["prod"],
+    }
+    await logger.log_success_fallback_event("gpt-group", fallback_kwargs, original)
+    await logger.log_failure_fallback_event("gpt-group", fallback_kwargs, original)
     await logger.async_post_call_failure_hook(
         {"model": "gpt-group", "metadata": {}},
         litellm.RateLimitError(message="slow down", llm_provider="openai", model="gpt-4o-mini"),
         UserAPIKeyAuth(api_key="hashed", user_id="u", team_id="team-1"),
     )
     return outcomes
+
+
+def _failure(index: int, exception: Exception) -> dict[str, object]:
+    event: Final = _event(index)
+    event["log_event_type"] = "failed_api_call"
+    event["exception"] = exception
+    event["standard_logging_object"]["status"] = "failure"
+    return event
 
 
 def _outcome(call: Callable[[], object]) -> str:
