@@ -23,7 +23,6 @@ pub const NAME: &str = "budgets";
 pub struct Held {
     call_id: String,
     reservation: tokio::sync::Mutex<Reservation>,
-    reported: std::sync::atomic::AtomicBool,
 }
 
 impl Held {
@@ -36,13 +35,6 @@ impl Held {
 pub struct BudgetState(Mutex<Option<Arc<Held>>>);
 
 impl BudgetState {
-    fn get(&self) -> Option<Arc<Held>> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
     fn set(&self, held: Arc<Held>) {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(held);
     }
@@ -53,13 +45,6 @@ struct Admission {
     plan: Option<Plan>,
     call_id: Option<String>,
     model: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Ended {
-    status: Option<String>,
-    response_cost: Option<f64>,
-    call_id: Option<String>,
 }
 
 pub struct Budgets {
@@ -75,18 +60,11 @@ fn manifest() -> Manifest {
             opt_out_by: vec![OptOutBy::Admin],
             ..Selection::named(NAME)
         },
-        subscriptions: vec![
-            Subscription {
-                reads: FieldSet::of(&[Field::DeprecatedKwargs]),
-                may_abort: true,
-                ..Subscription::on(Hook::PreCall)
-            },
-            Subscription {
-                reads: FieldSet::of(&[Field::StandardLoggingPayload]),
-                awaited: true,
-                ..Subscription::on(Hook::AttemptEnded)
-            },
-        ],
+        subscriptions: vec![Subscription {
+            reads: FieldSet::of(&[Field::DeprecatedKwargs]),
+            may_abort: true,
+            ..Subscription::on(Hook::PreCall)
+        }],
         has_request_state: true,
     }
 }
@@ -161,31 +139,20 @@ impl Budgets {
         }
     }
 
-    pub async fn reservation(&self, call_id: &str) -> Option<Reservation> {
+    pub async fn take(&self, call_id: &str) -> Option<Reservation> {
         let held = self.held(call_id)?;
+        self.forget(&held);
         Some(held.snapshot().await)
     }
 
     pub async fn settle(
         &self,
-        call_id: &str,
+        mut reservation: Reservation,
         actual: f64,
         finalize: bool,
-    ) -> Result<bool, EngineError> {
-        let Some(held) = self.held(call_id) else {
-            return Ok(false);
-        };
-        held.reported
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let finalized = {
-            let mut reservation = held.reservation.lock().await;
-            engine::settle(&self.store, &mut reservation, actual, finalize).await?;
-            reservation.finalized
-        };
-        if finalized {
-            self.forget(&held);
-        }
-        Ok(true)
+    ) -> Result<Reservation, EngineError> {
+        engine::settle(&self.store, &mut reservation, actual, finalize).await?;
+        Ok(reservation)
     }
 
     fn lease(
@@ -226,7 +193,6 @@ impl Budgets {
                 let held = Arc::new(Held {
                     call_id: call_id.clone(),
                     reservation: tokio::sync::Mutex::new(reservation),
-                    reported: std::sync::atomic::AtomicBool::new(false),
                 });
                 let request = input
                     .state
@@ -251,51 +217,6 @@ impl Budgets {
                 admission.model,
             )))),
         }
-    }
-
-    async fn ended(&self, input: &HookInput) -> HookOutput {
-        let ended = decode::<Ended>(input.fields.raw(Field::StandardLoggingPayload)?)?;
-        let held = input
-            .state::<BudgetState>()
-            .and_then(BudgetState::get)
-            .or_else(|| {
-                let call_id = input
-                    .call
-                    .as_ref()
-                    .map(|call| call.ids.call_id.clone())
-                    .or_else(|| ended.as_ref().and_then(|ended| ended.call_id.clone()))?;
-                self.held(&call_id)
-            });
-        let (Some(held), Some(ended)) = (held, ended) else {
-            return Ok(None);
-        };
-        if ended.status.as_deref() != Some("success") {
-            return Ok(None);
-        }
-        {
-            let mut reservation = held.reservation.lock().await;
-            if !held.reported.load(std::sync::atomic::Ordering::Relaxed)
-                && let Err(error) = engine::settle(
-                    &self.store,
-                    &mut reservation,
-                    ended.response_cost.unwrap_or(0.0),
-                    true,
-                )
-                .await
-            {
-                tracing::warn!(%error, "settling the budget reservation failed; invalidating its counters");
-                let counters: Vec<_> = reservation
-                    .entries
-                    .iter()
-                    .map(engine::Entry::counter)
-                    .cloned()
-                    .collect();
-                self.store.invalidate(&counters).await;
-            }
-            reservation.finalized = true;
-        }
-        self.forget(&held);
-        Ok(None)
     }
 }
 
@@ -353,7 +274,6 @@ impl Callback for Shared {
         Box::pin(async move {
             match input.hook {
                 Hook::PreCall => self.0.admit(input).await,
-                Hook::AttemptEnded => self.0.ended(input).await,
                 _ => Ok(None),
             }
         })

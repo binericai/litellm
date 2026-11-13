@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use litellm_callbacks::{
-    CallFacts, CallIds, Callback, Field, FieldSet, FieldValues, Hook, HookInput, Verdict,
-};
+use litellm_callbacks::{Callback, Field, FieldSet, FieldValues, Hook, HookInput, Verdict};
 use litellm_callbacks_budgets::{BudgetState, Budgets, Plan, PlannedCounter, Shared};
 use litellm_redis_store::{
     Number,
@@ -72,7 +70,7 @@ fn pre_call(plan: &Plan, state: &Arc<BudgetState>) -> HookInput {
 
 #[rstest]
 #[tokio::test]
-async fn the_callback_holds_at_pre_call_and_settles_at_attempt_ended() {
+async fn the_callback_holds_at_pre_call_and_hands_the_hold_over_once() {
     let store = store(&[(KEY, 1.0)]);
     let budgets = Arc::new(Budgets::new(Arc::clone(&store)));
     let callback = Shared(Arc::clone(&budgets));
@@ -83,48 +81,36 @@ async fn the_callback_holds_at_pre_call_and_settles_at_attempt_ended() {
         None
     );
     assert_eq!(value(&store, KEY), Some(3.0));
-    assert!(budgets.reservation("call-1").await.is_some());
-    let ended = HookInput {
-        hook: Hook::AttemptEnded,
-        fields: FieldValues::new(FieldSet::of(&[Field::StandardLoggingPayload])).with(
-            Field::StandardLoggingPayload,
-            json!({"status": "success", "response_cost": 0.5}),
-        ),
-        call: Some(CallFacts {
-            ids: CallIds {
-                call_id: "call-1".into(),
-                ..CallIds::default()
-            },
-            ..CallFacts::default()
-        }),
-        state: Some(state as _),
-    };
-    assert_eq!(callback.handle(&ended).await.unwrap(), None);
+    let reservation = budgets.take("call-1").await.unwrap();
+    assert!(budgets.take("call-1").await.is_none());
+    let settled = budgets.settle(reservation, 0.5, true).await.unwrap();
+    assert!(settled.finalized);
     assert_eq!(value(&store, KEY), Some(1.5));
-    assert!(budgets.reservation("call-1").await.is_none());
+    let again = budgets.settle(settled, 0.0, true).await.unwrap();
+    assert!(again.finalized);
+    assert_eq!(value(&store, KEY), Some(1.5));
 }
 
 #[rstest]
+#[case::once(&[0.25])]
+#[case::twice_on_the_same_cost(&[0.25, 0.25])]
+#[case::grown_then_shrunk(&[0.75, 0.25])]
 #[tokio::test]
-async fn a_forwarded_settlement_wins_over_the_attempt_ended_cost() {
+async fn a_settlement_through_the_reservation_dict_lands_on_the_last_cost(#[case] costs: &[f64]) {
     let store = store(&[(KEY, 1.0)]);
     let budgets = Arc::new(Budgets::new(Arc::clone(&store)));
     let callback = Shared(Arc::clone(&budgets));
     let state = Arc::new(BudgetState::default());
     let plan = plan(vec![counter(KEY, 10.0, "Key", "hashed")], 2.0);
     callback.handle(&pre_call(&plan, &state)).await.unwrap();
-    assert!(budgets.settle("call-1", 0.25, false).await.unwrap());
-    let ended = HookInput {
-        hook: Hook::AttemptEnded,
-        fields: FieldValues::new(FieldSet::of(&[Field::StandardLoggingPayload])).with(
-            Field::StandardLoggingPayload,
-            json!({"status": "success", "response_cost": 0.5}),
-        ),
-        call: None,
-        state: Some(state as _),
-    };
-    callback.handle(&ended).await.unwrap();
-    assert_eq!(value(&store, KEY), Some(1.25));
+    let mut wire = serde_json::to_value(budgets.take("call-1").await.unwrap()).unwrap();
+    for cost in costs {
+        let reservation = serde_json::from_value(wire).unwrap();
+        wire =
+            serde_json::to_value(budgets.settle(reservation, *cost, false).await.unwrap()).unwrap();
+    }
+    assert_eq!(value(&store, KEY), Some(1.0 + costs[costs.len() - 1]));
+    assert_eq!(wire["finalized"], json!(false));
 }
 
 #[rstest]

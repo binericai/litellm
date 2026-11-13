@@ -5,7 +5,7 @@ use litellm_redis_store::{
     Number,
     spend_counters::{NotASpendCounter, SpendCounter, SpendCounters},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::plan::{Counter, Plan, entity_type_value};
 
@@ -13,7 +13,18 @@ const EPSILON: f64 = 1e-12;
 
 static ENTRY_IDS: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Deserialize)]
+struct WireEntry {
+    counter_key: String,
+    entity_type: String,
+    entity_id: String,
+    reserved_cost: f64,
+    #[serde(default)]
+    applied_adjustment: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "WireEntry")]
 pub struct Entry {
     pub counter_key: String,
     pub entity_type: String,
@@ -24,6 +35,22 @@ pub struct Entry {
     id: usize,
     #[serde(skip)]
     counter: SpendCounter,
+}
+
+impl TryFrom<WireEntry> for Entry {
+    type Error = NotASpendCounter;
+
+    fn try_from(wire: WireEntry) -> Result<Self, Self::Error> {
+        Ok(Self {
+            counter: SpendCounter::parse(&wire.counter_key)?,
+            counter_key: wire.counter_key,
+            entity_type: wire.entity_type,
+            entity_id: wire.entity_id,
+            reserved_cost: wire.reserved_cost,
+            applied_adjustment: wire.applied_adjustment,
+            id: ENTRY_IDS.fetch_add(1, Ordering::Relaxed),
+        })
+    }
 }
 
 impl Entry {
@@ -44,10 +71,11 @@ impl Entry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Reservation {
     pub reserved_cost: f64,
     pub entries: Vec<Entry>,
+    #[serde(default)]
     pub finalized: bool,
     pub input_cost: f64,
     pub input_tokens: Option<i64>,

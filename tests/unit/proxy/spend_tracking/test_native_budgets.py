@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Final, TypeAlias
@@ -10,6 +11,7 @@ import litellm
 from litellm.caching import DualCache
 from litellm.integrations.custom_logger_v2.call import CallContext
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.native import WireManifest
 from litellm.integrations.custom_logger_v2.outcomes import Abort
 from litellm.proxy import proxy_server
 from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable, UserAPIKeyAuth
@@ -18,8 +20,10 @@ from litellm.proxy.spend_tracking import native_budgets
 from litellm.proxy.spend_tracking.budget_reservation import (
     estimate_request_max_cost,
     reconcile_budget_reservation,
+    release_budget_reservation,
     release_budget_reservation_on_cancel,
     release_or_invalidate_budget_reservation,
+    release_unbound_budget_reservation,
     reserve_budget_for_request,
 )
 from litellm.proxy.utils import ProxyLogging
@@ -102,11 +106,16 @@ def _arguments(identity: Identity) -> Mapping[str, object]:
     }
 
 
+async def _no_attempt_line(_status: str, _response_cost: float) -> None:
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class Admitted:
     reservation: dict[str, object] | None  # mutable-ok: settlement stamps finalized on the shared reservation
     refusal: Exception | None
     counters: Mapping[str, float]
+    attempt_ended: Callable[[str, float], Awaitable[None]] = _no_attempt_line
 
 
 def _install_native_owner(store: SpendCounterStore) -> native_budgets.NativeBudgetsLogger:
@@ -138,15 +147,32 @@ async def _native_admit(store: SpendCounterStore, identity: Identity, call_id: s
     view: Final = type("View", (), {Field.deprecated_kwargs.value: data})()
     state_type: Final = type(logger).request_state
     assert state_type is not None
+    state: Final = state_type()
     outcome: Final = await logger.run_native(
         Hook.pre_call,
         frozenset({Field.deprecated_kwargs}),
         view,
-        CallContext[object](hook=Hook.pre_call, call=None, state=state_type()),
+        CallContext[object](hook=Hook.pre_call, call=None, state=state),
     )
+
+    subscribed: Final = frozenset(
+        subscription.hook for subscription in WireManifest.model_validate_json(logger.native.manifest()).subscriptions
+    )
+
+    async def attempt_ended(status: str, response_cost: float) -> None:
+        if Hook.attempt_ended not in subscribed:
+            return
+        payload: Final = {"status": status, "response_cost": response_cost, "id": call_id}
+        _ = await logger.run_native(
+            Hook.attempt_ended,
+            frozenset({Field.standard_logging_payload}),
+            type("View", (), {Field.standard_logging_payload.value: payload})(),
+            CallContext[object](hook=Hook.attempt_ended, call=None, state=state),
+        )
+
     refusal: Final = outcome.exception if isinstance(outcome, Abort) else None
     reservation: Final = plan if plan is not None and plan.get("native_call_id") is not None else None
-    return Admitted(reservation=reservation, refusal=refusal, counters=_snapshot(store))
+    return Admitted(reservation=reservation, refusal=refusal, counters=_snapshot(store), attempt_ended=attempt_ended)
 
 
 def _refusal_fields(error: Exception | None) -> object:
@@ -230,3 +256,65 @@ async def test_native_settlement_matches_python(
 
     assert _snapshot(store) == settled_python
     assert settled_python != python.counters
+
+
+async def _db_logger_success(reservation: dict[str, object]) -> None:  # mutable-ok: the shared reservation
+    _ = await reconcile_budget_reservation(reservation, 0.002, finalize=False, apply_consistent=False)
+    await proxy_server.increment_spend_counters(
+        token=TOKEN, team_id="team-1", user_id="user-1", response_cost=0.002, budget_reservation=reservation
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Exit:
+    attempt_status: str | None
+    settle: Settle
+
+
+EXITS: Final = {
+    "db_logger_charges_the_row": Exit("success", _db_logger_success),
+    "db_logger_releases_an_uncharged_row": Exit("success", release_budget_reservation),
+    "db_logger_releases_after_a_failed_write": Exit("success", release_or_invalidate_budget_reservation),
+    "failure_hook_releases": Exit("failure", release_or_invalidate_budget_reservation),
+    "client_disconnect_keeps_the_input_cost": Exit(None, release_budget_reservation_on_cancel),
+    "request_end_releases_an_unbound_hold": Exit(None, release_unbound_budget_reservation),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", EXITS.values(), ids=EXITS.keys())
+async def test_every_exit_settles_the_native_hold_like_python(store: SpendCounterStore, exit_path: Exit) -> None:
+    identity: Final = Identity(team_budget=100.0, user_budget=100.0, spend={KEY: 1.0, TEAM: 2.0, USER: 0.5})
+    python: Final = await _python_admit(store, identity)
+    assert python.reservation is not None
+    await exit_path.settle(python.reservation)
+    settled_python: Final = _snapshot(store)
+    store.flush_local()
+
+    native: Final = await _native_admit(store, identity, "call-exit")
+    assert native.reservation is not None
+    if exit_path.attempt_status is not None:
+        await native.attempt_ended(exit_path.attempt_status, 0.002)
+    await exit_path.settle(native.reservation)
+
+    assert _snapshot(store) == settled_python
+    assert native.reservation.get("finalized") == python.reservation.get("finalized")
+
+
+@pytest.mark.asyncio
+async def test_a_stream_settles_after_its_request_state_is_gone(store: SpendCounterStore) -> None:
+    identity: Final = Identity(team_budget=100.0, spend={KEY: 1.0, TEAM: 2.0})
+    python: Final = await _python_admit(store, identity)
+    assert python.reservation is not None
+    await _db_logger_success(python.reservation)
+    settled_python: Final = _snapshot(store)
+    store.flush_local()
+
+    native: Final = await _native_admit(store, identity, "call-stream")
+    assert native.reservation is not None
+    reservation: Final = native.reservation
+    del native
+    gc.collect()
+    await _db_logger_success(reservation)
+
+    assert _snapshot(store) == settled_python

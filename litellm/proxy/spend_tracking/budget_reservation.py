@@ -440,7 +440,7 @@ async def reconcile_budget_reservation(
     actual: Final = float(actual_cost or 0.0)
     native: Final = is_native_reservation(budget_reservation)
     if native:
-        _ = await settle_native_reservation(budget_reservation, actual, finalize)
+        await settle_native_reservation(budget_reservation, actual, finalize)
     pending: Final = (
         ()
         if native

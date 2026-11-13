@@ -85,6 +85,7 @@ class _MessageFields(BaseModel):
 
 
 _RESERVATION: Final = TypeAdapter(_Reservation | None)
+_SETTLED: Final = TypeAdapter(_Reservation)
 _STR_MAPPING: Final = TypeAdapter(Mapping[str, object])
 
 
@@ -157,11 +158,6 @@ def _admission(data: object) -> object:
     }
 
 
-def _ended(payload: object) -> object:
-    fields: Final = _STR_MAPPING.validate_python(payload) if isinstance(payload, Mapping) else {}
-    return {key: fields.get(key) for key in ("status", "response_cost", "id")} | {"call_id": fields.get("id")}
-
-
 class NativeBudgetsLogger(NativeLogger):
     budgets: NativeBudgets
 
@@ -179,7 +175,7 @@ class NativeBudgetsLogger(NativeLogger):
             return
         call_id: Final = _admission(data)
         held: Final = (
-            _RESERVATION.validate_python(await self.budgets.reservation(str(call_id["call_id"])))  # pyright: ignore[reportIndexIssue]  # _admission builds this dict
+            _RESERVATION.validate_python(await self.budgets.take(str(call_id["call_id"])))  # pyright: ignore[reportIndexIssue]  # _admission builds this dict
             if isinstance(call_id, dict) and isinstance(call_id.get("call_id"), str)
             else None
         )
@@ -197,10 +193,7 @@ class NativeBudgetsLogger(NativeLogger):
         )
 
 
-_PROJECTIONS: Final[Mapping[Field, Projection]] = {
-    Field.deprecated_kwargs: _admission,
-    Field.standard_logging_payload: _ended,
-}
+_PROJECTIONS: Final[Mapping[Field, Projection]] = {Field.deprecated_kwargs: _admission}
 
 _installed: Final[list[NativeBudgets]] = []  # mutable-ok: one process-wide native owner, set once at startup
 
@@ -222,13 +215,17 @@ def install_native_budgets(store: SpendCounterStore, callbacks: list[object]) ->
     _installed.append(budgets)
 
 
-async def settle_native_reservation(reservation: Mapping[str, object], actual_cost: float, finalize: bool) -> bool:
-    call_id: Final = reservation.get(NATIVE_CALL_ID_KEY)
+async def settle_native_reservation(
+    reservation: dict[str, object],  # mutable-ok: writes the settled entries back
+    actual_cost: float,
+    finalize: bool,
+) -> None:
     budgets: Final = native_budgets()
-    if not isinstance(call_id, str) or budgets is None:
-        return isinstance(call_id, str) or NATIVE_PLAN_KEY in reservation
-    await budgets.settle(call_id, actual_cost, finalize)
-    return True
+    if budgets is None or NATIVE_CALL_ID_KEY not in reservation:
+        return
+    held: Final = _SETTLED.validate_python(reservation)
+    settled: Final = _SETTLED.validate_python(await budgets.settle(held.model_dump(), actual_cost, finalize))
+    reservation.update({"entries": [entry.model_dump() for entry in settled.entries], "finalized": settled.finalized})
 
 
 def is_native_reservation(reservation: Mapping[str, object] | None) -> bool:
