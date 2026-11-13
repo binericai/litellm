@@ -18,6 +18,7 @@ aws-smithy-types = { version = "1.6.0", features = ["http-body-1-x"] }
 http.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 rstest.workspace = true

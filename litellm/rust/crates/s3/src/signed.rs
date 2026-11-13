@@ -12,7 +12,7 @@ pub struct SignedRequest<'a> {
     pub region: &'a str,
     pub credentials: &'a Credentials,
     pub time: SystemTime,
-    pub timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,19 +64,38 @@ pub async fn send(
 ) -> Result<Reply, SendError> {
     let signature = signature_headers(&request)?;
     let mut builder = client.request(request.method.clone(), request.url);
-    if let Some(timeout) = request.timeout {
-        builder = builder.timeout(timeout);
-    }
     for (name, value) in request.headers.iter().chain(&signature) {
         builder = builder.header(name, value);
     }
     if !request.body.is_empty() || request.method == Method::PUT {
         builder = builder.body(request.body.clone());
     }
-    let response = builder.send().await.map_err(transport)?;
+    let mut response = timed(request.read_timeout, builder.send()).await?;
     let status = response.status().as_u16();
-    let body = response.bytes().await.map_err(transport)?;
-    Ok(Reply { status, body })
+    let mut body = Vec::new();
+    while let Some(chunk) = timed(request.read_timeout, response.chunk()).await? {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Reply {
+        status,
+        body: Bytes::from(body),
+    })
+}
+
+async fn timed<T>(
+    limit: Option<Duration>,
+    pending: impl Future<Output = Result<T, reqwest::Error>>,
+) -> Result<T, SendError> {
+    let finished = match limit {
+        Some(limit) => tokio::time::timeout(limit, pending)
+            .await
+            .map_err(|elapsed| SendError::Transport {
+                kind: "ReadTimeout",
+                message: elapsed.to_string(),
+            })?,
+        None => pending.await,
+    };
+    finished.map_err(transport)
 }
 
 fn transport(error: reqwest::Error) -> SendError {

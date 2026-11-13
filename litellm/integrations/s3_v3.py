@@ -9,18 +9,22 @@ from typing import TYPE_CHECKING, ClassVar, Final, Literal, TypeAlias
 import litellm
 from litellm._logging import verbose_logger
 from litellm.constants import (
+    COMPLETION_HTTP_FALLBACK_SECONDS,
     DEFAULT_MAX_RECURSE_DEPTH,
     DEFAULT_S3_BATCH_SIZE,
     DEFAULT_S3_FLUSH_INTERVAL_SECONDS,
     DEFAULT_S3_MAX_ADAPTIVE_CONCURRENCY,
     DEFAULT_S3_MAX_CONCURRENT_UPLOADS,
+    HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS,
     S3_UPLOAD_ATTEMPT_TIMEOUT_SECONDS,
 )
 from litellm.integrations.batch_line_item_objects import batch_line_items_ndjson, batch_line_items_object_name
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2.enums import Field
 from litellm.integrations.custom_logger_v2.native import NativeLogger, native_logger
+from litellm.integrations.s3 import prompts_only_payload
 from litellm.integrations.s3_v2 import S3Logger
+from litellm.secret_managers.main import get_secret
 from litellm.types.integrations.s3_v2 import S3PartitionGranularity
 from litellm.types.utils import StandardAuditLogPayload, StandardBatchLineItemsPayload
 
@@ -28,10 +32,12 @@ if TYPE_CHECKING:
     from litellm.rust_bridge._native import NativeS3Log
 
 NATIVE_S3_V2_FLAG: Final = "LITELLM_NATIVE_S3_V2"
+CALLBACK_NAME: Final = "s3_v2"
 
 MetadataKind: TypeAlias = Literal["missing", "none", "mapping", "other"]
 
 _MISSING: Final = object()
+_FAILED: Final = {"failed": True}
 
 
 @cache
@@ -49,6 +55,21 @@ class _Host:
     def cold_storage_is_s3_v2(self) -> bool:
         return litellm.cold_storage_custom_logger == "s3_v2"
 
+    def region_from_environment(self) -> str | None:
+        region_name: Final = get_secret("AWS_REGION_NAME", None)
+        region: Final = get_secret("AWS_REGION", None)
+        if isinstance(region, str):
+            return region
+        return region_name if isinstance(region_name, str) else None
+
+    def web_identity_token(self, reference: str) -> str:
+        if reference.startswith("os.environ/") or reference in os.environ:
+            raise ValueError("Invalid web identity token reference.")
+        token: Final = get_secret(reference)
+        if token is None:
+            raise ValueError("OIDC token could not be retrieved from secret manager.")
+        return str(token)
+
 
 def _resolved_params(params_source: Mapping[str, object] | None) -> dict[str, object]:  # mutable-ok: handed to Rust
     source: Final = params_source if params_source is not None else (litellm.s3_callback_params or {})
@@ -60,28 +81,21 @@ def _resolved_params(params_source: Mapping[str, object] | None) -> dict[str, ob
 
 def _constants() -> Mapping[str, object]:
     return {
-        "flush_interval_seconds": DEFAULT_S3_FLUSH_INTERVAL_SECONDS or litellm.DEFAULT_FLUSH_INTERVAL_SECONDS,
         "batch_size": DEFAULT_S3_BATCH_SIZE or litellm.DEFAULT_BATCH_SIZE,
         "max_concurrent_uploads": DEFAULT_S3_MAX_CONCURRENT_UPLOADS,
         "max_adaptive_concurrency": DEFAULT_S3_MAX_ADAPTIVE_CONCURRENCY,
         "upload_attempt_timeout_seconds": S3_UPLOAD_ATTEMPT_TIMEOUT_SECONDS,
+        "download_read_timeout_seconds": COMPLETION_HTTP_FALLBACK_SECONDS,
+        "download_connect_timeout_seconds": HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS,
+        "web_identity_session_policy": S3Logger._web_identity_session_policy_document(),
     }
+
+
+def _flush_interval() -> float:
+    return DEFAULT_S3_FLUSH_INTERVAL_SECONDS or litellm.DEFAULT_FLUSH_INTERVAL_SECONDS
 
 
 _STRIPPER: Final = CustomLogger()
-
-
-def _stripped(payload: Mapping[str, object]) -> Mapping[str, object]:
-    messages: Final = payload.get("messages", [])
-    copied: Final = {
-        **payload,
-        **(
-            {"messages": [dict(message) if isinstance(message, dict) else message for message in messages]}
-            if isinstance(messages, list)
-            else {}
-        ),
-    }
-    return _STRIPPER._strip_base64_from_messages_sync(copied)  # pyright: ignore[reportArgumentType]  # the payload is a StandardLoggingPayload copy
 
 
 def _metadata_kind(metadata: object) -> MetadataKind:
@@ -108,19 +122,41 @@ def _start(value: object) -> list[int] | None:  # mutable-ok: crosses into Rust 
     return [start.year, start.month, start.day, start.hour, start.minute, start.second, start.microsecond]
 
 
+def legacy_should_log(kwargs: Mapping[str, object]) -> bool:
+    from litellm.litellm_core_utils import litellm_logging
+
+    if litellm.global_disable_no_log_param:
+        return True
+    litellm_params: Final = kwargs.get("litellm_params", {})
+    lookup: Final = getattr(litellm_params, "get", None)
+    if callable(lookup) and lookup("no-log", False) is True:
+        return False
+    controls: Final = litellm_logging.EnterpriseCallbackControls
+    return controls is None or not controls.is_callback_disabled_dynamically(
+        callback=CALLBACK_NAME,
+        litellm_params=litellm_logging._callback_control_params(litellm_params),
+        standard_callback_dynamic_params=kwargs.get("standard_callback_dynamic_params") or {},  # pyright: ignore[reportArgumentType]  # the dynamic params dict the legacy path hands the same check
+    )
+
+
 def project_payload(sink: "NativeS3Log", payload: object) -> object:
     if payload is None:
         return None
     if not isinstance(payload, Mapping):
-        return {"not_a_mapping": True}
-    stripped: Final = _stripped(payload) if sink.strip_base64_files else payload
+        return _FAILED
+    stripped: Final = (
+        _STRIPPER._strip_base64_from_messages_sync(payload)  # pyright: ignore[reportArgumentType]  # the shared StandardLoggingPayload, stripped in place as S3Logger does
+        if sink.strip_base64_files
+        else payload
+    )
     metadata: Final = stripped.get("metadata", _MISSING)
     kind: Final = _metadata_kind(metadata)
     get: Final[Callable[[str], object]] = metadata.get if kind == "mapping" else {}.get  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # kind says metadata has a get, as Python's s3_v2 calls it
     payload_id: Final = stripped.get("id")
     cold_storage_object_key: Final = get("cold_storage_object_key") if kind == "mapping" else None
+    stored: Final = dict(prompts_only_payload(stripped) if sink.log_prompts_only() else stripped)  # pyright: ignore[reportArgumentType]  # the StandardLoggingPayload copy S3Logger queues
     return {
-        "body": sink.encode(stripped, sink.log_prompts_only()),
+        "body": sink.stash(stored),
         "start": _start(stripped.get("startTime")),
         "id": payload_id if isinstance(payload_id, str) else None,
         "metadata": kind,
@@ -131,8 +167,25 @@ def project_payload(sink: "NativeS3Log", payload: object) -> object:
     }
 
 
+def project_kwargs(sink: "NativeS3Log", kwargs: object) -> object:
+    if not isinstance(kwargs, Mapping) or not legacy_should_log(kwargs):
+        return None
+    try:
+        return project_payload(sink, kwargs.get("standard_logging_object"))
+    except Exception as e:  # noqa: BLE001  # S3Logger counts a failure to build the element and moves on
+        verbose_logger.exception("s3 Layer Error - %s", e)
+        return _FAILED
+
+
+async def _periodic_flush(sink: "NativeS3Log", interval: float) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        await sink.flush()
+
+
 class S3LoggerV3(NativeLogger):
     sink: ClassVar["NativeS3Log"]
+    periodic_flush_task: ClassVar["asyncio.Task[None]"]
 
     @property
     def s3_path(self) -> str | None:
@@ -147,7 +200,7 @@ class S3LoggerV3(NativeLogger):
     async def async_log_audit_log_event(self, audit_log: StandardAuditLogPayload) -> None:
         try:
             audit_log_id: Final = audit_log.get("id", "unknown")
-            await self.sink.submit_audit(self.sink.encode(dict(audit_log), False), f"{audit_log_id}")
+            await self.sink.submit_audit(self.sink.stash(dict(audit_log)), f"{audit_log_id}")
         except Exception as e:  # noqa: BLE001  # an audit log failure is logged and swallowed, as in S3Logger
             verbose_logger.exception("S3 audit log error: %s", e)
 
@@ -199,9 +252,17 @@ def new_s3_v2_logger(s3_callback_params_override: Mapping[str, object] | None = 
     sink: Final = NativeS3Log(
         _resolved_params(s3_callback_params_override), _constants(), _Host(), DEFAULT_MAX_RECURSE_DEPTH
     )
+    periodic: Final = asyncio.create_task(_periodic_flush(sink, _flush_interval()))
     generated: Final = type(native_logger(sink.callback()))
-    cls: Final = type("s3_v2", (S3LoggerV3, generated), {"sink": sink})
-    return cls(sink.callback(), {Field.standard_logging_payload: lambda payload: project_payload(sink, payload)})
+    cls: Final = type("s3_v2", (S3LoggerV3, generated), {"sink": sink, "periodic_flush_task": periodic})
+    return cls(sink.callback(), {Field.deprecated_kwargs: lambda kwargs: project_kwargs(sink, kwargs)})
 
 
-__all__ = ["NATIVE_S3_V2_FLAG", "S3_V2_LOGGER_TYPES", "S3LoggerV3", "native_s3_v2_enabled", "new_s3_v2_logger"]
+__all__ = [
+    "NATIVE_S3_V2_FLAG",
+    "S3_V2_LOGGER_TYPES",
+    "S3LoggerV3",
+    "legacy_should_log",
+    "native_s3_v2_enabled",
+    "new_s3_v2_logger",
+]

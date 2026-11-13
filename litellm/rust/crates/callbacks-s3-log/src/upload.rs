@@ -16,6 +16,7 @@ use crate::{
     key::{hex_sha256, object_url},
     limiter::Limiter,
     settings::{Environment, Settings},
+    sink::Host,
 };
 
 const ATTEMPTS: u32 = 3;
@@ -39,12 +40,58 @@ pub enum Outcome {
     Dropped,
 }
 
+pub struct Stash {
+    pub id: u64,
+    pub host: Arc<dyn Host>,
+}
+
+impl std::fmt::Debug for Stash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("Stash").field(&self.id).finish()
+    }
+}
+
+impl Drop for Stash {
+    fn drop(&mut self) {
+        self.host.release(self.id);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Body {
+    Ready(Bytes),
+    Stashed(Arc<Stash>),
+}
+
 #[derive(Clone, Debug)]
 pub struct Object {
     pub key: String,
-    pub body: Bytes,
+    pub body: Body,
     pub content_type: &'static str,
     pub download_name: String,
+}
+
+pub async fn on_host<T: Send + 'static>(
+    host: &Arc<dyn Host>,
+    call: impl FnOnce(&dyn Host) -> T + Send + 'static,
+) -> T {
+    let host = Arc::clone(host);
+    match tokio::task::spawn_blocking(move || call(host.as_ref())).await {
+        Ok(value) => value,
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
+    }
+}
+
+impl Body {
+    pub async fn render(&self) -> Result<Bytes, String> {
+        match self {
+            Self::Ready(bytes) => Ok(bytes.clone()),
+            Self::Stashed(stash) => {
+                let id = stash.id;
+                on_host(&stash.host, move |host| host.render(id)).await
+            }
+        }
+    }
 }
 
 pub type Clock = fn() -> SystemTime;
@@ -53,6 +100,8 @@ pub type Backoff = Arc<dyn Fn(u32) -> Duration + Send + Sync>;
 pub struct Uploader {
     pub settings: Arc<Settings>,
     pub client: litellm_http::Client,
+    pub download_client: litellm_http::Client,
+    pub host: Arc<dyn Host>,
     pub auth: AwsAuthService,
     pub environment: Arc<Environment>,
     pub clock: Clock,
@@ -97,13 +146,13 @@ fn throttled(attempt: &Attempt) -> bool {
 }
 
 impl Uploader {
-    pub fn headers(&self, object: &Object) -> Vec<(String, String)> {
+    pub fn headers(&self, object: &Object, body: &Bytes) -> Vec<(String, String)> {
         let md5 = base64::engine::general_purpose::STANDARD
-            .encode(<md5::Md5 as md5::Digest>::digest(&object.body));
+            .encode(<md5::Md5 as md5::Digest>::digest(body));
         let mut headers = vec![
             ("Content-Type".to_owned(), object.content_type.to_owned()),
             ("Content-MD5".to_owned(), md5),
-            ("x-amz-content-sha256".to_owned(), hex_sha256(&object.body)),
+            ("x-amz-content-sha256".to_owned(), hex_sha256(body)),
             ("Content-Language".to_owned(), "en".to_owned()),
             (
                 "Content-Disposition".to_owned(),
@@ -139,7 +188,11 @@ impl Uploader {
         body: &Bytes,
     ) -> Result<Attempt, String> {
         let credentials = self.credentials().await?;
-        let region = self.settings.signing_region(self.environment.as_ref())?;
+        let from_environment = match self.settings.region_name {
+            Some(_) => Ok(None),
+            None => on_host(&self.host, |host| host.region_from_environment()).await,
+        };
+        let region = self.settings.signing_region(|| from_environment)?;
         let sent = send(
             &self.client,
             SignedRequest {
@@ -150,7 +203,7 @@ impl Uploader {
                 region: &region,
                 credentials: &credentials,
                 time: (self.clock)(),
-                timeout: Some(self.settings.attempt_timeout),
+                read_timeout: Some(self.settings.attempt_timeout),
             },
         )
         .await;
@@ -177,12 +230,18 @@ impl Uploader {
         }
     }
 
-    pub async fn upload(&self, object: &Object, limiter: &Limiter, in_flush: bool) -> Outcome {
+    pub async fn upload(
+        &self,
+        object: &Object,
+        body: &Bytes,
+        limiter: &Limiter,
+        in_flush: bool,
+    ) -> Outcome {
         let url = object_url(&self.settings, &object.key);
-        let headers = self.headers(object);
+        let headers = self.headers(object, body);
         let mut attempt_number = 0;
         let last = loop {
-            let attempt = match self.attempt(&url, &headers, &object.body).await {
+            let attempt = match self.attempt(&url, &headers, body).await {
                 Ok(attempt) => attempt,
                 Err(error) => {
                     tracing::error!("Error uploading to s3: {error}");
@@ -262,7 +321,7 @@ impl Uploader {
         };
         let headers = [("x-amz-content-sha256".to_owned(), EMPTY_SHA256.to_owned())];
         let reply = send(
-            &self.client,
+            &self.download_client,
             SignedRequest {
                 method: Method::GET,
                 url: &object_url(&self.settings, key),
@@ -271,7 +330,7 @@ impl Uploader {
                 region: &region,
                 credentials: &credentials,
                 time: (self.clock)(),
-                timeout: None,
+                read_timeout: Some(self.settings.download_read_timeout),
             },
         )
         .await;

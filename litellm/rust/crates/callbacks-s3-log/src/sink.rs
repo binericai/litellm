@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak, atomic::Ordering},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, atomic::Ordering},
     time::SystemTime,
 };
 
@@ -19,7 +19,7 @@ use crate::{
     key::{Stamp, download_name, logging_id, object_key, parent},
     limiter::Limiter,
     settings::{Environment, Granularity, Settings},
-    upload::{Backoff, Clock, Object, Outcome, Uploader},
+    upload::{Backoff, Body, Clock, Object, Outcome, Stash, Uploader},
 };
 
 pub const NAME: &str = "s3_v2";
@@ -29,11 +29,16 @@ const NDJSON: &str = "application/x-ndjson";
 pub trait Host: Send + Sync {
     fn callback_failed(&self);
     fn cold_storage_is_s3_v2(&self) -> bool;
+    fn render(&self, payload: u64) -> Result<Bytes, String>;
+    fn release(&self, payload: u64);
+    fn region_from_environment(&self) -> Result<Option<String>, String>;
+    fn web_identity_token(&self, reference: &str) -> Result<String, String>;
 }
 
 pub struct S3LogParts {
     pub settings: Settings,
     pub client: litellm_http::Client,
+    pub download_client: litellm_http::Client,
     pub environment: Arc<Environment>,
     pub clock: Clock,
     pub backoff: Backoff,
@@ -60,8 +65,6 @@ pub struct S3Log {
     host: Arc<dyn Host>,
     queue: Mutex<Queue>,
     flush_lock: tokio::sync::Mutex<()>,
-    periodic: OnceLock<()>,
-    this: Weak<S3Log>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,7 +78,8 @@ enum MetadataKind {
 
 #[derive(Debug, Deserialize)]
 struct Event {
-    body: String,
+    #[serde(rename = "body")]
+    _body: u64,
     start: Option<Stamp>,
     id: Option<String>,
     metadata: MetadataKind,
@@ -89,12 +93,12 @@ fn manifest() -> Manifest {
     Manifest {
         selection: Selection {
             activation: Activation::DefaultOn,
-            opt_out_by: vec![OptOutBy::Admin, OptOutBy::Caller],
-            honors_no_log: true,
+            opt_out_by: vec![OptOutBy::Admin],
+            honors_no_log: false,
             ..Selection::named(NAME)
         },
         subscriptions: vec![Subscription {
-            reads: FieldSet::of(&[Field::StandardLoggingPayload]),
+            reads: FieldSet::of(&[Field::DeprecatedKwargs]),
             ..Subscription::on(Hook::AttemptEnded)
         }],
         has_request_state: false,
@@ -109,12 +113,19 @@ impl S3Log {
             settings.adaptive_concurrency,
             settings.max_adaptive_concurrency,
         );
-        Arc::new_cyclic(|this| Self {
+        let resolver_host = Arc::clone(&parts.host);
+        let session_policy = settings.web_identity_session_policy.clone();
+        Arc::new(Self {
             manifest: manifest(),
             uploader: Uploader {
                 settings,
                 client: parts.client,
-                auth: AwsAuthService::default(),
+                download_client: parts.download_client,
+                host: Arc::clone(&parts.host),
+                auth: AwsAuthService::for_web_identity(
+                    Arc::new(move |reference: &str| resolver_host.web_identity_token(reference)),
+                    session_policy,
+                ),
                 environment: parts.environment,
                 clock: parts.clock,
                 backoff: parts.backoff,
@@ -124,8 +135,6 @@ impl S3Log {
             host: parts.host,
             queue: Mutex::default(),
             flush_lock: tokio::sync::Mutex::new(()),
-            periodic: OnceLock::new(),
-            this: Weak::clone(this),
         })
     }
 
@@ -156,13 +165,19 @@ impl S3Log {
     }
 
     fn push(&self, element: Element) -> usize {
-        self.start_periodic_flush();
         let mut queue = self.queue();
         queue.items.push(element);
         queue.items.len()
     }
 
-    fn element(&self, event: Event) -> Result<Element, String> {
+    fn stash(&self, payload: u64) -> Arc<Stash> {
+        Arc::new(Stash {
+            id: payload,
+            host: Arc::clone(&self.host),
+        })
+    }
+
+    fn element(&self, event: Event, body: Arc<Stash>) -> Result<Element, String> {
         let settings = self.settings();
         let start = event
             .start
@@ -214,7 +229,7 @@ impl S3Log {
         Ok(Element {
             object: Object {
                 key,
-                body: Bytes::from(event.body),
+                body: Body::Stashed(body),
                 content_type: JSON,
                 download_name: download_name(&start, &id),
             },
@@ -227,9 +242,15 @@ impl S3Log {
         if value.is_null() {
             return;
         }
-        let built = Event::deserialize(value)
-            .map_err(|error| error.to_string())
-            .and_then(|event| self.element(event));
+        let built = match value.get("body").and_then(Value::as_u64) {
+            Some(payload) => {
+                let body = self.stash(payload);
+                Event::deserialize(value)
+                    .map_err(|error| error.to_string())
+                    .and_then(|event| self.element(event, body))
+            }
+            None => Err("the event carries no stashed payload".to_owned()),
+        };
         match built {
             Ok(element) => {
                 self.push(element);
@@ -241,7 +262,8 @@ impl S3Log {
         }
     }
 
-    pub async fn submit_audit(&self, body: String, id: &str) {
+    pub async fn submit_audit(&self, payload: u64, id: &str) {
+        let body = self.stash(payload);
         let now = Stamp::utc((self.uploader.clock)());
         let key = object_key(
             self.settings().path.as_deref().unwrap_or_default(),
@@ -253,7 +275,7 @@ impl S3Log {
         let queued = self.push(Element {
             object: Object {
                 key,
-                body: Bytes::from(body),
+                body: Body::Stashed(body),
                 content_type: JSON,
                 download_name: format!("audit-{id}.json"),
             },
@@ -266,14 +288,17 @@ impl S3Log {
     }
 
     pub async fn upload_now(&self, key: String, body: String, download_name: String) -> bool {
+        let body = Bytes::from(body);
         let object = Object {
             key,
-            body: Bytes::from(body),
+            body: Body::Ready(body.clone()),
             content_type: NDJSON,
             download_name,
         };
-        self.start_periodic_flush();
-        let outcome = self.uploader.upload(&object, &self.limiter, false).await;
+        let outcome = self
+            .uploader
+            .upload(&object, &body, &self.limiter, false)
+            .await;
         if outcome != Outcome::Delivered {
             self.host.callback_failed();
         }
@@ -282,23 +307,6 @@ impl S3Log {
 
     pub async fn download(&self, key: &str) -> Option<Bytes> {
         self.uploader.download(key).await
-    }
-
-    fn start_periodic_flush(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        self.periodic.get_or_init(|| {
-            let Some(sink) = self.this.upgrade() else {
-                return;
-            };
-            runtime.spawn(async move {
-                loop {
-                    tokio::time::sleep(sink.settings().flush_interval).await;
-                    sink.flush().await;
-                }
-            });
-        });
     }
 
     pub async fn flush(&self) {
@@ -339,7 +347,7 @@ impl S3Log {
         true
     }
 
-    fn batch_files(&self, batch: &[Element]) -> Vec<Element> {
+    async fn batch_files(&self, batch: &[Element]) -> Result<Vec<Element>, String> {
         let now = Stamp::utc((self.uploader.clock)());
         let mut groups: BTreeMap<&str, Vec<&Element>> = BTreeMap::new();
         for element in batch.iter().filter(|element| !element.is_file) {
@@ -348,23 +356,24 @@ impl S3Log {
                 .or_default()
                 .push(element);
         }
-        let files = groups.into_iter().map(|(folder, elements)| {
+        let mut files = Vec::with_capacity(groups.len());
+        for (folder, elements) in groups {
             let name = format!("batch_{}_{}", now.clock(), uuid::Uuid::new_v4().simple());
             let mut body = Vec::new();
             for (index, element) in elements.iter().enumerate() {
                 if index > 0 {
                     body.push(b'\n');
                 }
-                body.extend_from_slice(&element.object.body);
+                body.extend_from_slice(&element.object.body.render().await?);
             }
-            Element {
+            files.push(Element {
                 object: Object {
                     key: if folder.is_empty() {
                         format!("{name}.jsonl")
                     } else {
                         format!("{folder}/{name}.jsonl")
                     },
-                    body: Bytes::from(body),
+                    body: Body::Ready(Bytes::from(body)),
                     content_type: NDJSON,
                     download_name: format!("{name}.jsonl"),
                 },
@@ -373,22 +382,29 @@ impl S3Log {
                     .filter_map(|element| element.retrying_since)
                     .min(),
                 is_file: true,
-            }
-        });
-        batch
+            });
+        }
+        Ok(batch
             .iter()
             .filter(|element| element.is_file)
             .cloned()
             .chain(files)
-            .collect()
+            .collect())
     }
 
     async fn upload_bounded(&self, element: &Element) -> Outcome {
         let _permit = self.limiter.acquire().await;
-        let outcome = self
-            .uploader
-            .upload(&element.object, &self.limiter, true)
-            .await;
+        let outcome = match element.object.body.render().await {
+            Ok(body) => {
+                self.uploader
+                    .upload(&element.object, &body, &self.limiter, true)
+                    .await
+            }
+            Err(error) => {
+                tracing::error!("Error uploading to s3: {error}");
+                Outcome::Retry
+            }
+        };
         if outcome != Outcome::Delivered {
             self.host.callback_failed();
         }
@@ -397,7 +413,16 @@ impl S3Log {
 
     async fn send_batch(&self, batch: Vec<Element>, requeued_count: usize) -> bool {
         let uploads = if self.batch_file_mode() {
-            self.batch_files(&batch)
+            match self.batch_files(&batch).await {
+                Ok(files) => files,
+                Err(error) => {
+                    tracing::error!(
+                        "CustomLogger: async_send_batch raised; preserving {} events in queue for retry: {error}",
+                        batch.len()
+                    );
+                    return false;
+                }
+            }
         } else {
             batch.clone()
         };
@@ -510,7 +535,7 @@ impl Callback for S3Log {
     fn handle<'a>(&'a self, input: &'a HookInput) -> BoxFuture<'a, HookOutput> {
         Box::pin(async move {
             if input.hook == Hook::AttemptEnded
-                && let Some(value) = input.fields.raw(Field::StandardLoggingPayload)?
+                && let Some(value) = input.fields.raw(Field::DeprecatedKwargs)?
             {
                 self.submit(value);
             }

@@ -1,11 +1,13 @@
 use std::{
+    collections::HashMap,
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use litellm_callbacks_s3_log::{Constants, Host, S3Log, S3LogParts, Settings};
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -17,6 +19,35 @@ use wiremock::{
 #[derive(Default)]
 struct Recorder {
     failures: AtomicUsize,
+    next: AtomicU64,
+    payloads: Mutex<HashMap<u64, Option<String>>>,
+    region: Mutex<Option<Result<Option<String>, String>>>,
+}
+
+impl Recorder {
+    fn stash(&self, body: Option<&str>) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.payloads
+            .lock()
+            .unwrap()
+            .insert(id, body.map(str::to_owned));
+        id
+    }
+
+    fn rewrite(&self, id: u64, body: &str) {
+        self.payloads
+            .lock()
+            .unwrap()
+            .insert(id, Some(body.to_owned()));
+    }
+
+    fn held(&self) -> usize {
+        self.payloads.lock().unwrap().len()
+    }
+
+    fn failures(&self) -> usize {
+        self.failures.load(Ordering::Relaxed)
+    }
 }
 
 impl Host for Recorder {
@@ -26,6 +57,25 @@ impl Host for Recorder {
 
     fn cold_storage_is_s3_v2(&self) -> bool {
         false
+    }
+
+    fn render(&self, payload: u64) -> Result<Bytes, String> {
+        match self.payloads.lock().unwrap().get(&payload) {
+            Some(Some(body)) => Ok(Bytes::from(body.clone())),
+            _ => Err("the payload cannot be encoded".to_owned()),
+        }
+    }
+
+    fn release(&self, payload: u64) {
+        self.payloads.lock().unwrap().remove(&payload);
+    }
+
+    fn region_from_environment(&self) -> Result<Option<String>, String> {
+        self.region.lock().unwrap().clone().unwrap_or(Ok(None))
+    }
+
+    fn web_identity_token(&self, reference: &str) -> Result<String, String> {
+        Ok(reference.to_owned())
     }
 }
 
@@ -38,6 +88,14 @@ fn no_env(_: &str) -> Option<String> {
 }
 
 fn sink(server: &MockServer, extra: Value) -> (Arc<S3Log>, Arc<Recorder>) {
+    sink_with(server, extra, Constants::default())
+}
+
+fn sink_with(
+    server: &MockServer,
+    extra: Value,
+    constants: Constants,
+) -> (Arc<S3Log>, Arc<Recorder>) {
     let mut params = json!({
         "s3_bucket_name": "logs",
         "s3_region_name": "us-east-1",
@@ -50,10 +108,15 @@ fn sink(server: &MockServer, extra: Value) -> (Arc<S3Log>, Arc<Recorder>) {
         .as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
+    params
+        .as_object_mut()
+        .unwrap()
+        .retain(|_, value| !value.is_null());
     let host = Arc::new(Recorder::default());
     let sink = S3Log::new(S3LogParts {
-        settings: Settings::from_params(params.as_object().unwrap(), &Constants::default()),
+        settings: Settings::from_params(params.as_object().unwrap(), &constants),
         client: litellm_http::Client::for_test(),
+        download_client: litellm_http::Client::for_test(),
         environment: Arc::new(no_env),
         clock: fixed_clock,
         backoff: Arc::new(|_| Duration::ZERO),
@@ -62,9 +125,13 @@ fn sink(server: &MockServer, extra: Value) -> (Arc<S3Log>, Arc<Recorder>) {
     (sink, host)
 }
 
-fn event(id: &str, body: &str) -> Value {
+fn event(host: &Recorder, id: &str, body: &str) -> Value {
+    event_with(host.stash(Some(body)), id)
+}
+
+fn event_with(payload: u64, id: &str) -> Value {
     json!({
-        "body": body,
+        "body": payload,
         "start": [2026, 11, 13, 9, 5, 7, 42],
         "id": id,
         "metadata": "mapping",
@@ -94,7 +161,7 @@ async fn a_flush_puts_one_object_per_event_with_the_python_headers() {
         &server,
         json!({"s3_use_team_prefix": true, "s3_sse_kms_key_id": "kms-1"}),
     );
-    sink.submit(&event("chatcmpl-1", "{\"id\": \"chatcmpl-1\"}"));
+    sink.submit(&event(&host, "chatcmpl-1", "{\"id\": \"chatcmpl-1\"}"));
     sink.flush().await;
 
     let requests = server.received_requests().await.unwrap();
@@ -143,8 +210,8 @@ async fn a_bucket_that_fails_every_upload_keeps_the_queue() {
         .mount(&server)
         .await;
     let (sink, host) = sink(&server, json!({}));
-    sink.submit(&event("a", "{}"));
-    sink.submit(&event("b", "{}"));
+    sink.submit(&event(&host, "a", "{}"));
+    sink.submit(&event(&host, "b", "{}"));
     sink.flush().await;
 
     assert_eq!(server.received_requests().await.unwrap().len(), 6);
@@ -173,9 +240,9 @@ async fn a_terminal_rejection_is_dropped_when_another_upload_lands() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
-    let (sink, _) = sink(&server, json!({}));
+    let (sink, host) = sink(&server, json!({}));
     for id in ["ok", "bad", "slow"] {
-        sink.submit(&event(id, "{}"));
+        sink.submit(&event(&host, id, "{}"));
     }
     sink.flush().await;
 
@@ -183,6 +250,7 @@ async fn a_terminal_rejection_is_dropped_when_another_upload_lands() {
         sink.queued_keys(),
         ["base/2026-11-13/time-09-05-07-000042_slow.json"]
     );
+    assert_eq!(host.held(), 1);
 }
 
 #[rstest]
@@ -193,9 +261,9 @@ async fn batch_files_group_one_flush_by_folder() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
-    let (sink, _) = sink(&server, json!({"s3_batch_file_upload": "yes"}));
-    sink.submit(&event("a", "{\"n\": 1}"));
-    sink.submit(&event("b", "{\"n\": 2}"));
+    let (sink, host) = sink(&server, json!({"s3_batch_file_upload": "yes"}));
+    sink.submit(&event(&host, "a", "{\"n\": 1}"));
+    sink.submit(&event(&host, "b", "{\"n\": 2}"));
     sink.flush().await;
 
     let requests = server.received_requests().await.unwrap();
@@ -218,11 +286,99 @@ async fn batch_files_group_one_flush_by_folder() {
 async fn an_event_python_would_reject_is_counted_and_skipped() {
     let server = MockServer::start().await;
     let (sink, host) = sink(&server, json!({"s3_use_key_prefix": true}));
-    let mut bad = event("a", "{}");
+    let mut bad = event(&host, "a", "{}");
     bad["key_alias"] = json!(true);
     sink.submit(&bad);
     sink.submit(&Value::Null);
 
     assert!(sink.queued_keys().is_empty());
-    assert_eq!(host.failures.load(Ordering::Relaxed), 1);
+    assert_eq!(host.failures(), 1);
+    assert_eq!(host.held(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn the_body_is_encoded_at_flush_and_released_once_delivered() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (sink, host) = sink(&server, json!({}));
+    let payload = host.stash(Some("{\"n\": 1}"));
+    sink.submit(&event_with(payload, "a"));
+    host.rewrite(payload, "{\"n\": 2}");
+    sink.flush().await;
+
+    assert_eq!(
+        server.received_requests().await.unwrap()[0].body,
+        b"{\"n\": 2}"
+    );
+    assert_eq!(host.held(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_body_that_cannot_be_encoded_stays_queued_and_counts_a_failure() {
+    let server = MockServer::start().await;
+    let (sink, host) = sink(&server, json!({}));
+    sink.submit(&event_with(host.stash(None), "a"));
+    sink.flush().await;
+
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(sink.queued_keys().len(), 1);
+    assert_eq!(host.failures(), 1);
+}
+
+#[rstest]
+#[case::environment(Ok(Some("ap-south-1".to_owned())), Some("/ap-south-1/"))]
+#[case::default(Ok(None), Some("/us-west-2/"))]
+#[case::invalid(Ok(Some("Ap_South".to_owned())), None)]
+#[case::secret_failure(Err("secret manager down".to_owned()), None)]
+#[tokio::test]
+async fn without_a_region_param_the_host_resolves_the_signing_region(
+    #[case] region: Result<Option<String>, String>,
+    #[case] scope: Option<&str>,
+) {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (sink, host) = sink(&server, json!({"s3_region_name": null}));
+    *host.region.lock().unwrap() = Some(region);
+    sink.submit(&event(&host, "a", "{}"));
+    sink.flush().await;
+
+    let requests = server.received_requests().await.unwrap();
+    let signed = requests
+        .first()
+        .and_then(|put| header(put, "authorization"))
+        .map(|authorization| scope.is_some_and(|scope| authorization.contains(scope)));
+    assert_eq!(signed, scope.map(|_| true));
+    assert_eq!(sink.queued_keys().len(), usize::from(scope.is_none()));
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_reply_slower_than_the_attempt_timeout_is_retried_then_kept() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(600)))
+        .mount(&server)
+        .await;
+    let (sink, host) = sink_with(
+        &server,
+        json!({}),
+        Constants {
+            upload_attempt_timeout_seconds: 0.1,
+            ..Constants::default()
+        },
+    );
+    sink.submit(&event(&host, "a", "{}"));
+    sink.flush().await;
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(sink.queued_keys().len(), 1);
+    assert_eq!(host.failures(), 1);
 }

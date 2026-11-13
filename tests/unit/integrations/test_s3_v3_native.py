@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import re
 import threading
@@ -9,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import patch
+from urllib.parse import parse_qs
 
 import pytest
 from pydantic import BaseModel
@@ -143,15 +145,22 @@ async def _loggers(
     return python_logger, rust_logger
 
 
-async def _log(python_logger: S3Logger, rust_logger: S3LoggerV3, payload: object) -> None:
-    kwargs: Final = {"standard_logging_object": payload}
-    await python_logger.async_log_success_event(kwargs, None, START, START)
+async def _log_native(rust_logger: S3LoggerV3, kwargs: Mapping[str, object]) -> None:
     await rust_logger.run_native(
         Hook.attempt_ended,
-        frozenset({Field.standard_logging_payload}),
-        SimpleNamespace(standard_logging_payload=payload),
+        frozenset({Field.deprecated_kwargs}),
+        SimpleNamespace(deprecated_kwargs=kwargs),
         SimpleNamespace(call=None, state=None),  # pyright: ignore[reportArgumentType]  # run_native reads only call and state
     )
+
+
+async def _log_each(python_logger: S3Logger, rust_logger: S3LoggerV3, payloads: tuple[object, object]) -> None:
+    await python_logger.async_log_success_event({"standard_logging_object": payloads[0]}, None, START, START)
+    await _log_native(rust_logger, {"standard_logging_object": payloads[1]})
+
+
+async def _log(python_logger: S3Logger, rust_logger: S3LoggerV3, payload: object) -> None:
+    await _log_each(python_logger, rust_logger, (payload, copy.deepcopy(payload)))
 
 
 async def _flush(python_logger: S3Logger, rust_logger: S3LoggerV3) -> None:
@@ -165,7 +174,12 @@ def _signed_headers(request: Received) -> str:
     return match.group(1)
 
 
-def _botocore_authorization(request: Received, port: int) -> str:
+def _botocore_authorization(
+    request: Received,
+    port: int,
+    credentials: tuple[str, str, str] = ("AKIDEXAMPLE", "secret", "session-token"),
+    region: str = "us-east-1",
+) -> str:
     from botocore.auth import S3SigV4Auth
     from botocore.awsrequest import AWSRequest
     from botocore.credentials import Credentials
@@ -181,7 +195,7 @@ def _botocore_authorization(request: Received, port: int) -> str:
     )
     at: Final = datetime.strptime(request.headers["x-amz-date"], "%Y%m%dT%H%M%SZ")
     with patch("botocore.auth.get_current_datetime", return_value=at):
-        S3SigV4Auth(Credentials("AKIDEXAMPLE", "secret", "session-token"), "s3", "us-east-1").add_auth(aws_request)
+        S3SigV4Auth(Credentials(*credentials), "s3", region).add_auth(aws_request)
     return aws_request.headers["Authorization"]
 
 
@@ -463,3 +477,228 @@ async def test_the_native_logger_answers_the_python_helpers(
     assert selection is not None
     assert selection.name == "s3_v2"
     assert json.loads(rust_logger.sink.callback().manifest())["subscriptions"][0]["hook"] == "attempt_ended"
+
+
+@pytest.mark.asyncio
+async def test_stripping_base64_rewrites_the_shared_payload_the_same_way(
+    buckets: tuple[FakeBucket, FakeBucket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, {"s3_strip_base64_files": True})
+    original: Final = _payload(
+        "with-file",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see data:image/png;base64,AAAA== inline"},
+                    {"type": "file", "file": {"file_data": "data:application/pdf;base64,JVBER"}},
+                ],
+            }
+        ],
+    )
+    python_payload, rust_payload = copy.deepcopy(original), copy.deepcopy(original)
+    await _log_each(python_logger, rust_logger, (python_payload, rust_payload))
+    assert rust_payload == python_payload != original
+    await _flush(python_logger, rust_logger)
+    _assert_same_puts(buckets, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_payload_changed_before_the_flush_is_stored_as_it_is_at_the_flush(
+    buckets: tuple[FakeBucket, FakeBucket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, {})
+    python_payload, rust_payload = _payload(), _payload()
+    await _log_each(python_logger, rust_logger, (python_payload, rust_payload))
+    for payload in (python_payload, rust_payload):
+        payload["metadata"]["late"] = "written after the event"  # pyright: ignore[reportIndexIssue]  # metadata is the dict _payload builds
+        payload["response_cost"] = 99.0
+    await _flush(python_logger, rust_logger)
+    _assert_same_puts(buckets, 1)
+    stored: Final = json.loads(buckets[1].puts()[0].body)
+    assert stored["metadata"]["late"] == "written after the event"
+    assert stored["response_cost"] == 0.000123
+    assert rust_logger.sink.stashed() == 0
+
+
+def test_both_loggers_need_a_running_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "s3_callback_params", _params("http://127.0.0.1:9", {}))
+    for flag in ("false", "true"):
+        monkeypatch.setenv("LITELLM_NATIVE_S3_V2", flag)
+        native_s3_v2_enabled.cache_clear()
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            new_s3_v2_logger()
+
+
+@pytest.mark.asyncio
+async def test_the_native_logger_flushes_on_its_own_after_the_interval(
+    buckets: tuple[FakeBucket, FakeBucket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(s3_v3, "DEFAULT_S3_FLUSH_INTERVAL_SECONDS", 0.05)
+    _, rust_logger = await _loggers(monkeypatch, buckets, {})
+    await _log_native(rust_logger, {"standard_logging_object": _payload()})
+    for _ in range(100):
+        if buckets[1].puts():
+            break
+        await asyncio.sleep(0.02)
+    assert [r.path for r in buckets[1].puts()] == ["/logs/2026-11-13/time-09-05-07-000042_chatcmpl-1.json"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("environment", "region"),
+    [
+        pytest.param({"AWS_REGION_NAME": "eu-central-1"}, "eu-central-1", id="region-name"),
+        pytest.param({"AWS_REGION_NAME": "eu-central-1", "AWS_REGION": "ap-south-1"}, "ap-south-1", id="region-wins"),
+        pytest.param({}, "us-west-2", id="default"),
+        pytest.param({"AWS_REGION": "Bad_Region"}, None, id="invalid"),
+    ],
+)
+async def test_without_a_region_param_both_sign_with_the_same_environment_region(
+    buckets: tuple[FakeBucket, FakeBucket],
+    monkeypatch: pytest.MonkeyPatch,
+    environment: Mapping[str, str],
+    region: str | None,
+) -> None:
+    for name in ("AWS_REGION_NAME", "AWS_REGION"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, {"s3_region_name": None})
+    with (
+        patch.object(S3Logger, "handle_callback_failure") as python_failures,
+        patch.object(s3_v3._Host, "callback_failed") as rust_failures,
+    ):
+        await _log(python_logger, rust_logger, _payload())
+        await _flush(python_logger, rust_logger)
+        await asyncio.sleep(0.2)
+    if region is None:
+        assert buckets[0].puts() == buckets[1].puts() == []
+        assert python_failures.call_count == rust_failures.call_count == 1
+        return
+    for bucket in buckets:
+        put = bucket.puts()[0]
+        assert put.headers["authorization"] == _botocore_authorization(put, bucket.port, region=region)
+
+
+@dataclass
+class FakeSts:
+    calls: list[Mapping[str, list[str]]] = field(default_factory=list)
+    port: int = 0
+
+
+STS_REPLY: Final = (
+    '<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">'
+    "<AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>AKIDSTS</AccessKeyId>"
+    "<SecretAccessKey>sts-secret</SecretAccessKey><SessionToken>sts-token</SessionToken>"
+    "<Expiration>2099-01-01T00:00:00Z</Expiration></Credentials>"
+    "<SubjectFromWebIdentityToken>subject</SubjectFromWebIdentityToken>"
+    "<AssumedRoleUser><Arn>arn:aws:sts::123456789012:assumed-role/logs/s3</Arn>"
+    "<AssumedRoleId>AROA:s3</AssumedRoleId></AssumedRoleUser><PackedPolicySize>10</PackedPolicySize>"
+    "</AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>"
+)
+
+
+@pytest.fixture
+def sts() -> Iterator[FakeSts]:
+    fake: Final = FakeSts()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_: object) -> None:
+            return
+
+        def do_POST(self) -> None:
+            body: Final = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            fake.calls.append(parse_qs(body.decode()))
+            reply: Final = STS_REPLY.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/xml")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+    server: Final = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    fake.port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield fake
+    server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_web_identity_assumes_the_role_with_the_same_session_policy(
+    buckets: tuple[FakeBucket, FakeBucket], monkeypatch: pytest.MonkeyPatch, sts: FakeSts
+) -> None:
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_EXTERNAL_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("S3_V3_TEST_OIDC_TOKEN", "oidc-token-value")
+    identity: Final = {
+        "s3_aws_access_key_id": None,
+        "s3_aws_secret_access_key": None,
+        "s3_aws_session_token": None,
+        "s3_aws_web_identity_token": "oidc/env/S3_V3_TEST_OIDC_TOKEN",
+        "s3_aws_role_name": "arn:aws:iam::123456789012:role/logs",
+        "s3_aws_session_name": f"s3-{sts.port}",
+        "s3_aws_sts_endpoint": f"http://127.0.0.1:{sts.port}",
+    }
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, identity)
+    await _log(python_logger, rust_logger, _payload())
+    await _flush(python_logger, rust_logger)
+    assert len(sts.calls) == 2
+    python_call, rust_call = sts.calls
+    for name in ("Action", "RoleArn", "RoleSessionName", "WebIdentityToken", "DurationSeconds", "Policy"):
+        assert rust_call.get(name) == python_call.get(name), name
+    assert rust_call["WebIdentityToken"] == ["oidc-token-value"]
+    assert json.loads(rust_call["Policy"][0]) == json.loads(S3Logger._web_identity_session_policy_document())
+    for bucket in buckets:
+        put = bucket.puts()[0]
+        assert put.headers["x-amz-security-token"] == "sts-token"
+        assert put.headers["authorization"] == _botocore_authorization(
+            put, bucket.port, credentials=("AKIDSTS", "sts-secret", "sts-token")
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("global_disable", [False, True])
+@pytest.mark.parametrize("no_log", [None, True, "true"])
+@pytest.mark.parametrize("disabled_header", [None, "s3_v2", "langfuse, S3_V2"])
+async def test_the_native_opt_out_matches_should_run_callback(
+    buckets: tuple[FakeBucket, FakeBucket],
+    monkeypatch: pytest.MonkeyPatch,
+    global_disable: bool,
+    no_log: object,
+    disabled_header: str | None,
+) -> None:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(litellm, "global_disable_no_log_param", global_disable)
+    monkeypatch.setattr(litellm, "allow_dynamic_callback_disabling", True)
+    monkeypatch.setattr(proxy_server, "premium_user", True)
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, {})
+    logging_obj: Final = Logging(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="acompletion",
+        litellm_call_id="call-1",
+        start_time=START,
+        function_id="fn-1",
+    )
+    litellm_params: Final = {
+        **({} if no_log is None else {"no-log": no_log}),
+        "proxy_server_request": {
+            "headers": {} if disabled_header is None else {"x-litellm-disable-callbacks": disabled_header}
+        },
+    }
+    expected: Final = logging_obj.should_run_callback(python_logger, litellm_params, "async_success_handler")
+    kwargs: Final = {
+        "litellm_params": litellm_params,
+        "standard_callback_dynamic_params": logging_obj.standard_callback_dynamic_params,
+        "standard_logging_object": _payload(),
+    }
+    assert s3_v3.legacy_should_log(kwargs) is expected
+    await _log_native(rust_logger, kwargs)
+    await rust_logger.flush_queue()
+    assert len(buckets[1].puts()) == int(expected)

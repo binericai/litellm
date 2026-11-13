@@ -1,4 +1,13 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use bytes::Bytes;
 
 use litellm_callbacks::Callback;
 use litellm_callbacks_python::NativeCallback;
@@ -14,11 +23,44 @@ use pyo3::{
     types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple},
 };
 
-struct PythonHost(Arc<Py<PyAny>>);
+struct PythonHost {
+    host: Arc<Py<PyAny>>,
+    payloads: Mutex<HashMap<u64, Py<PyAny>>>,
+    next: AtomicU64,
+    max_depth: usize,
+}
+
+impl PythonHost {
+    fn stash(&self, payload: Py<PyAny>) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.payloads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, payload);
+        id
+    }
+
+    fn ask<T>(
+        &self,
+        method: &str,
+        argument: Option<&str>,
+        read: impl for<'py> FnOnce(&Bound<'py, PyAny>) -> PyResult<T>,
+    ) -> Result<T, String> {
+        Python::attach(|py| {
+            let answer = match argument {
+                Some(argument) => self.host.call_method1(py, method, (argument,)),
+                None => self.host.call_method0(py, method),
+            };
+            answer
+                .and_then(|answer| read(answer.bind(py)))
+                .map_err(|error| error.to_string())
+        })
+    }
+}
 
 impl Host for PythonHost {
     fn callback_failed(&self) {
-        let host = Arc::clone(&self.0);
+        let host = Arc::clone(&self.host);
         let report = move || {
             Python::attach(|py| {
                 if let Err(error) = host.call_method0(py, "callback_failed") {
@@ -34,10 +76,48 @@ impl Host for PythonHost {
 
     fn cold_storage_is_s3_v2(&self) -> bool {
         Python::attach(|py| {
-            self.0
+            self.host
                 .call_method0(py, "cold_storage_is_s3_v2")
                 .and_then(|answer| answer.extract::<bool>(py))
                 .unwrap_or(false)
+        })
+    }
+
+    fn render(&self, payload: u64) -> Result<Bytes, String> {
+        Python::attach(|py| {
+            let value = self
+                .payloads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&payload)
+                .map(|value| value.clone_ref(py))
+                .ok_or_else(|| "the payload was already released".to_owned())?;
+            let mut out = Vec::new();
+            Encoder::new(py, self.max_depth)
+                .and_then(|mut encoder| encoder.encode(value.bind(py), 0, &mut out))
+                .map_err(|error| error.to_string())?;
+            Ok(Bytes::from(out))
+        })
+    }
+
+    fn release(&self, payload: u64) {
+        let released = self
+            .payloads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&payload);
+        drop(released);
+    }
+
+    fn region_from_environment(&self) -> Result<Option<String>, String> {
+        self.ask("region_from_environment", None, |answer| {
+            answer.extract::<Option<String>>()
+        })
+    }
+
+    fn web_identity_token(&self, reference: &str) -> Result<String, String> {
+        self.ask("web_identity_token", Some(reference), |answer| {
+            answer.extract::<String>()
         })
     }
 }
@@ -209,7 +289,21 @@ impl<'py> Encoder<'py> {
 #[pyclass(frozen, name = "NativeS3Log")]
 pub struct NativeS3Log {
     sink: Arc<S3Log>,
-    max_depth: usize,
+    host: Arc<PythonHost>,
+}
+
+fn client(
+    py: Python<'_>,
+    params: &Bound<'_, PyDict>,
+    connect_timeout_seconds: f64,
+) -> PyResult<litellm_http::Client> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("ssl_verify", params.get_item("s3_verify")?)?;
+    let mut config = crate::http::call_config(py, &kwargs, true)?;
+    config.connect_timeout = Duration::from_secs_f64(connect_timeout_seconds.max(0.0));
+    crate::http::pool()
+        .client(&config, ClientVariant::Provider)
+        .map_err(crate::http::client_error)
 }
 
 #[pymethods]
@@ -228,21 +322,22 @@ impl NativeS3Log {
             .as_object()
             .ok_or_else(|| PyValueError::new_err("s3 params must be a mapping"))?;
         let constants: Constants = from_py(constants)?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("ssl_verify", params.get_item("s3_verify")?)?;
-        let config = crate::http::call_config(py, &kwargs, true)?;
-        let client = crate::http::pool()
-            .client(&config, ClientVariant::Provider)
-            .map_err(crate::http::client_error)?;
+        let host = Arc::new(PythonHost {
+            host: Arc::new(host),
+            payloads: Mutex::default(),
+            next: AtomicU64::new(0),
+            max_depth,
+        });
         let sink = S3Log::new(S3LogParts {
             settings: Settings::from_params(resolved, &constants),
-            client,
+            client: client(py, params, constants.upload_attempt_timeout_seconds)?,
+            download_client: client(py, params, constants.download_connect_timeout_seconds)?,
             environment: Arc::new(|name: &str| std::env::var(name).ok()),
             clock: system_clock,
             backoff: Arc::new(python_backoff),
-            host: Arc::new(PythonHost(Arc::new(host))),
+            host: Arc::clone(&host) as Arc<dyn Host>,
         });
-        Ok(Self { sink, max_depth })
+        Ok(Self { sink, host })
     }
 
     fn callback(&self) -> PyResult<NativeCallback> {
@@ -251,26 +346,16 @@ impl NativeS3Log {
         )?)
     }
 
-    #[pyo3(signature = (value, prompts_only))]
-    fn encode(
-        &self,
-        py: Python<'_>,
-        value: &Bound<'_, PyAny>,
-        prompts_only: bool,
-    ) -> PyResult<String> {
-        let mut encoder = Encoder::new(py, self.max_depth)?;
-        let mut out = Vec::new();
-        match value.cast::<PyDict>() {
-            Ok(payload) => {
-                let copy = payload.copy()?;
-                if prompts_only {
-                    copy.set_item("response", py.None())?;
-                }
-                encoder.encode(copy.as_any(), 0, &mut out)?;
-            }
-            Err(_) => encoder.encode(value, 0, &mut out)?,
-        }
-        String::from_utf8(out).map_err(|error| PyValueError::new_err(error.to_string()))
+    fn stash(&self, payload: Py<PyAny>) -> u64 {
+        self.host.stash(payload)
+    }
+
+    fn stashed(&self) -> usize {
+        self.host
+            .payloads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     fn log_prompts_only(&self) -> bool {
@@ -298,12 +383,12 @@ impl NativeS3Log {
     fn submit_audit<'py>(
         &self,
         py: Python<'py>,
-        body: String,
+        payload: u64,
         id: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let sink = Arc::clone(&self.sink);
         crate::execution::run_async_value(py, async move {
-            sink.submit_audit(body, &id).await;
+            sink.submit_audit(payload, &id).await;
             Ok(())
         })
     }

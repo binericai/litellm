@@ -38,9 +38,14 @@ pub struct AwsAuthService {
 
 impl Default for AwsAuthService {
     fn default() -> Self {
-        Self::new(Arc::new(NativeProviderLoader))
+        Self::new(Arc::new(NativeProviderLoader {
+            token: None,
+            policy: None,
+        }))
     }
 }
+
+pub type WebIdentityTokenResolver = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
 impl AwsAuthService {
     fn new(loader: Arc<dyn ProviderLoader>) -> Self {
@@ -52,6 +57,16 @@ impl AwsAuthService {
                 .build(),
             loader,
         }
+    }
+
+    pub fn for_web_identity(
+        resolver: WebIdentityTokenResolver,
+        session_policy: Option<String>,
+    ) -> Self {
+        Self::new(Arc::new(NativeProviderLoader {
+            token: Some(resolver),
+            policy: session_policy,
+        }))
     }
 }
 
@@ -81,11 +96,19 @@ trait ProviderLoader: Send + Sync {
     fn load(&self, config: AwsAuthConfig, flow: AwsAuthFlow) -> ProviderFuture<'_>;
 }
 
-struct NativeProviderLoader;
+struct NativeProviderLoader {
+    token: Option<WebIdentityTokenResolver>,
+    policy: Option<String>,
+}
 
 impl ProviderLoader for NativeProviderLoader {
     fn load(&self, config: AwsAuthConfig, flow: AwsAuthFlow) -> ProviderFuture<'_> {
-        Box::pin(build_provider(config, flow))
+        Box::pin(build_provider(
+            config,
+            flow,
+            self.token.clone(),
+            self.policy.clone(),
+        ))
     }
 }
 
@@ -347,6 +370,8 @@ impl AwsAuthFlow {
 async fn build_provider(
     resolved: AwsAuthConfig,
     flow: AwsAuthFlow,
+    token_resolver: Option<WebIdentityTokenResolver>,
+    policy: Option<String>,
 ) -> Result<SharedCredentialsProvider, Error> {
     match flow {
         AwsAuthFlow::SessionToken {
@@ -417,8 +442,10 @@ async fn build_provider(
             role,
             session_name,
         } => Ok(SharedCredentialsProvider::new(WebIdentityProvider {
+            policy,
             client: aws_sdk_sts::Client::new(&sdk_config(resolved).await),
             token,
+            token_resolver,
             role,
             session_name,
         })),
@@ -448,12 +475,25 @@ async fn sdk_config(config: AwsAuthConfig) -> aws_types::SdkConfig {
     loader.load().await
 }
 
-#[derive(Debug)]
 struct WebIdentityProvider {
     client: aws_sdk_sts::Client,
     token: SecretValue,
+    token_resolver: Option<WebIdentityTokenResolver>,
+    policy: Option<String>,
     role: String,
     session_name: String,
+}
+
+impl std::fmt::Debug for WebIdentityProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebIdentityProvider")
+            .field("token", &self.token)
+            .field("policy", &self.policy)
+            .field("role", &self.role)
+            .field("session_name", &self.session_name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProvideCredentials for WebIdentityProvider {
@@ -464,12 +504,23 @@ impl ProvideCredentials for WebIdentityProvider {
         Self: 'a,
     {
         aws_credential_types::provider::future::ProvideCredentials::new(async {
-            let response = self
+            let token = match &self.token_resolver {
+                Some(resolve) => resolve(self.token.expose()).map_err(|message| {
+                    CredentialsError::provider_error(std::io::Error::other(message))
+                })?,
+                None => self.token.expose().to_owned(),
+            };
+            let request = self
                 .client
                 .assume_role_with_web_identity()
                 .role_arn(&self.role)
                 .role_session_name(&self.session_name)
-                .web_identity_token(self.token.expose())
+                .web_identity_token(token);
+            let request = match &self.policy {
+                Some(policy) => request.policy(policy).duration_seconds(3600),
+                None => request,
+            };
+            let response = request
                 .send()
                 .await
                 .map_err(CredentialsError::provider_error)?;
