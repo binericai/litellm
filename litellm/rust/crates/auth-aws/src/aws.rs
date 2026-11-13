@@ -505,9 +505,17 @@ impl ProvideCredentials for WebIdentityProvider {
     {
         aws_credential_types::provider::future::ProvideCredentials::new(async {
             let token = match &self.token_resolver {
-                Some(resolve) => resolve(self.token.expose()).map_err(|message| {
-                    CredentialsError::provider_error(std::io::Error::other(message))
-                })?,
+                Some(resolve) => {
+                    let resolve = Arc::clone(resolve);
+                    let reference = self.token.expose().to_owned();
+                    tokio::task::spawn_blocking(move || resolve(&reference))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|token| token)
+                        .map_err(|message| {
+                            CredentialsError::provider_error(std::io::Error::other(message))
+                        })?
+                }
                 None => self.token.expose().to_owned(),
             };
             let request = self

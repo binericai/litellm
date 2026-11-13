@@ -23,7 +23,8 @@ use crate::{
     limiter::Limiter,
     settings::{Environment, Granularity, Settings},
     upload::{
-        Backoff, Body, Clock, Object, Outcome, Stash, Uploader, panic_message, render_bodies,
+        Backoff, Body, Clock, Object, Outcome, Stash, Uploader, on_host, panic_message,
+        render_bodies,
     },
 };
 
@@ -349,11 +350,14 @@ impl S3Log {
         }
     }
 
-    fn batch_file_mode(&self) -> bool {
+    async fn batch_file_mode(&self) -> bool {
         if !self.settings().batch_file_upload {
             return false;
         }
-        if self.host.cold_storage_is_s3_v2() {
+        if on_host(&self.host, |host| host.cold_storage_is_s3_v2())
+            .await
+            .unwrap_or(false)
+        {
             tracing::warn!(
                 "s3 logging: s3_batch_file_upload is ignored because s3_v2 is the cold storage logger; per-request objects are required for spend log lookups"
             );
@@ -433,7 +437,7 @@ impl S3Log {
     }
 
     async fn send_batch(&self, batch: Vec<Element>, requeued_count: usize) -> bool {
-        let uploads = if self.batch_file_mode() {
+        let uploads = if self.batch_file_mode().await {
             match self.batch_files(&batch).await {
                 Ok(files) => files,
                 Err(error) => {
