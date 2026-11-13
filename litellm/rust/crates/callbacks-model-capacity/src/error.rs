@@ -24,6 +24,8 @@ pub enum CapacityError {
     Config(String),
     #[error("unhashable type: '{0}'")]
     Unhashable(&'static str),
+    #[error("{0}")]
+    Type(String),
     #[error("the host answered {method} with an unexpected shape: {detail}")]
     Shape {
         method: &'static str,
@@ -46,6 +48,17 @@ impl CapacityError {
 
     pub fn unhashable(&self) -> bool {
         matches!(self, Self::Unhashable(_))
+    }
+
+    pub fn is_type_error(&self) -> bool {
+        matches!(self, Self::Unhashable(_) | Self::Type(_))
+    }
+
+    pub fn python_message(&self) -> String {
+        match self {
+            Self::Raised(raised) => raised.message.clone(),
+            _ => self.to_string(),
+        }
     }
 
     pub fn is_registry_unavailable(&self) -> bool {

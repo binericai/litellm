@@ -190,7 +190,13 @@ impl ModelCapacity {
         if facts.failed {
             return self.failure(facts, stash).await;
         }
-        let _ = self.success(facts, stash).await;
+        if let Err(error) = self.success(facts, stash).await {
+            let message = format!(
+                "Error in dynamic rate limiter success event: {}",
+                error.python_message()
+            );
+            let _ = self.engine.host.log("error", &message).await;
+        }
         Ok(None)
     }
 

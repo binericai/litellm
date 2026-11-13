@@ -444,16 +444,23 @@ class _MetricsTap(PrometheusLogger):
 
 class _UnlicensedTap(logging.Handler):
     def __init__(self) -> None:
-        super().__init__(level=logging.ERROR)
+        super().__init__(level=logging.INFO)
         self.count = 0
+        self.lines: list[tuple[str, str]] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         if record.getMessage() == UNLICENSED_PRIORITY_MESSAGE:
             self.count += 1
+        self.lines.append((record.levelname, record.getMessage()))
 
     def take(self) -> int:
         taken: Final = self.count
         self.count = 0
+        return taken
+
+    def take_lines(self) -> tuple[tuple[str, str], ...]:
+        taken: Final = tuple(self.lines)
+        self.lines.clear()
         return taken
 
 
@@ -469,6 +476,7 @@ async def _differential(
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
     tap: Final = _UnlicensedTap()
     verbose_proxy_logger.addHandler(tap)
+    monkeypatch.setattr(verbose_proxy_logger, "level", logging.INFO)
     transcripts: Final[list[list[object]]] = []
     try:
         for build in (PythonSide, NativeSide):
@@ -494,7 +502,7 @@ async def _transcript(
     transcript: Final[list[object]] = []
     for step in steps:
         clock.advance(step.advance)
-        transcript.append([*await _run_step(side, step), ("unlicensed", tap.take())])
+        transcript.append([*await _run_step(side, step), ("unlicensed", tap.take()), ("logged", tap.take_lines())])
     transcript.append(await _counters(side, scopes))
     return transcript
 
@@ -953,7 +961,7 @@ async def test_unlicensed_priorities_log_the_premium_line_the_same_number_of_tim
         for name in ("high", "low", "none")
     ]
     python: Final = await _differential(monkeypatch, isolated, router, steps, [("priority_model", "lic:high")])
-    assert sum(step[-1][1] for step in python[:-2]) > 0, python
+    assert sum(step[-2][1] for step in python[:-2]) > 0, python
 
 
 def _socket_connection(name: str, key: UserAPIKeyAuth, turns: Sequence[Turn]) -> Step:

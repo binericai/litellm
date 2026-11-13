@@ -94,6 +94,7 @@ pub trait CapacityHost: Send + Sync {
     fn throttled<'a>(&'a self, event: &'a Throttle) -> SeamFuture<'a, ()>;
     fn set_share<'a>(&'a self, gauge: &'a ShareGauge) -> SeamFuture<'a, ()>;
     fn unlicensed_priority(&self) -> SeamFuture<'_, ()>;
+    fn log<'a>(&'a self, level: &'static str, message: &'a str) -> SeamFuture<'a, ()>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,5 +271,9 @@ impl<D: Delegate> CapacityHost for Delegated<D> {
 
     fn unlicensed_priority(&self) -> SeamFuture<'_, ()> {
         self.invoke("unlicensed_priority", json!({}))
+    }
+
+    fn log<'a>(&'a self, level: &'static str, message: &'a str) -> SeamFuture<'a, ()> {
+        self.invoke("log", json!({"level": level, "message": message}))
     }
 }

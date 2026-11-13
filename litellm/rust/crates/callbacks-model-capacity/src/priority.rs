@@ -14,9 +14,14 @@ fn as_float(value: &Value) -> Result<f64, CapacityError> {
             .as_f64()
             .ok_or_else(|| CapacityError::Config(format!("{number} is not a float"))),
         Value::Bool(flag) => Ok(f64::from(u8::from(*flag))),
-        Value::String(text) => text.trim().parse::<f64>().map_err(|_| {
-            CapacityError::Config(format!("could not convert string to float: {text:?}"))
-        }),
+        Value::String(text) => pyfmt::numeric_text(text)
+            .and_then(|text| text.parse::<f64>().ok())
+            .ok_or_else(|| {
+                CapacityError::Config(format!(
+                    "could not convert string to float: {}",
+                    pyfmt::str_repr(text)
+                ))
+            }),
         other => Err(CapacityError::Config(format!(
             "float() argument must be a string or a real number, not {other}"
         ))),
@@ -58,6 +63,14 @@ pub fn normalized_weights(
     let Some(reservation) = &settings.priority_reservation else {
         return Ok(Vec::new());
     };
+    if let Some(index) = reservation.iter().position(|(_, value)| {
+        !matches!(value, Value::Number(_) | Value::Bool(_) | Value::Object(_))
+    }) {
+        let left = if index == 0 { "int" } else { "float" };
+        return Err(CapacityError::Type(format!(
+            "unsupported operand type(s) for +: '{left}' and 'NoneType'"
+        )));
+    }
     let weights = reservation
         .iter()
         .map(|(name, value)| {
@@ -266,6 +279,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(converted, 0.5);
+    }
+
+    #[rstest]
+    #[case::first(&[("a", json!("x")), ("b", json!(0.5))], "'int' and 'NoneType'")]
+    #[case::later(&[("a", json!(0.5)), ("b", json!([1]))], "'float' and 'NoneType'")]
+    fn a_reservation_python_cannot_convert_fails_the_sum_like_python(
+        #[case] reservation: &[(&str, Value)],
+        #[case] operands: &str,
+    ) {
+        let error =
+            normalized_weights(&settings(reservation), &group(Some(1000), None)).unwrap_err();
+        assert!(error.is_type_error());
+        assert_eq!(
+            error.to_string(),
+            format!("unsupported operand type(s) for +: {operands}")
+        );
     }
 
     #[rstest]

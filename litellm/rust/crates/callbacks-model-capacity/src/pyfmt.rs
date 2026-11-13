@@ -80,6 +80,29 @@ pub fn equals(left: &Value, right: &Value) -> bool {
     }
 }
 
+pub fn numeric_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let digit = |index: Option<usize>| {
+        index
+            .and_then(|index| chars.get(index))
+            .is_some_and(char::is_ascii_digit)
+    };
+    let misplaced = chars
+        .iter()
+        .enumerate()
+        .any(|(index, ch)| *ch == '_' && !(digit(index.checked_sub(1)) && digit(Some(index + 1))));
+    (!misplaced).then(|| trimmed.replace('_', ""))
+}
+
+pub fn str_repr(text: &str) -> String {
+    if text.contains('\'') && !text.contains('"') {
+        format!("\"{text}\"")
+    } else {
+        format!("'{}'", text.replace('\'', "\\'"))
+    }
+}
+
 pub fn sum(values: impl IntoIterator<Item = f64>) -> f64 {
     let mut total = 0.0_f64;
     let mut compensation = 0.0_f64;
@@ -127,6 +150,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[rstest]
+    #[case::grouped(" 1_000 ", Some("1000"))]
+    #[case::plain("12.5", Some("12.5"))]
+    #[case::leading("_1", None)]
+    #[case::trailing("1_", None)]
+    #[case::doubled("1__0", None)]
+    #[case::beside_a_point("1_.5", None)]
+    fn numbers_accept_underscores_only_between_digits_like_python(
+        #[case] text: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(numeric_text(text).as_deref(), expected);
+    }
 
     #[rstest]
     #[case(2.0, "2.0")]

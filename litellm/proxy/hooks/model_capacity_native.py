@@ -1,9 +1,11 @@
+import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import count
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from fastapi import HTTPException
@@ -83,6 +85,7 @@ RATE_LIMIT_KIND: Final = "model_capacity_rate_limit"
 RERAISE_KIND: Final = "model_capacity_reraise"
 _TOKENS: Final = count(1)
 _CALL_TYPES: Final = frozenset(call_type.value for call_type in CallTypes)
+_LOG_LEVELS: Final = MappingProxyType({"error": logging.ERROR, "warning": logging.WARNING, "info": logging.INFO})
 _TARGETED_HOOKS: Final = frozenset({Hook.pre_call, Hook.post_call_success, Hook.attempt_ended})
 _SYNC_CALL_TYPES: Final = frozenset(name for name in _CALL_TYPES if f"a{name}" in _CALL_TYPES)
 
@@ -472,7 +475,12 @@ class CapacityDelegate:
                 team_id=None if live.auth is None else live.auth.team_id,
                 rate_limit_type=self.v3_limiter.get_rate_limit_type(),
             )
-        except Exception:  # noqa: BLE001  # an unreadable prompt still holds the minimum so admission runs
+        except Exception as error:  # noqa: BLE001  # an unreadable prompt still holds the minimum so admission runs
+            from litellm._logging import verbose_proxy_logger
+
+            verbose_proxy_logger.warning(
+                "Dynamic rate limiter: token estimate failed for %s, holding one token: %s", model, error
+            )
             return {"kind": "failed"}
         return {"kind": "tokens", "tokens": estimate}
 
@@ -589,6 +597,13 @@ class CapacityDelegate:
         return None
 
     @_seam
+    async def log(self, args: Mapping[str, object]) -> object:
+        from litellm._logging import verbose_proxy_logger
+
+        verbose_proxy_logger.log(_LOG_LEVELS[str(args["level"])], str(args["message"]))
+        return None
+
+    @_seam
     async def unlicensed_priority(self, _args: Mapping[str, object]) -> object:
         from litellm._logging import verbose_proxy_logger
 
@@ -597,19 +612,23 @@ class CapacityDelegate:
 
     @_seam
     async def set_share(self, args: Mapping[str, object]) -> object:
+        from litellm._logging import verbose_proxy_logger
         from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
             _prometheus_loggers,  # pyright: ignore[reportPrivateUsage]  # one metrics source
         )
 
-        for logger in _prometheus_loggers():
-            logger.set_dynamic_limiter_share(
-                model_group=str(args["model_group"]),
-                team=str(args["team"]),
-                team_alias=args["team_alias"] if isinstance(args["team_alias"], str) else None,
-                priority=args["priority"],  # pyright: ignore[reportArgumentType]  # the priority value as the handler passes it
-                share_tokens=int(str(args["share_tokens"])),
-                borrowed_tokens=int(str(args["borrowed_tokens"])),
-            )
+        try:
+            for logger in _prometheus_loggers():
+                logger.set_dynamic_limiter_share(
+                    model_group=str(args["model_group"]),
+                    team=str(args["team"]),
+                    team_alias=args["team_alias"] if isinstance(args["team_alias"], str) else None,
+                    priority=args["priority"],  # pyright: ignore[reportArgumentType]  # the priority value as the handler passes it
+                    share_tokens=int(str(args["share_tokens"])),
+                    borrowed_tokens=int(str(args["borrowed_tokens"])),
+                )
+        except Exception as metrics_error:  # noqa: BLE001  # a failing metrics sink must not change settlement
+            verbose_proxy_logger.warning("Dynamic rate limiter share metrics failed: %s", metrics_error)
         return None
 
 

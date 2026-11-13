@@ -168,7 +168,7 @@ impl NativeModelCapacity {
 fn failure(error: &CapacityError) -> Value {
     match error.raised() {
         Some(raised) => json!({"raised": raised.token}),
-        None if error.unhashable() => json!({"type_error": error.to_string()}),
+        None if error.is_type_error() => json!({"type_error": error.to_string()}),
         None => json!({"failed": error.to_string()}),
     }
 }

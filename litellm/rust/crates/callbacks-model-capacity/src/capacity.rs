@@ -181,6 +181,10 @@ pub fn reservation_covers(
         }))
 }
 
+fn python_optional(value: Option<&str>) -> &str {
+    value.unwrap_or("None")
+}
+
 fn python_int(value: &Value) -> Result<i64, CapacityError> {
     match value {
         Value::Number(number) => number
@@ -188,10 +192,14 @@ fn python_int(value: &Value) -> Result<i64, CapacityError> {
             .or_else(|| number.as_f64().map(|float| float.trunc() as i64))
             .ok_or_else(|| CapacityError::Config(format!("{number} is not an int"))),
         Value::Bool(flag) => Ok(i64::from(*flag)),
-        Value::String(text) => text
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| CapacityError::Config(format!("invalid literal for int(): {text:?}"))),
+        Value::String(text) => pyfmt::numeric_text(text)
+            .and_then(|text| text.parse::<i64>().ok())
+            .ok_or_else(|| {
+                CapacityError::Config(format!(
+                    "invalid literal for int() with base 10: {}",
+                    pyfmt::str_repr(text)
+                ))
+            }),
         other => Err(CapacityError::Config(format!("{other} is not an int"))),
     }
 }
@@ -202,9 +210,14 @@ fn python_float(value: &Value) -> Result<f64, CapacityError> {
             .as_f64()
             .ok_or_else(|| CapacityError::Config(format!("{number} is not a float"))),
         Value::Bool(flag) => Ok(f64::from(u8::from(*flag))),
-        Value::String(text) => text.trim().parse::<f64>().map_err(|_| {
-            CapacityError::Config(format!("could not convert string to float: {text:?}"))
-        }),
+        Value::String(text) => pyfmt::numeric_text(text)
+            .and_then(|text| text.parse::<f64>().ok())
+            .ok_or_else(|| {
+                CapacityError::Config(format!(
+                    "could not convert string to float: {}",
+                    pyfmt::str_repr(text)
+                ))
+            }),
         other => Err(CapacityError::Config(format!("{other} is not a float"))),
     }
 }
@@ -274,9 +287,17 @@ pub struct Settlement<'a> {
 
 impl Engine {
     pub async fn saturation(&self, settings: &Settings, model: &str, group: &GroupInfo) -> f64 {
-        self.read_saturation(settings, model, group)
-            .await
-            .unwrap_or(0.0)
+        match self.read_saturation(settings, model, group).await {
+            Ok(saturation) => saturation,
+            Err(error) => {
+                let message = format!(
+                    "Error checking saturation for {model}: {}",
+                    error.python_message()
+                );
+                let _ = self.host.log("error", &message).await;
+                0.0
+            }
+        }
     }
 
     async fn read_saturation(
@@ -620,7 +641,14 @@ impl Engine {
                 PreCall::Refuse(refusal)
             }
             Err(AdmitError::Failed(error)) if error.is_http() => PreCall::Raise(error),
-            Err(AdmitError::Failed(_)) => PreCall::Allow,
+            Err(AdmitError::Failed(error)) => {
+                let message = format!(
+                    "Error in dynamic rate limiter: {}, allowing request",
+                    error.python_message()
+                );
+                let _ = self.host.log("error", &message).await;
+                PreCall::Allow
+            }
         }
     }
 
@@ -631,13 +659,20 @@ impl Engine {
         group: &GroupInfo,
         steered: Option<Steered>,
     ) -> Result<Option<Steered>, AdmitError> {
-        if let Some(steered) = steered
-            && self
+        if let Some(steered) = steered {
+            if self
                 .admit(request, &steered.model, &steered.group)
                 .await
                 .is_ok()
-        {
-            return Ok(Some(steered));
+            {
+                return Ok(Some(steered));
+            }
+            let message = format!(
+                "Alternate {} refused team {}, staying on {model}",
+                steered.model,
+                python_optional(request.key.team_id.as_deref())
+            );
+            let _ = self.host.log("info", &message).await;
         }
         self.admit(request, model, group).await?;
         Ok(None)
@@ -649,10 +684,17 @@ impl Engine {
         model: &str,
         group: &GroupInfo,
     ) -> Option<Steered> {
-        self.pick_alternate(request, model, group)
-            .await
-            .ok()
-            .flatten()
+        match self.pick_alternate(request, model, group).await {
+            Ok(steered) => steered,
+            Err(_) => {
+                let message = format!(
+                    "Alternate check failed for team {}, staying on {model}",
+                    python_optional(request.key.team_id.as_deref())
+                );
+                let _ = self.host.log("warning", &message).await;
+                None
+            }
+        }
     }
 
     async fn pick_alternate(
@@ -687,6 +729,11 @@ impl Engine {
                 .idle_permitted_alternate(request, alternate, threshold, group)
                 .await?
             {
+                let message = format!(
+                    "Steering team {} from {model} to {alternate}",
+                    python_optional(request.key.team_id.as_deref())
+                );
+                let _ = self.host.log("info", &message).await;
                 return Ok(Some(candidate));
             }
         }
