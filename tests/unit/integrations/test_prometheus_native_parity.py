@@ -16,6 +16,7 @@ from prometheus_client.registry import Collector
 import litellm
 from litellm._logging import verbose_logger
 from litellm.integrations.prometheus import PrometheusLogger
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.integrations.prometheus_helpers.native_store import (
     NATIVE_PROMETHEUS_ENV,
     NativeFamilyCollector,
@@ -692,9 +693,8 @@ async def _completion_text(native: bool, registration: str, scenario: str, monke
             metadata=metadata,
             **options,
         )
-        if options.get("stream") is True:
-            async for _ in response:
-                pass
+        if isinstance(response, CustomStreamWrapper):
+            assert [chunk.id async for chunk in response]
     except litellm.RateLimitError:
         pass
     await asyncio.sleep(1)
