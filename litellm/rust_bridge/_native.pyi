@@ -688,6 +688,8 @@ __all__ = [
     "NativeModelCostMap",
     "NativeModelCostMapState",
     "NativePending",
+    "NativePrometheusMetric",
+    "NativePrometheusStore",
     "NativeProvenance",
     "NativeRateLimits",
     "NativeRedisBreaker",
@@ -729,6 +731,7 @@ __all__ = [
     "ocr_health_check_document",
     "ocr_passthrough_response",
     "process_state_started",
+    "prometheus_callback",
     "reserve_process_for_forking",
     "responses",
     "trace_encode_error",
@@ -1289,6 +1292,7 @@ _PrometheusFamily = tuple[
 
 @final
 class NativePrometheusMetric:
+    def __new__(cls, _uninstantiable: Never, /) -> Never: ...
     @property
     def name(self) -> str: ...
     def labels(self, *args: object, **kwargs: object) -> NativePrometheusMetric: ...
@@ -1301,13 +1305,13 @@ class NativePrometheusMetric:
 
 @final
 class NativePrometheusStore:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         max_series: int | None = None,
         ttl_seconds: float | None = None,
         cleanup_interval_seconds: float | None = None,
         manual_clock: bool = False,
-    ) -> None: ...
+    ) -> NativePrometheusStore: ...
     def set_time(self, monotonic: float, wall: float) -> None: ...
     def declare_labels(self, metric: str, labels: Sequence[str]) -> None: ...
     def metric(
@@ -1333,12 +1337,11 @@ class NativePrometheusStore:
     def collect(self) -> list[_PrometheusFamily]: ...
     def encode_text(self, created: bool = True) -> str: ...
 
-@final
-class NativeCallback:
+class _NativeCallback(Protocol):
     def manifest(self) -> str: ...
     def request_state(self) -> object: ...
     def handle(
         self, hook: str, fields: Mapping[str, object], call: Mapping[str, object] | None, state: object, /
     ) -> Future[object]: ...
 
-def prometheus_callback(store: NativePrometheusStore, owns_latency: bool) -> NativeCallback: ...
+def prometheus_callback(store: NativePrometheusStore, owns_latency: bool) -> _NativeCallback: ...
