@@ -19,10 +19,10 @@ use litellm_callbacks_s3_log::{
 use litellm_host_python::{from_py, json_from_py};
 use litellm_http::ClientVariant;
 use pyo3::{
-    exceptions::PyValueError,
     prelude::*,
     types::{PyBool, PyCFunction, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple},
 };
+use serde_json::{Map, Value};
 use tokio::sync::oneshot;
 
 type Payloads = Arc<Mutex<HashMap<u64, Py<PyAny>>>>;
@@ -337,6 +337,7 @@ impl<'py> Encoder<'py> {
             return self.raw(&structure, out);
         }
         if !container {
+            self.seen.insert(identity);
             match value.str() {
                 Ok(text) => self.text(&text, out)?,
                 Err(_) => write_str(out, "Unserializable Object"),
@@ -379,6 +380,29 @@ fn client(
         .map_err(crate::http::client_error)
 }
 
+fn settings_param(value: &Bound<'_, PyAny>) -> Value {
+    if let Ok(integer) = value.cast::<PyInt>()
+        && !value.is_instance_of::<PyBool>()
+        && integer.extract::<i64>().is_err()
+        && integer.extract::<u64>().is_err()
+    {
+        return value
+            .str()
+            .map_or(Value::Null, |text| Value::String(text.to_string()));
+    }
+    json_from_py(value).unwrap_or(Value::Null)
+}
+
+fn settings_params(params: &Bound<'_, PyDict>) -> Map<String, Value> {
+    params
+        .iter()
+        .filter_map(|(key, value)| {
+            let key = key.cast_into::<PyString>().ok()?;
+            Some((key.to_str().ok()?.to_owned(), settings_param(&value)))
+        })
+        .collect()
+}
+
 #[pymethods]
 impl NativeS3Log {
     #[new]
@@ -390,10 +414,7 @@ impl NativeS3Log {
         host: Py<PyAny>,
         max_depth: usize,
     ) -> PyResult<Self> {
-        let resolved = json_from_py(params.as_any())?;
-        let resolved = resolved
-            .as_object()
-            .ok_or_else(|| PyValueError::new_err("s3 params must be a mapping"))?;
+        let resolved = settings_params(params);
         let constants: Constants = from_py(constants)?;
         let host = Arc::new(PythonHost {
             host: Arc::new(host),
@@ -402,7 +423,7 @@ impl NativeS3Log {
             max_depth,
         });
         let sink = S3Log::new(S3LogParts {
-            settings: Settings::from_params(resolved, &constants),
+            settings: Settings::from_params(&resolved, &constants),
             client: client(py, params, constants.upload_attempt_timeout_seconds)?,
             download_client: client(py, params, constants.download_connect_timeout_seconds)?,
             environment: Arc::new(|name: &str| std::env::var(name).ok()),

@@ -37,7 +37,7 @@ CALLBACK_NAME: Final = "s3_v2"
 MetadataKind: TypeAlias = Literal["missing", "none", "mapping", "other"]
 
 _MISSING: Final = object()
-_FAILED: Final = {"failed": True}
+_FAILED: Final = "failed"
 
 
 @cache
@@ -112,12 +112,20 @@ def _alias(value: object) -> object:
     return value if isinstance(value, str) else True
 
 
-def _start(value: object) -> list[int] | None:  # mutable-ok: crosses into Rust as a JSON list
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
+def _start_time(start_time: object, timestamp: object) -> datetime | None:
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        return start_time if isinstance(start_time, datetime) else None
+    if isinstance(start_time, datetime) and start_time.timestamp() == timestamp:
+        return start_time
     try:
-        start: Final = datetime.fromtimestamp(value)  # noqa: DTZ006  # naive local time, as the start_time the Python logger formats
+        return datetime.fromtimestamp(timestamp)  # noqa: DTZ006  # naive local time, as the start_time the Python logger formats
     except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _start(start_time: object, timestamp: object) -> list[int] | None:  # mutable-ok: crosses into Rust as a JSON list
+    start: Final = _start_time(start_time, timestamp)
+    if start is None:
         return None
     return [start.year, start.month, start.day, start.hour, start.minute, start.second, start.microsecond]
 
@@ -139,7 +147,7 @@ def legacy_should_log(kwargs: Mapping[str, object]) -> bool:
     )
 
 
-def project_payload(sink: "NativeS3Log", payload: object) -> object:
+def project_payload(sink: "NativeS3Log", payload: object, start_time: object = None) -> object:
     if payload is None:
         return None
     if not isinstance(payload, Mapping):
@@ -156,24 +164,27 @@ def project_payload(sink: "NativeS3Log", payload: object) -> object:
     cold_storage_object_key: Final = get("cold_storage_object_key") if kind == "mapping" else None
     stored: Final = dict(prompts_only_payload(stripped) if sink.log_prompts_only() else stripped)  # pyright: ignore[reportArgumentType]  # the StandardLoggingPayload copy S3Logger queues
     return {
-        "body": sink.stash(stored),
-        "start": _start(stripped.get("startTime")),
+        "start": _start(start_time, stripped.get("startTime")),
         "id": payload_id if isinstance(payload_id, str) else None,
         "metadata": kind,
         "team_alias": _alias(get("user_api_key_team_alias")),
         "key_alias": _alias(get("user_api_key_alias")),
         "cold_storage_object_key": cold_storage_object_key if isinstance(cold_storage_object_key, str) else None,
         "cold_storage_s3_v2": litellm.cold_storage_custom_logger == "s3_v2",
+        "body": sink.stash(stored),
     }
 
 
 def project_kwargs(sink: "NativeS3Log", kwargs: object) -> object:
     from litellm.litellm_core_utils.litellm_logging import V2_ASYNC_LOGGING_LINE
 
-    if not V2_ASYNC_LOGGING_LINE.get() or not isinstance(kwargs, Mapping) or not legacy_should_log(kwargs):
+    if not V2_ASYNC_LOGGING_LINE.get() or not isinstance(kwargs, Mapping):
+        return None
+    fields: Final[Mapping[str, object]] = kwargs
+    if not legacy_should_log(fields):
         return None
     try:
-        return project_payload(sink, kwargs.get("standard_logging_object"))
+        return project_payload(sink, fields.get("standard_logging_object"), fields.get("start_time"))
     except Exception as e:  # noqa: BLE001  # S3Logger counts a failure to build the element and moves on
         verbose_logger.exception("s3 Layer Error - %s", e)
         return _FAILED
