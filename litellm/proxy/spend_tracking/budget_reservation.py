@@ -5,6 +5,7 @@ import json
 import math
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from itertools import chain
@@ -47,7 +48,9 @@ from litellm.proxy.spend_tracking.input_tokens import (
     openai_chat_pdf_file_tokens,
 )
 from litellm.proxy.spend_tracking.native_budgets import (
+    await_native_admission,
     is_native_reservation,
+    native_admission,
     native_budget_route,
     native_budgets,
     new_reservation_id,
@@ -440,6 +443,7 @@ async def reconcile_budget_reservation(
     """Settle every reserved counter on ``actual_cost``. With ``apply_consistent`` False the adjustments for
     counters that still hold the reservation are returned instead of written, so the caller can pipeline them with
     its own increments and then call ``stamp_budget_reservation_actual_cost``."""
+    await await_native_admission(budget_reservation)
     if not budget_reservation or budget_reservation.get("finalized") is True:
         return ()
 
@@ -506,6 +510,10 @@ async def release_budget_reservation_on_cancel(
     when success/failure handling already reconciled, so calling it on every
     cancellation path is safe.
     """
+    admission: Final = native_admission(budget_reservation)
+    if admission is not None:
+        with suppress(asyncio.CancelledError, Exception):
+            _ = await asyncio.shield(admission)
     if not budget_reservation or budget_reservation.get("finalized") is True:
         return
     incurred_cost: Final = float(budget_reservation.get("input_cost") or 0.0)

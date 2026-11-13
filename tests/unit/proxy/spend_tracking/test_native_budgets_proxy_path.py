@@ -540,3 +540,53 @@ def test_a_reservation_refusal_reaches_the_client_like_the_auth_refusal(
 
     assert python.status == 422
     assert native == python
+
+
+@dataclass(frozen=True, slots=True)
+class _GatedTake:
+    budgets: object
+    entered: asyncio.Event
+    opened: asyncio.Event
+
+    async def take(self, reservation_id: str) -> object:
+        self.entered.set()
+        _ = await self.opened.wait()
+        take: Final = getattr(self.budgets, "take")
+        return await take(reservation_id)
+
+
+async def _cancel_during_pre_call(proxy: Proxy, native: bool, monkeypatch: pytest.MonkeyPatch) -> Mapping[str, float]:
+    _use_native(proxy, native)
+    auth: Final = await _authenticate(proxy, max_budget=1.0)
+    data: Final = {**BODY, "litellm_call_id": f"call-cancel-{native}"}
+    gate: Final = _GatedTake(native_budgets.native_budgets(), asyncio.Event(), asyncio.Event())
+    if native:
+        monkeypatch.setattr(type(litellm.callbacks[0]), "budgets", gate)
+    pre_call: Final = asyncio.ensure_future(
+        proxy.logging.pre_call_hook(user_api_key_dict=auth, data=data, call_type="completion")
+    )
+    if native:
+        _ = await gate.entered.wait()
+    _ = pre_call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pre_call
+    release: Final = asyncio.ensure_future(
+        budget_reservation.release_budget_reservation_on_cancel(auth.budget_reservation)
+    )
+    await asyncio.sleep(0)
+    gate.opened.set()
+    await release
+    for _ in range(3):
+        await asyncio.sleep(0)
+    return dict(proxy.store.snapshot())
+
+
+@pytest.mark.asyncio
+async def test_a_client_that_disconnects_during_pre_call_leaves_no_hold_like_python(
+    proxy: Proxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python: Final = await _cancel_during_pre_call(proxy, False, monkeypatch)
+    native: Final = await _cancel_during_pre_call(proxy, True, monkeypatch)
+
+    assert python[KEY_COUNTER] > 0.0, "the flag-off run must charge the input cost on cancel"
+    assert native == python

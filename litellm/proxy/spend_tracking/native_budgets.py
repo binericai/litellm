@@ -5,6 +5,7 @@ import os
 import uuid
 import weakref
 from collections.abc import Mapping
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
@@ -93,6 +94,21 @@ def pending_native_reservation(
         )
     )
     return reservation
+
+
+_admissions: Final[dict[int, asyncio.Future[Patch | Abort | None]]] = {}  # mutable-ok: in-flight admissions by reservation
+
+
+def native_admission(reservation: Mapping[str, object] | None) -> asyncio.Future[Patch | Abort | None] | None:
+    return None if reservation is None else _admissions.get(id(reservation))
+
+
+async def await_native_admission(reservation: Mapping[str, object] | None) -> None:
+    admission: Final = native_admission(reservation)
+    if admission is None:
+        return
+    with suppress(Exception):
+        _ = await asyncio.shield(admission)
 
 
 _REFUSAL_TYPES: Final = (litellm.BudgetExceededError, HTTPException, ProxyException)
@@ -234,11 +250,23 @@ class NativeBudgetsLogger(NativeLogger):
         plan: Final = None if pending is None else pending.claim()
         if pending is None or plan is None:
             return await super().run_native(hook, reads, view, ctx)
-        token: Final = _admitting.set(plan)
-        try:
-            outcome: Final = await super().run_native(hook, reads, view, ctx)
-        finally:
-            _admitting.reset(token)
+        key: Final = id(pending.reservation)
+        admission: Final = asyncio.ensure_future(self._admit(pending, plan, hook, reads, view, ctx))
+        _admissions[key] = admission
+        admission.add_done_callback(lambda _: _admissions.pop(key, None))
+        return await asyncio.shield(admission)
+
+    async def _admit(
+        self,
+        pending: _PendingPlan,
+        plan: Mapping[str, object],
+        hook: Hook,
+        reads: frozenset[Field],
+        view: object,
+        ctx: CallContext[object],
+    ) -> Patch | Abort | None:
+        _ = _admitting.set(plan)
+        outcome: Final = await super().run_native(hook, reads, view, ctx)
         await self._mirror(pending, plan)
         if isinstance(outcome, Abort) and outcome.exception is not None:
             _refusals[outcome.exception] = pending
