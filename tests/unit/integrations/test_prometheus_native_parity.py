@@ -41,6 +41,11 @@ _SETTINGS: Final = (
     "prometheus_deployment_and_latency_caller_identity",
     "prometheus_emit_input_sequence_length_label",
     "prometheus_latency_buckets",
+    "prometheus_emit_rate_limit_labels",
+    "prometheus_user_budget_label_include_email_alias",
+    "disable_end_user_cost_tracking",
+    "prometheus_metrics_ttl_seconds",
+    "prometheus_metrics_cleanup_interval_seconds",
 )
 
 
@@ -369,6 +374,11 @@ async def _direct_calls(logger: PrometheusLogger) -> list[str]:
         litellm.RateLimitError(message="slow down", llm_provider="openai", model="gpt-4o-mini"),
         UserAPIKeyAuth(api_key="hashed", user_id="u", team_id="team-1"),
     )
+    await logger.async_post_call_failure_hook(
+        {"model": "gpt-group", "metadata": {"requester_ip_address": "10.0.0.2"}},
+        litellm.AuthenticationError(message="bad key", llm_provider="openai", model="gpt-4o-mini"),
+        UserAPIKeyAuth(api_key="hashed", user_id="u", user_email="u@example.com", key_alias="k", team_id="team-1"),
+    )
     return outcomes + _budget_calls(logger) + [await _counts(logger)]
 
 
@@ -528,6 +538,18 @@ CONFIGS: Final[Mapping[str, Mapping[str, object]]] = {
         "prometheus_latency_buckets": [0.1, 1, 2.5, 600],
     },
     "input_sequence_length": {"prometheus_emit_input_sequence_length_label": True},
+    "rate_limit_labels": {"prometheus_emit_rate_limit_labels": True},
+    "user_budget_email_alias": {"prometheus_user_budget_label_include_email_alias": True},
+    "caller_identity_user_email": {"prometheus_deployment_and_latency_caller_identity": "user_email"},
+    "end_user_cost_tracking_disabled": {
+        "enable_end_user_cost_tracking_prometheus_only": True,
+        "disable_end_user_cost_tracking": True,
+    },
+    "series_cap_ttl": {
+        "prometheus_metrics_max_series_per_metric": 3,
+        "prometheus_metrics_ttl_seconds": 0.000001,
+        "prometheus_metrics_cleanup_interval_seconds": 0,
+    },
 }
 
 
@@ -553,6 +575,35 @@ async def test_the_native_store_and_handler_expose_exactly_what_the_python_logge
         assert 'team="team-raise"' in python_text
         assert 'litellm_remaining_team_budget_metric{team="team-raise"' not in python_text
         assert 'org_id="org-dst"} 3044.0' in python_text
+
+
+async def _shared_call_id_lines(native: bool, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    if native:
+        monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
+    else:
+        monkeypatch.delenv(NATIVE_PROMETHEUS_ENV, raising=False)
+    logger: Final = PrometheusLogger()
+    shared: Final = [
+        {
+            **_event(20 + index, user=user, metadata={"user_api_key_team_id": f"team-{user}"}),
+            "litellm_call_id": "shared",
+        }
+        for index, user in enumerate(("x", "y"))
+    ]
+    outcomes: Final = await asyncio.gather(*(_success_outcome(logger, kwargs) for kwargs in shared))
+    text: Final = _masked(generate_latest(_ours()).decode())
+    _clear_registry()
+    return sorted([*text.splitlines(), *outcomes])
+
+
+async def test_concurrent_attempts_sharing_a_call_id_keep_their_own_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    python_lines: Final = await _shared_call_id_lines(False, monkeypatch)
+    native_lines: Final = await _shared_call_id_lines(True, monkeypatch)
+
+    assert any(
+        'team="team-y"' in line and line.startswith("litellm_remaining_team_budget_metric") for line in python_lines
+    )
+    assert native_lines == python_lines
 
 
 async def _openmetrics(native: bool, monkeypatch: pytest.MonkeyPatch) -> str:
