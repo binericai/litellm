@@ -1,6 +1,3 @@
-//! `BatchEnqueuedTokenStore`'s keyspace: its single-key Lua, byte for byte as `main`'s Python
-//! registers it, and the raw memory keys its in-process fallback keeps.
-
 use std::{sync::LazyLock, time::Duration};
 
 use litellm_redis_client::{
@@ -50,7 +47,6 @@ static REFUND: LazyLock<Script> = LazyLock::new(|| Script::new(REFUND_ENQUEUED_T
 static SAVE: LazyLock<Script> = LazyLock::new(|| Script::new(SAVE_RESERVATION));
 static POP: LazyLock<Script> = LazyLock::new(|| Script::new(POP_RESERVATION));
 
-/// `RESERVE_ENQUEUED_TOKENS_SCRIPT`'s reply: whether it charged, and the counter it saw or left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnqueuedReply {
     pub reserved: bool,
@@ -103,7 +99,6 @@ impl RateLimits {
         )))
     }
 
-    /// Held across the fallback's read-modify-writes, which the Python store guards with its lock.
     pub fn enqueued_guard(&self) -> UpdateGuard<'_> {
         self.cache.memory().guard()
     }

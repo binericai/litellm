@@ -25,8 +25,6 @@ pub struct Memory<V: Clone> {
     updates: UpdateLock,
 }
 
-/// The tier's update lock. Unlike a mutex guard it can also be taken and released by separate
-/// calls, so a caller in another language can hold it across a read and a write of its own.
 #[derive(Default)]
 pub struct UpdateLock {
     held: Mutex<bool>,

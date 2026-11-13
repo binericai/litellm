@@ -84,8 +84,6 @@ impl RateLimits {
             .collect()
     }
 
-    /// Held across a read-modify-write of the memory tier, so it is atomic against every
-    /// increment of the tier and every other holder, in Rust or in Python.
     pub fn memory_guard(&self) -> UpdateGuard<'_> {
         self.cache.memory().guard()
     }
