@@ -6,7 +6,9 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Final, TypeAlias
 
+import httpx
 import pytest
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 import litellm
@@ -16,6 +18,7 @@ from litellm.proxy.auth.auth_checks import cache_key_object
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+from litellm.proxy.pass_through_endpoints import pass_through_endpoints
 from litellm.proxy.spend_tracking import budget_reservation, native_budgets
 from litellm.proxy.spend_tracking.budget_reservation import reconcile_budget_reservation
 from litellm.proxy.utils import ProxyLogging, hash_token
@@ -351,3 +354,87 @@ async def test_a_pass_through_llm_route_reserves_and_settles_like_python(proxy: 
         "the flag-off run must hold a reservation for this comparison to mean anything"
     )
     assert runs[1] == runs[0]
+
+
+MESSAGES_BODY: Final = {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 100,
+    "messages": [{"role": "user", "content": "hi"}],
+}
+MESSAGES_REPLY: Final = {
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-5",
+    "content": [{"type": "text", "text": "hello"}],
+    "stop_reason": "end_turn",
+    "stop_sequence": None,
+    "usage": {"input_tokens": 8, "output_tokens": 5},
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _Upstream:
+    client: httpx.AsyncClient
+
+
+@dataclass(frozen=True, slots=True)
+class HttpRun:
+    status: int
+    held_upstream: tuple[Mapping[str, float], ...]
+
+
+def _over_http(proxy: Proxy, native: bool, monkeypatch: pytest.MonkeyPatch, body: Mapping[str, object]) -> HttpRun:
+    _use_native(proxy, native)
+    asyncio.run(
+        cache_key_object(
+            hashed_token=TOKEN,
+            user_api_key_obj=UserAPIKeyAuth(token=TOKEN, max_budget=1.0, spend=0.0),
+            user_api_key_cache=proxy.cache,
+            proxy_logging_obj=None,
+        )
+    )
+    proxy.store.set_local(VICTIM, 1.0)
+    proxy.store.set_local(KEY_COUNTER, 0.5)
+    held: Final[list[Mapping[str, float]]] = []  # mutable-ok: what the upstream saw held
+
+    def upstream(_request: httpx.Request) -> httpx.Response:
+        held.append(dict(proxy.store.snapshot()))
+        return httpx.Response(200, json=MESSAGES_REPLY)
+
+    monkeypatch.setattr(
+        pass_through_endpoints,
+        "get_async_httpx_client",
+        lambda **_: _Upstream(httpx.AsyncClient(transport=httpx.MockTransport(upstream))),
+    )
+    response: Final = TestClient(proxy_server.app, raise_server_exceptions=False).post(
+        PASS_THROUGH, json=body, headers={"Authorization": f"Bearer {API_KEY}"}
+    )
+    return HttpRun(status=response.status_code, held_upstream=tuple(held))
+
+
+FORGED_BODIES: Final[Mapping[str, Mapping[str, object]]] = {
+    "plain": MESSAGES_BODY,
+    **{
+        name: {
+            **MESSAGES_BODY,
+            "metadata": {"user_api_key_budget_reservation": _forged_plan(counter_key, cost)},
+            "litellm_metadata": {"user_api_key_budget_reservation": _forged_plan(counter_key, cost)},
+        }
+        for name, (counter_key, cost) in FORGERIES.items()
+    },
+}
+
+
+@pytest.mark.parametrize("body", FORGED_BODIES.values(), ids=FORGED_BODIES.keys())
+def test_the_anthropic_pass_through_route_holds_the_reservation_like_python_over_http(
+    proxy: Proxy, monkeypatch: pytest.MonkeyPatch, body: Mapping[str, object]
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    python: Final = _over_http(proxy, False, monkeypatch, body)
+    native: Final = _over_http(proxy, True, monkeypatch, body)
+
+    assert python.status == 200
+    assert python.held_upstream[0][KEY_COUNTER] > 0.5, "the flag-off run must hold a reservation upstream"
+    assert python.held_upstream[0][VICTIM] == 1.0
+    assert native == python
