@@ -321,6 +321,8 @@ async def reserve_budget_for_request(
         return None
     if native_budgets() is not None and native_budget_route(route):
         return await _native_budget_plan(
+            request_body=request_body,
+            route=route,
             counters=counters,
             valid_token=valid_token,
             reservation_cost=reservation_cost,
@@ -382,6 +384,8 @@ async def reserve_budget_for_request(
 
 
 async def _native_budget_plan(
+    request_body: Mapping[str, object],
+    route: str,
     counters: Sequence[_BudgetCounter],
     valid_token: UserAPIKeyAuth,
     reservation_cost: float,
@@ -422,6 +426,8 @@ async def _native_budget_plan(
         },
         valid_token,
         input_tokens,
+        route,
+        request_body,
     )
 
 

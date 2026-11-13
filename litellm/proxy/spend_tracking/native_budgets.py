@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+import weakref
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 import litellm
@@ -40,6 +41,9 @@ class _PendingPlan:
     identity: UserAPIKeyAuth
     request_task: asyncio.Task[object] | None
     plan: Mapping[str, object] | None
+    route: str
+    request_data: Mapping[str, object]
+    request: Request | None = None
 
     def claim(self) -> Mapping[str, object] | None:
         plan: Final = self.plan
@@ -49,6 +53,7 @@ class _PendingPlan:
 
 _pending_plan: Final[ContextVar[_PendingPlan | None]] = ContextVar("native_budget_plan", default=None)
 _admitting: Final[ContextVar[Mapping[str, object] | None]] = ContextVar("native_budget_admission", default=None)
+_refusals: Final[weakref.WeakKeyDictionary[Exception, _PendingPlan]] = weakref.WeakKeyDictionary()
 
 
 def new_reservation_id() -> str:
@@ -56,7 +61,11 @@ def new_reservation_id() -> str:
 
 
 def pending_native_reservation(
-    plan: Mapping[str, object], identity: UserAPIKeyAuth, input_tokens: int | None
+    plan: Mapping[str, object],
+    identity: UserAPIKeyAuth,
+    input_tokens: int | None,
+    route: str,
+    request_data: Mapping[str, object],
 ) -> dict[str, object]:  # mutable-ok: settlement stamps the reservation it returns
     reservation: Final[dict[str, object]] = {  # mutable-ok: settlement stamps the reservation it returns
         "reserved_cost": 0.0,
@@ -67,9 +76,49 @@ def pending_native_reservation(
         "input_tokens": input_tokens,
     }
     _ = _pending_plan.set(
-        _PendingPlan(reservation=reservation, identity=identity, request_task=asyncio.current_task(), plan=plan)
+        _PendingPlan(
+            reservation=reservation,
+            identity=identity.model_copy(),
+            request_task=asyncio.current_task(),
+            plan=plan,
+            route=route,
+            request_data={
+                **request_data,
+                **{
+                    name: dict(bucket)
+                    for name in ("metadata", "litellm_metadata")
+                    if isinstance(bucket := request_data.get(name), Mapping)
+                },
+            },
+        )
     )
     return reservation
+
+
+_REFUSAL_TYPES: Final = (litellm.BudgetExceededError, HTTPException, ProxyException)
+
+
+def bind_native_request(reservation: Mapping[str, object] | None, request: Request) -> None:
+    pending: Final = _pending_plan.get()
+    if pending is not None and reservation is not None and pending.reservation is reservation:
+        pending.request = request
+
+
+async def raise_native_admission_refusal(error: Exception) -> None:
+    pending: Final = _refusals.pop(error, None) if isinstance(error, _REFUSAL_TYPES) else None
+    if pending is None or pending.request is None:
+        return
+    from litellm.proxy.auth.auth_exception_handler import UserAPIKeyAuthExceptionHandler
+
+    _ = await UserAPIKeyAuthExceptionHandler.handle_authentication_error(
+        e=error,
+        request=pending.request,
+        request_data=pending.request_data,
+        route=pending.route,
+        parent_otel_span=pending.identity.parent_otel_span,
+        api_key="",
+        resolved_identity=pending.identity,
+    )
 
 
 _NATIVE_CALL_TYPES: Final = frozenset(
@@ -144,20 +193,14 @@ def native_budget_route(route: str) -> bool:
 
 
 def _budget_exceeded(wire: WireAbort) -> Exception:
-    from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
-
     fields: Final = _BudgetExceededFields.model_validate(wire.error.fields if wire.error else {})
-    error: Final = litellm.BudgetExceededError(
+    return litellm.BudgetExceededError(
         current_cost=fields.current_cost,
         max_budget=fields.max_budget,
         message=fields.message,
         entity_type=fields.entity_type,
         entity_id=fields.entity_id,
     )
-    _, error.llm_provider = resolve_llm_provider_for_rate_limit(fields.model)
-    error.type = ProxyErrorTypes.budget_exceeded  # pyright: ignore[reportAttributeAccessIssue]  # the route handler reads error.type for the client body, as auth's ProxyException sets it
-    error.param = None  # pyright: ignore[reportAttributeAccessIssue]  # auth sends param null for a budget refusal
-    return error
 
 
 def _budget_unavailable(wire: WireAbort) -> Exception:
@@ -197,6 +240,8 @@ class NativeBudgetsLogger(NativeLogger):
         finally:
             _admitting.reset(token)
         await self._mirror(pending, plan)
+        if isinstance(outcome, Abort) and outcome.exception is not None:
+            _refusals[outcome.exception] = pending
         return outcome
 
     async def _mirror(self, pending: _PendingPlan, plan: Mapping[str, object]) -> None:

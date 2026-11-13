@@ -8,13 +8,14 @@ from typing import Final, TypeAlias
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 import litellm
 from litellm.proxy import proxy_server
-from litellm.proxy._types import ProxyException, UserAPIKeyAuth
-from litellm.proxy.auth.auth_checks import cache_key_object
+from litellm.proxy._types import LiteLLM_TeamTableCachedObj, ProxyErrorTypes, ProxyException, UserAPIKeyAuth
+from litellm.proxy.auth.auth_checks import cache_key_object, cache_team_object
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
@@ -437,4 +438,105 @@ def test_the_anthropic_pass_through_route_holds_the_reservation_like_python_over
     assert python.status == 200
     assert python.held_upstream[0][KEY_COUNTER] > 0.5, "the flag-off run must hold a reservation upstream"
     assert python.held_upstream[0][VICTIM] == 1.0
+    assert native == python
+
+
+TEAM: Final = "team-at-max"
+TEAM_COUNTER: Final = f"spend:team:{TEAM}"
+
+
+@dataclass(frozen=True, slots=True)
+class Refusal:
+    status: int
+    body: str
+    headers: Mapping[str, str]
+    failure_hooks: tuple[Mapping[str, object], ...]
+    counters: Mapping[str, float]
+
+
+def _refused_over_http(
+    proxy: Proxy, native: bool, monkeypatch: pytest.MonkeyPatch, path: str, body: Mapping[str, object]
+) -> Refusal:
+    _use_native(proxy, native)
+
+    async def seed() -> None:
+        await cache_key_object(
+            hashed_token=TOKEN,
+            user_api_key_obj=UserAPIKeyAuth(token=TOKEN, team_id=TEAM, spend=0.0),
+            user_api_key_cache=proxy.cache,
+            proxy_logging_obj=None,
+        )
+        await cache_team_object(
+            team_id=TEAM,
+            team_table=LiteLLM_TeamTableCachedObj(team_id=TEAM, max_budget=1.0, spend=0.0),
+            user_api_key_cache=proxy.cache,
+            proxy_logging_obj=None,
+        )
+
+    asyncio.run(seed())
+    proxy.store.set_local(TEAM_COUNTER, 1.0)
+    hooks: Final[list[Mapping[str, object]]] = []  # mutable-ok: one entry per failure hook call
+    original: Final = proxy.logging.post_call_failure_hook
+
+    async def recording(
+        request_data: dict[str, object],  # mutable-ok: the hook's own signature
+        original_exception: Exception,
+        user_api_key_dict: UserAPIKeyAuth,
+        error_type: ProxyErrorTypes | None = None,
+        route: str | None = None,
+        traceback_str: str | None = None,
+        dispatched_call_type: str | None = None,
+    ) -> HTTPException | None:
+        hooks.append(
+            {
+                "exception": (type(original_exception).__name__, str(original_exception)),
+                "llm_provider": getattr(original_exception, "llm_provider", None),
+                "error_type": error_type,
+                "route": route,
+                "dispatched_call_type": dispatched_call_type,
+                "identity": (user_api_key_dict.token, user_api_key_dict.team_id, user_api_key_dict.request_route),
+                "budget_reservation": user_api_key_dict.budget_reservation,
+                "request_keys": sorted(request_data),
+            }
+        )
+        return await original(
+            request_data=request_data,
+            original_exception=original_exception,
+            user_api_key_dict=user_api_key_dict,
+            error_type=error_type,
+            route=route,
+            traceback_str=traceback_str,
+            dispatched_call_type=dispatched_call_type,
+        )
+
+    monkeypatch.setattr(proxy.logging, "post_call_failure_hook", recording)
+    response: Final = TestClient(proxy_server.app, raise_server_exceptions=False).post(
+        path, json=body, headers={"Authorization": f"Bearer {API_KEY}"}
+    )
+    return Refusal(
+        status=response.status_code,
+        body=response.text,
+        headers=dict(response.headers),
+        failure_hooks=tuple(hooks),
+        counters=dict(proxy.store.snapshot()),
+    )
+
+
+REFUSED_ROUTES: Final[Mapping[str, tuple[str, Mapping[str, object]]]] = {
+    "chat_completions": ("/v1/chat/completions", BODY),
+    "anthropic_pass_through": (PASS_THROUGH, MESSAGES_BODY),
+    "messages": ("/v1/messages", MESSAGES_BODY),
+}
+
+
+@pytest.mark.parametrize("route", REFUSED_ROUTES.values(), ids=REFUSED_ROUTES.keys())
+def test_a_reservation_refusal_reaches_the_client_like_the_auth_refusal(
+    proxy: Proxy, monkeypatch: pytest.MonkeyPatch, route: tuple[str, Mapping[str, object]]
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    path, body = route
+    python: Final = _refused_over_http(proxy, False, monkeypatch, path, body)
+    native: Final = _refused_over_http(proxy, True, monkeypatch, path, body)
+
+    assert python.status == 422
     assert native == python

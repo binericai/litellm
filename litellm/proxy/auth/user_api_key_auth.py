@@ -4354,6 +4354,7 @@ async def _reserve_budget_after_common_checks(
         from litellm.proxy.spend_tracking.budget_reservation import (
             reserve_budget_for_request,
         )
+        from litellm.proxy.spend_tracking.native_budgets import bind_native_request
 
         reservation_path_params: Final = read_request_path_params(request)
         user_api_key_auth_obj.budget_reservation = await reserve_budget_for_request(
@@ -4376,6 +4377,8 @@ async def _reserve_budget_after_common_checks(
             raw_body=await read_raw_json_body(request=request),
             path_params=reservation_path_params,
         )
+        if request is not None:
+            bind_native_request(user_api_key_auth_obj.budget_reservation, request)
     if request is not None:
         reservation: Final = user_api_key_auth_obj.budget_reservation
         request.state.budget_reservation = reservation  # rebind-ok: read by the release middleware
