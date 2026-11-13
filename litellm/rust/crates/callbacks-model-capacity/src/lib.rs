@@ -17,3 +17,4 @@ pub use refusal::{RATE_LIMIT_ERROR, RERAISE};
 pub use seam::{
     CapacityHost, Delegate, Delegated, Estimate, SeamFuture, ShareGauge, Throttle, V3Limiter,
 };
+pub use state::SharedStash;

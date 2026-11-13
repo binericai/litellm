@@ -28,6 +28,7 @@ from litellm.integrations.custom_logger_v2.legacy import (
     run_subscribers,
 )
 from litellm.integrations.custom_logger_v2.native import ABORT_ERRORS
+from litellm.integrations.prometheus import PrometheusLogger
 from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks import parallel_request_limiter_v3
@@ -335,6 +336,8 @@ class Step:
     served_group: str | None = None
     failed: bool = False
     partial: tuple[int, int] | None = None
+    retried: bool = False
+    streamed: tuple[int, int] | None = None
     fallbacks: Sequence[tuple[str, bool]] = ()
     turns: Sequence[Turn] = ()
     advance: float = 0.0
@@ -345,36 +348,41 @@ async def _run_step(side: Side, step: Step) -> list[object]:
         data: Final = step.request.data()
         transcript: Final[list[object]] = []
         get_or_create_request_stash()
-        with request_scope():
-            outcome: Final = await side.pre_call(data, step.request.call_type)
-            transcript.append(outcome)
-            if outcome.raised is not None:
-                return transcript
-            transcript.extend(
-                [await side.fallback(step.request.auth, model, data, commit) for model, commit in step.fallbacks]
-            )
-            for index, turn in enumerate(step.turns):
-                refused = await side.frame(step.request.auth, turn.model)
-                transcript.append(refused)
-                if refused is None and turn.model is not None:
-                    await side.ended(
-                        _turn_kwargs(step.request, turn, index),
-                        None if turn.failed else _response(turn.tokens),
-                        turn.failed,
-                    )
-            if step.tokens is None:
-                return transcript
-            response: Final = _response(step.tokens)
-            if not step.failed:
-                transcript.append(await side.post_call(data, response))
-            transcript.append(await side.response_headers(data))
-            served: Final = step.served_group or (outcome.model if isinstance(outcome.model, str) else None)
-            kwargs: Final = _kwargs(step.request, served, step.tokens, step.failed)
-            if step.partial is not None:
-                kwargs["combined_usage_object"] = Usage(
-                    prompt_tokens=step.partial[0], completion_tokens=step.partial[1], total_tokens=sum(step.partial)
+        outcome: Final = await side.pre_call(data, step.request.call_type)
+        transcript.append(outcome)
+        if outcome.raised is not None:
+            return transcript
+        transcript.extend(
+            [await side.fallback(step.request.auth, model, data, commit) for model, commit in step.fallbacks]
+        )
+        for index, turn in enumerate(step.turns):
+            refused = await side.frame(step.request.auth, turn.model)
+            transcript.append(refused)
+            if refused is None and turn.model is not None:
+                await side.ended(
+                    _turn_kwargs(step.request, turn, index),
+                    None if turn.failed else _response(turn.tokens),
+                    turn.failed,
                 )
-            await side.ended(kwargs, None if step.failed else response, step.failed)
+        if step.tokens is None:
+            return transcript
+        response: Final = _response(step.tokens if step.streamed is None else step.streamed)
+        if not step.failed:
+            transcript.append(await side.post_call(data, response))
+        transcript.append(await side.response_headers(data))
+        served: Final = step.served_group or (outcome.model if isinstance(outcome.model, str) else None)
+        if step.retried:
+            await side.ended(_kwargs(step.request, served, (0, 0), True), None, True)
+        kwargs: Final = {
+            **_kwargs(step.request, served, step.tokens, step.failed),
+            **({"exception": RuntimeError("an earlier attempt failed")} if step.retried else {}),
+            **({} if step.streamed is None else {"async_complete_streaming_response": response}),
+        }
+        if step.partial is not None:
+            kwargs["combined_usage_object"] = Usage(
+                prompt_tokens=step.partial[0], completion_tokens=step.partial[1], total_tokens=sum(step.partial)
+            )
+        await side.ended(kwargs, None if step.failed else response, step.failed)
         return transcript
 
     return await asyncio.create_task(lifecycle(), context=contextvars.Context())
@@ -408,6 +416,27 @@ def _router(*groups: tuple[str, int | None, int | None]) -> Router:
     )
 
 
+class _MetricsTap(PrometheusLogger):
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def increment_dynamic_limiter_throttled(
+        self, model_group: str, team: str, team_alias: str | None, priority: str, rate_limit_type: str, reason: str
+    ) -> None:
+        self.calls.append(("throttled", model_group, team, team_alias, priority, rate_limit_type, reason))
+
+    def set_dynamic_limiter_share(
+        self,
+        model_group: str,
+        team: str,
+        team_alias: str | None,
+        priority: str,
+        share_tokens: int,
+        borrowed_tokens: int,
+    ) -> None:
+        self.calls.append(("share", model_group, team, team_alias, priority, share_tokens, borrowed_tokens))
+
+
 class _UnlicensedTap(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.ERROR)
@@ -430,6 +459,7 @@ async def _differential(
     steps: Sequence[Step],
     scopes: Sequence[tuple[str, str]],
     prepare: Callable[[Side], None] | None = None,
+    metrics: bool = False,
 ) -> list[object]:
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
     tap: Final = _UnlicensedTap()
@@ -441,8 +471,10 @@ async def _differential(
             side = build(router, clock)
             if prepare is not None:
                 prepare(side)
-            monkeypatch.setattr(litellm, "callbacks", [side.handler if isinstance(side, PythonSide) else side.logger])
-            transcripts.append(await _transcript(side, clock, steps, scopes, tap))
+            limiter = side.handler if isinstance(side, PythonSide) else side.logger
+            gauges = _MetricsTap()
+            monkeypatch.setattr(litellm, "callbacks", [limiter, gauges] if metrics else [limiter])
+            transcripts.append([*await _transcript(side, clock, steps, scopes, tap), tuple(gauges.calls)])
     finally:
         verbose_proxy_logger.removeHandler(tap)
     python, native = transcripts
@@ -596,7 +628,9 @@ async def test_class_split_holds_each_active_team_to_its_slice(monkeypatch: pyte
             ("priority_class_share_saturated", "5:split:team-c"),
             ("priority_model", "split:batch"),
         ],
+        metrics=True,
     )
+    assert {call[0] for call in python[-1]} == {"throttled", "share"}, python[-1]
     assert "Priority class share reached" in _refusal_prefixes(python), python
 
 
@@ -638,11 +672,33 @@ async def test_borrowing_teams_hold_tokens_settle_and_refund(monkeypatch: pytest
             ("model_per_team_saturated", "team-a:borrow"),
             ("model_per_team_saturated", "team-b:borrow"),
         ],
+        metrics=True,
     )
+    assert {call[0] for call in python[-1]} == {"throttled", "share"}, python[-1]
     assert set(_refusal_prefixes(python)) == {
         "Team model_tpm_limit borrow cap reached",
         "Team model_tpm_limit reached",
     }, python
+
+
+async def test_a_retried_attempt_and_a_streamed_reply_settle_like_python(
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock
+):
+    _borrowing(monkeypatch, 0.0)
+    router: Final = _router(("retry", 1000, None))
+    team: Final = _key("team", team_id="team-t", team_metadata={"model_tpm_limit": {"retry": 400}})
+    steps: Final = [
+        Step(Request(team, "retry", "t0"), tokens=(40, 20), retried=True),
+        Step(Request(team, "retry", "t1"), tokens=(5, 5), streamed=(70, 50)),
+    ]
+    python: Final = await _differential(
+        monkeypatch,
+        isolated,
+        router,
+        steps,
+        [("model_saturation_check", "retry"), ("model_per_team_saturated", "team-t:retry")],
+    )
+    assert python[-2][3][3] == 60 + 120, python[-2]
 
 
 async def test_responses_calls_cap_their_output_the_same_way(monkeypatch: pytest.MonkeyPatch, isolated: Clock):
@@ -859,7 +915,7 @@ async def test_unlicensed_priorities_log_the_premium_line_the_same_number_of_tim
         for name in ("high", "low", "none")
     ]
     python: Final = await _differential(monkeypatch, isolated, router, steps, [("priority_model", "lic:high")])
-    assert sum(step[-1][1] for step in python[:-1]) > 0, python
+    assert sum(step[-1][1] for step in python[:-2]) > 0, python
 
 
 def _socket_connection(name: str, key: UserAPIKeyAuth, turns: Sequence[Turn]) -> Step:
@@ -953,29 +1009,28 @@ async def _logged_lifecycle(side: Side, router: Router, request: Request, failed
     async def lifecycle() -> list[object]:
         data: Final = request.data()
         get_or_create_request_stash()
-        with request_scope():
-            outcome: Final = await side.pre_call(data, request.call_type)
-            if outcome.raised is not None:
-                return [outcome]
-            auth: Final = request.auth
-            try:
-                await router.acompletion(
-                    model=request.model,
-                    messages=list(request.messages),
-                    litellm_call_id=request.call_id,
-                    metadata={
-                        "user_api_key_auth": auth,
-                        "user_api_key_team_id": auth.team_id,
-                        "user_api_key_team_alias": auth.team_alias,
-                    },
-                    mock_response=Exception("provider down") if failed else "settled through logging",
-                    num_retries=0,
-                )
-            except Exception as error:
-                await _settled()
-                return [outcome, type(error).__name__]
+        outcome: Final = await side.pre_call(data, request.call_type)
+        if outcome.raised is not None:
+            return [outcome]
+        auth: Final = request.auth
+        try:
+            await router.acompletion(
+                model=request.model,
+                messages=list(request.messages),
+                litellm_call_id=request.call_id,
+                metadata={
+                    "user_api_key_auth": auth,
+                    "user_api_key_team_id": auth.team_id,
+                    "user_api_key_team_alias": auth.team_alias,
+                },
+                mock_response=Exception("provider down") if failed else "settled through logging",
+                num_retries=0,
+            )
+        except Exception as error:
             await _settled()
-            return [outcome, None]
+            return [outcome, type(error).__name__]
+        await _settled()
+        return [outcome, None]
 
     return await asyncio.create_task(lifecycle(), context=contextvars.Context())
 
@@ -1129,3 +1184,93 @@ async def test_the_real_proxy_hooks_share_one_request_stash_like_python(
         and "x-ratelimit-model_saturation_check-remaining-requests" in run.response_headers
         for run in native
     ), native
+
+
+async def _unscoped_through_the_proxy(
+    proxy_logging: ProxyLogging, router: Router, request: Request, failed: bool
+) -> list[object]:
+    async def lifecycle() -> list[object]:
+        data: Final = request.data()
+        live_auth: Final = _auth(data)
+        try:
+            admitted: Final = await proxy_logging.pre_call_hook(
+                user_api_key_dict=live_auth,
+                data=data,
+                call_type=request.call_type,  # pyright: ignore[reportArgumentType]  # the endpoints pass their own call type string
+            )
+        except Exception as error:
+            return [_raised(error)]
+        assert admitted is not None
+        try:
+            response: Final = await router.acompletion(
+                model=str(admitted["model"]),
+                messages=list(request.messages),
+                litellm_call_id=request.call_id,
+                metadata={
+                    "user_api_key_auth": live_auth,
+                    "user_api_key_team_id": live_auth.team_id,
+                    "user_api_key_team_alias": live_auth.team_alias,
+                },
+                mock_response=Exception("provider down") if failed else "outside a request scope",
+                num_retries=0,
+            )
+        except Exception as error:
+            await _settled()
+            return [admitted["model"], type(error).__name__]
+        header_hook: Final = await proxy_logging.post_call_response_headers_hook(
+            data=admitted, user_api_key_dict=live_auth, response=response
+        )
+        await _settled()
+        return [admitted["model"], header_hook]
+
+    return await asyncio.create_task(lifecycle(), context=contextvars.Context())
+
+
+@pytest.mark.parametrize("call_type", ["aimage_generation", "arerank", "amoderation", "acompletion"])
+async def test_requests_without_a_request_scope_keep_their_stash_through_the_real_proxy_hooks(
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock, call_type: str
+) -> None:
+    _borrowing(monkeypatch, 0.5)
+    flexible: Final = _key(
+        "flex",
+        team_id="flex",
+        team_models=["luna", "opus"],
+        team_metadata={
+            "model_preferences": [{"model": "luna", "alternates": ["luna", "opus"]}],
+            "model_tpm_limit": {"luna": 400, "opus": 400},
+        },
+    )
+    solo: Final = _key("solo", team_id="solo-team", team_metadata={"model_tpm_limit": {"solo": 400}})
+    plan: Final = [
+        (Request(_key("plain"), "luna", "p0", call_type=call_type), False),
+        (Request(_key("plain"), "luna", "p1", call_type=call_type), False),
+        (Request(flexible, "luna", "f0", call_type=call_type), False),
+        (Request(flexible, "luna", "f1", call_type=call_type), True),
+        *((Request(solo, "solo", f"s{index}", call_type=call_type), index == 3) for index in range(4)),
+    ]
+    scopes: Final = [
+        ("model_saturation_check", "opus"),
+        ("model_per_team_saturated", "flex:opus"),
+        ("model_per_team_saturated", "solo-team:solo"),
+    ]
+    runs: Final[list[list[object]]] = []
+    for build in (PythonSide, NativeSide):
+        isolated.current = datetime(2026, 11, 13, 12, 0, 0)
+        router = _router(("luna", 1000, 4), ("opus", 1000, 4), ("solo", 1000, 4))
+        monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+        side = build(router, isolated)
+        for name in ("success_callback", "failure_callback", "_async_success_callback", "_async_failure_callback"):
+            monkeypatch.setattr(litellm, name, [])
+        monkeypatch.setattr(litellm, "callbacks", [side.handler if isinstance(side, PythonSide) else side.logger])
+        proxy_logging = ProxyLogging(user_api_key_cache=DualCache())
+        run: list[object] = []
+        for request, failed in plan:
+            run.append(await _unscoped_through_the_proxy(proxy_logging, router, request, failed))
+            run.append(await _counters(side, scopes))
+        runs.append(run)
+    python, native = runs
+    for index, (expected, actual) in enumerate(zip(python, native, strict=True)):
+        assert actual == expected, f"entry {index} differs\nPY={expected!r}\nRS={actual!r}"
+    assert python[4] == ["opus", {"x-litellm-model-steered-from": "luna"}], python[4]
+    assert python[6][1] == "InternalServerError", python[6]
+    assert [entry[5][3] for entry in python[9::2]] == [None, None, 30, 30], python

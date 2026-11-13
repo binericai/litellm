@@ -19,6 +19,7 @@ from litellm.exceptions import ServiceUnavailableError
 from litellm.integrations.custom_logger_v2.call import CallContext
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.native import (
+    NativeHandle,
     NativeLogger,
     WireAbort,
     WireManifest,
@@ -50,14 +51,16 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RateLimitedModel,
     RateLimitResponse,
     RateLimitUnverifiableError,
+    RequestRateLimiterStash,
     ReservationOperation,
     WindowGuardedIncrement,
-    _socket_connection_call_id,  # pyright: ignore[reportPrivateUsage]  # a socket turn names its connection the same way
     borrowing_team_model_limits,
     callback_kwargs_mapping,
     claim_request_stash_for_data,
     get_or_create_request_stash,
     get_request_stash,
+    get_request_stash_for_call,
+    request_stash_for_callback,
 )
 from litellm.proxy.hooks.priority_class_share import ActiveTeamRegistry
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
@@ -67,7 +70,7 @@ from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, CounterIncremen
 from litellm.types.utils import Usage
 
 if TYPE_CHECKING:
-    from litellm.rust_bridge._native import NativeModelCapacity
+    from litellm.rust_bridge._native import NativeModelCapacity, NativeModelCapacityState
 
 NATIVE_FLAG: Final = "LITELLM_NATIVE_DYNAMIC_RATE_LIMITER_V3"
 UNLICENSED_PRIORITY_MESSAGE: Final = (
@@ -91,6 +94,7 @@ class LiveRequest:
     auth: UserAPIKeyAuth | None = None
     response: object = None
     kwargs: Mapping[str, object] | None = None
+    state: "NativeModelCapacityState | None" = None
     raised: dict[int, BaseException] = field(default_factory=dict)  # mutable-ok: exceptions the seam re-raises
     responses: dict[int, RateLimitResponse] = field(default_factory=dict)  # mutable-ok: limiter replies by id
 
@@ -147,10 +151,10 @@ def _usage_tokens(usage: Usage | None) -> Mapping[str, int] | None:
     }
 
 
-def _logged_usage(kwargs: Mapping[str, object]) -> Mapping[str, int] | None:
-    combined: Final = kwargs.get("combined_usage_object")
-    if isinstance(combined, Usage):
-        return _usage_tokens(combined)
+def _logged_usage(kwargs: Mapping[str, object], response: object) -> Mapping[str, int] | None:
+    usage: Final = _usage_of(kwargs, response)
+    if usage is not None:
+        return _usage_tokens(usage)
     payload: Final = as_str_mapping(kwargs.get("standard_logging_object"))
     if payload is None:
         return None
@@ -177,50 +181,48 @@ def _settlement(kwargs: Mapping[str, object]) -> Mapping[str, object]:
     }
 
 
-def _attempt_facts(raw: object) -> Mapping[str, object]:
+def _failed(kwargs: Mapping[str, object]) -> bool:
+    payload: Final = as_str_mapping(kwargs.get("standard_logging_object"))
+    status: Final = None if payload is None else payload.get("status")
+    return status == "failure" if isinstance(status, str) else "exception" in kwargs
+
+
+def _settled_response(kwargs: Mapping[str, object], delivered: object) -> object:
+    streamed: Final = kwargs.get("async_complete_streaming_response")
+    return streamed if streamed is not None else delivered
+
+
+def _attempt_facts(raw: object, response: object) -> Mapping[str, object]:
     from litellm.proxy.common_utils.callback_utils import (
         get_model_group_from_litellm_kwargs,  # pyright: ignore[reportUnknownVariableType]  # takes a bare dict
     )
 
     kwargs: Final = callback_kwargs_mapping(raw)
-    payload: Final = as_str_mapping(kwargs.get("standard_logging_object"))
-    failed: Final = (payload is not None and payload.get("status") == "failure") or "exception" in kwargs
-    call_id: Final = kwargs.get("litellm_call_id")
-    call_type: Final = kwargs.get("call_type")
-    socket_call_id: Final = _socket_connection_call_id(kwargs)
-    turn: Final = {
-        "call_id": call_id if isinstance(call_id, str) else None,
-        "call_type": call_type if isinstance(call_type, str) else None,
-        "socket_call_id": socket_call_id if isinstance(socket_call_id, str) else None,
-        "failed": failed,
-    }
+    failed: Final = _failed(kwargs)
     try:
         model_group: Final = get_model_group_from_litellm_kwargs(dict(kwargs))
     except Exception:  # noqa: BLE001  # an unreadable group settles nothing, as the handler's own guard does
-        return turn
+        return {"failed": failed}
     return {
-        **turn,
+        "failed": failed,
         "model_group_known": True,
         "model_group": model_group,
-        "usage": _usage_tokens(_usage_of(kwargs, None)) if failed else _logged_usage(kwargs),
+        "usage": _usage_tokens(_usage_of(kwargs, None))
+        if failed
+        else _logged_usage(kwargs, _settled_response(kwargs, response)),
         "settlement": _settlement(kwargs),
     }
 
 
 def _request_facts(raw: object) -> Mapping[str, object]:
     live: Final = _LIVE.get()
-    data: Final = as_str_mapping(raw) or {}
-    call_id: Final = data.get("litellm_call_id")
-    return {
-        "call_id": call_id if isinstance(call_id, str) else None,
-        "key": key_facts(live.auth if live is not None else auth_from_request(data)),
-    }
+    return {"key": key_facts(live.auth if live is not None else auth_from_request(as_str_mapping(raw) or {}))}
 
 
 def _project_kwargs(raw: object) -> object:
     live: Final = _LIVE.get()
     if live is not None and live.hook is Hook.attempt_ended:
-        return _attempt_facts(raw)
+        return _attempt_facts(raw, live.response)
     return _request_facts(raw)
 
 
@@ -650,6 +652,39 @@ def _native_answer(answer: Mapping[str, object], live: LiveRequest) -> Mapping[s
     return answer
 
 
+@dataclass(frozen=True, slots=True)
+class _StashedNative:
+    capacity: "NativeModelCapacity"
+    callback: NativeHandle
+
+    def manifest(self) -> str:
+        return self.callback.manifest()
+
+    def request_state(self) -> object:
+        return None
+
+    def handle(
+        self, hook: str, fields: Mapping[str, object], call: Mapping[str, object] | None, _state: object, /
+    ) -> Awaitable[object]:
+        live: Final = _LIVE.get()
+        return self.capacity.handle(hook, fields, call, None if live is None else live.state)
+
+
+def _request_stash(hook: Hook, data: Mapping[str, object] | None) -> RequestRateLimiterStash | None:
+    if data is None:
+        return None
+    match hook:
+        case Hook.pre_call:
+            return claim_request_stash_for_data(data) if "model" in data else None
+        case Hook.response_headers:
+            call_id: Final = data.get("litellm_call_id")
+            return get_request_stash_for_call(call_id if isinstance(call_id, str) else None)
+        case Hook.attempt_ended:
+            return request_stash_for_callback(callback_kwargs_mapping(data))
+        case _:
+            return None
+
+
 class NativeDynamicRateLimiter(NativeLogger):
     delegate: CapacityDelegate
     capacity: "NativeModelCapacity"
@@ -661,18 +696,25 @@ class NativeDynamicRateLimiter(NativeLogger):
     def update_variables(self, llm_router: Router) -> None:
         self.delegate.llm_router = llm_router
 
+    def _state(self, stash: RequestRateLimiterStash) -> "NativeModelCapacityState":
+        if stash.native_capacity_state is None:
+            stash.native_capacity_state = self.capacity.request_state()
+        return stash.native_capacity_state
+
+    def _state_for(self, stash: RequestRateLimiterStash | None) -> "NativeModelCapacityState | None":
+        return None if stash is None else self._state(stash)
+
     async def run_native(
         self, hook: Hook, reads: frozenset[Field], view: object, ctx: CallContext[object]
     ) -> Patch | Abort | None:
         data: Final = as_str_mapping(getattr(view, Field.deprecated_kwargs.value, None))
-        if hook is Hook.pre_call and data is not None and "model" in data:
-            claim_request_stash_for_data(data)
         live: Final = LiveRequest(
             hook=hook,
             data=data if hook is not Hook.attempt_ended else None,
             auth=(REQUEST_AUTH.get() or auth_from_request(data)) if hook is not Hook.attempt_ended else None,
             response=getattr(view, Field.deprecated_response_obj.value, None),
             kwargs=data if hook is Hook.attempt_ended else None,
+            state=self._state_for(_request_stash(hook, data)),
         )
         token: Final = _LIVE.set(live)
         try:
@@ -687,18 +729,12 @@ class NativeDynamicRateLimiter(NativeLogger):
     async def async_fallback_target_allowed(
         self, user_api_key_dict: UserAPIKeyAuth, model: str, request_data: Mapping[str, object], *, commit: bool = True
     ) -> bool:
-        request_call_id: Final = request_data.get("litellm_call_id")
-        stash: Final = get_request_stash()
-        call_id: Final = (
-            stash.owner_litellm_call_id
-            if stash is not None and stash.owner_litellm_call_id is not None
-            else request_call_id
-        )
-        live: Final = LiveRequest(data={**request_data, "model": model}, auth=user_api_key_dict)
+        state: Final = self._state(get_or_create_request_stash())
+        live: Final = LiveRequest(data={**request_data, "model": model}, auth=user_api_key_dict, state=state)
         token: Final = _LIVE.set(live)
         try:
             answer: Final = await self.capacity.fallback_target_allowed(
-                call_id if isinstance(call_id, str) else None, key_facts(user_api_key_dict), model, commit
+                state, key_facts(user_api_key_dict), model, commit
             )
         finally:
             _LIVE.reset(token)
@@ -709,13 +745,11 @@ class NativeDynamicRateLimiter(NativeLogger):
     ) -> None:
         if requested_model is None:
             return
-        stash: Final = get_request_stash()
-        live: Final = LiveRequest(auth=user_api_key_dict)
+        state: Final = self._state_for(get_request_stash())
+        live: Final = LiveRequest(auth=user_api_key_dict, state=state)
         token: Final = _LIVE.set(live)
         try:
-            answer: Final = await self.capacity.enforce_frame(
-                None if stash is None else stash.owner_litellm_call_id, key_facts(user_api_key_dict), requested_model
-            )
+            answer: Final = await self.capacity.enforce_frame(state, key_facts(user_api_key_dict), requested_model)
         finally:
             _LIVE.reset(token)
         raised_token: Final = answer.get("raised")
@@ -745,7 +779,7 @@ def build_native_dynamic_rate_limiter(
     )
     delegate: Final = CapacityDelegate(internal_usage_cache, v3_limiter, is_model_authorized)
     capacity: Final = NativeModelCapacity(delegate)
-    native: Final = capacity.callback()
+    native: Final = _StashedNative(capacity, capacity.callback())
     manifest: Final = WireManifest.model_validate_json(native.manifest())
     cls: Final = type(manifest.selection.name, (NativeDynamicRateLimiter,), _namespace(native, manifest))
     logger: Final = cls(native, PROJECTIONS)

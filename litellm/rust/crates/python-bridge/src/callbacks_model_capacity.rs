@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
-use litellm_callbacks::Callback;
+use litellm_callbacks::{CallFacts, Callback, FieldValues, HookInput, RequestState};
 use litellm_callbacks_model_capacity::{
-    CapacityError, Delegate, Delegated, Frame, KeyFacts, ModelCapacity,
+    CapacityError, Delegate, Delegated, Frame, KeyFacts, ModelCapacity, SharedStash,
 };
 use litellm_callbacks_python::NativeCallback;
 use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value, to_py};
-use pyo3::prelude::*;
+use pyo3::{
+    exceptions::{PyRuntimeError, PyValueError},
+    prelude::*,
+    types::PyDict,
+};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 struct PyDelegate(Py<PyAny>);
@@ -33,6 +38,14 @@ pub struct NativeModelCapacity {
     inner: Arc<ModelCapacity>,
 }
 
+#[pyclass(frozen, name = "NativeModelCapacityState")]
+pub struct NativeModelCapacityState(SharedStash);
+
+fn named<T: DeserializeOwned>(name: &str) -> PyResult<T> {
+    serde_json::from_value(Value::String(name.to_owned()))
+        .map_err(|_| PyValueError::new_err(format!("{name} is not a known name")))
+}
+
 #[pymethods]
 impl NativeModelCapacity {
     #[new]
@@ -48,6 +61,45 @@ impl NativeModelCapacity {
         Ok(NativeCallback::new(callback)?)
     }
 
+    fn request_state(&self) -> NativeModelCapacityState {
+        NativeModelCapacityState(SharedStash::default())
+    }
+
+    #[pyo3(signature = (hook, fields, call, state, /))]
+    fn handle<'py>(
+        &self,
+        py: Python<'py>,
+        hook: &str,
+        fields: &Bound<'py, PyDict>,
+        call: Option<&Bound<'py, PyAny>>,
+        state: Option<PyRef<'py, NativeModelCapacityState>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let hook = named(hook)?;
+        let subscription = self
+            .inner
+            .manifest()
+            .subscription(hook)
+            .ok_or_else(|| PyValueError::new_err(format!("{hook:?} has no subscription")))?;
+        let mut values = FieldValues::new(subscription.reads);
+        for (name, value) in fields {
+            values.insert(named(&name.extract::<String>()?)?, json_from_py(&value)?);
+        }
+        let input = HookInput {
+            hook,
+            fields: values,
+            call: call.map(from_py::<CallFacts>).transpose()?,
+            state: state.map(|state| -> RequestState { Arc::new(Arc::clone(&state.0)) }),
+        };
+        let inner = Arc::clone(&self.inner);
+        run_async_value(py, async move {
+            let verdict = inner
+                .handle(&input)
+                .await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Ok(Pythonized(verdict))
+        })
+    }
+
     fn post_call_headers<'py>(
         &self,
         py: Python<'py>,
@@ -57,20 +109,21 @@ impl NativeModelCapacity {
         Ok(to_py(py, &json!(self.inner.post_call_headers(&key)))?.into_bound(py))
     }
 
-    #[pyo3(signature = (call_id, key, model, commit))]
+    #[pyo3(signature = (state, key, model, commit))]
     fn fallback_target_allowed<'py>(
         &self,
         py: Python<'py>,
-        call_id: Option<String>,
+        state: PyRef<'py, NativeModelCapacityState>,
         key: &Bound<'py, PyAny>,
         model: String,
         commit: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let key: KeyFacts = from_py(key)?;
         let inner = Arc::clone(&self.inner);
+        let stash = Arc::clone(&state.0);
         run_async_value(py, async move {
             let answer = match inner
-                .fallback_target_allowed(call_id.as_deref(), &key, &model, commit)
+                .fallback_target_allowed(&stash, &key, &model, commit)
                 .await
             {
                 Ok(allowed) => json!({"allowed": allowed}),
@@ -80,21 +133,19 @@ impl NativeModelCapacity {
         })
     }
 
-    #[pyo3(signature = (connection_call_id, key, model))]
+    #[pyo3(signature = (connection, key, model))]
     fn enforce_frame<'py>(
         &self,
         py: Python<'py>,
-        connection_call_id: Option<String>,
+        connection: Option<PyRef<'py, NativeModelCapacityState>>,
         key: &Bound<'py, PyAny>,
         model: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let key: KeyFacts = from_py(key)?;
         let inner = Arc::clone(&self.inner);
+        let connection = connection.map(|state| Arc::clone(&state.0));
         run_async_value(py, async move {
-            let answer = match inner
-                .enforce_frame(connection_call_id.as_deref(), &key, &model)
-                .await
-            {
+            let answer = match inner.enforce_frame(connection.as_ref(), &key, &model).await {
                 Ok(Frame::Allow) => json!({"allowed": true}),
                 Ok(Frame::Refuse(refusal)) => json!({"refused": {
                     "detail": refusal.detail,

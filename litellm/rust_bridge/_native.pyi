@@ -544,16 +544,30 @@ def messages(
 def amessages(
     call: NativeCall,
 ) -> Execution: ...
+
+@final
+class NativeModelCapacityState:
+    def __new__(cls, _uninstantiable: Never, /) -> Never: ...
+
 @final
 class NativeModelCapacity:
     def __new__(cls, delegate: object) -> NativeModelCapacity: ...
     def callback(self) -> NativeHandle: ...
-    def post_call_headers(self, key: Mapping[str, object]) -> list[tuple[str, object]]: ...
+    def request_state(self) -> NativeModelCapacityState: ...
+    def handle(
+        self,
+        hook: str,
+        fields: Mapping[str, object],
+        call: Mapping[str, object] | None,
+        state: NativeModelCapacityState | None,
+        /,
+    ) -> Future[object]: ...
+    def post_call_headers(self, key: Mapping[str, object]) -> list[list[object]]: ...
     def fallback_target_allowed(
-        self, call_id: str | None, key: Mapping[str, object], model: str, commit: bool
+        self, state: NativeModelCapacityState, key: Mapping[str, object], model: str, commit: bool
     ) -> Future[dict[str, object]]: ...
     def enforce_frame(
-        self, connection_call_id: str | None, key: Mapping[str, object], model: str
+        self, connection: NativeModelCapacityState | None, key: Mapping[str, object], model: str
     ) -> Future[dict[str, object]]: ...
 
 @final
@@ -699,6 +713,7 @@ __all__ = [
     "NativeFetched",
     "NativeInstalled",
     "NativeModelCapacity",
+    "NativeModelCapacityState",
     "NativeModelCostMap",
     "NativeModelCostMapState",
     "NativePending",

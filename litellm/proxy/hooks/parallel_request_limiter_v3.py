@@ -132,6 +132,7 @@ if TYPE_CHECKING:
 
     from litellm.proxy.utils import InternalUsageCache as _InternalUsageCache
     from litellm.router import Router
+    from litellm.rust_bridge._native import NativeModelCapacityState
     from litellm.types.agents import AgentResponse
 
     Span = _Span
@@ -639,6 +640,7 @@ class RequestRateLimiterStash:
     io_reservation_released: bool = False
     tpm_limited_tags: frozenset[str] = field(default_factory=frozenset)
     socket_agent_windows: tuple[RateLimitDescriptor, ...] = ()
+    native_capacity_state: "NativeModelCapacityState | None" = None
 
     def clear_reserved_tokens(self) -> None:
         self.reserved_tokens = 0

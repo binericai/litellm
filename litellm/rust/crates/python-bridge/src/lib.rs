@@ -27,7 +27,7 @@ mod _native {
     use pyo3::{prelude::*, types::PyModule};
 
     #[pymodule_export]
-    use crate::callbacks_model_capacity::NativeModelCapacity;
+    use crate::callbacks_model_capacity::{NativeModelCapacity, NativeModelCapacityState};
     #[pymodule_export]
     use crate::db::NativeDatabase;
     #[cfg(feature = "panic-test")]
@@ -198,6 +198,7 @@ mod tests {
                 "reserve_process_for_forking",
                 "unsupported_tls_settings",
                 "NativeModelCapacity",
+                "NativeModelCapacityState",
             ];
             #[cfg(feature = "huggingface")]
             expected.push("HuggingFaceEncoding");

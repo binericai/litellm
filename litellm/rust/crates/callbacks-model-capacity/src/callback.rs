@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use litellm_callbacks::{
     Activation, Callback, CallbackError, Field, FieldSet, Hook, HookInput, HookOutput, Manifest,
-    Patch, RequestState, Selection, Subscription, Verdict,
+    Patch, Selection, Subscription, Verdict,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -15,27 +15,15 @@ use crate::{
     pyfmt,
     refusal::reraise,
     seam::{CapacityHost, V3Limiter},
-    state::{Anchor, SharedStash, Stashes},
+    state::SharedStash,
 };
 
 pub const NAME: &str = "dynamic_rate_limiter_v3";
 
 #[derive(Debug, Default, Deserialize)]
-struct PreCallFacts {
-    call_id: Option<String>,
-    #[serde(default)]
-    key: KeyFacts,
-}
-
-#[derive(Debug, Default, Deserialize)]
 struct KeyOnly {
     #[serde(default)]
     key: KeyFacts,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct CallOnly {
-    call_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -47,13 +35,8 @@ struct SettlementFacts {
     team_alias: Option<String>,
 }
 
-const SOCKET_CALL_TYPE: &str = "aresponses_websocket";
-
 #[derive(Debug, Default, Deserialize)]
 struct AttemptFacts {
-    call_id: Option<String>,
-    call_type: Option<String>,
-    socket_call_id: Option<String>,
     #[serde(default)]
     failed: bool,
     #[serde(default)]
@@ -67,7 +50,6 @@ struct AttemptFacts {
 pub struct ModelCapacity {
     manifest: Manifest,
     engine: Engine,
-    stashes: Arc<Stashes>,
 }
 
 fn failed(error: CapacityError) -> CallbackError {
@@ -120,46 +102,30 @@ impl ModelCapacity {
                         ..Subscription::on(Hook::ResponseHeaders)
                     },
                     Subscription {
-                        reads: kwargs,
+                        reads: FieldSet::of(&[
+                            Field::DeprecatedKwargs,
+                            Field::DeprecatedResponseObj,
+                        ]),
                         awaited: true,
                         ..Subscription::on(Hook::AttemptEnded)
                     },
                 ],
-                has_request_state: true,
+                has_request_state: false,
             },
             engine: Engine { limiter, host },
-            stashes: Arc::default(),
         }
     }
 
-    fn stash_for_call(&self, input: &HookInput, call_id: Option<&str>) -> Option<SharedStash> {
-        input
-            .state::<Anchor>()
-            .and_then(|anchor| anchor.for_call(call_id))
-            .or_else(|| self.stashes.find(call_id?))
-    }
-
-    fn settled_stash(&self, input: &HookInput, facts: &AttemptFacts) -> Option<SharedStash> {
-        let call_id = facts.call_id.as_deref();
-        if let Some(stash) = self.stash_for_call(input, call_id) {
-            return Some(stash);
-        }
-        let (owner, connection) = input.state::<Anchor>()?.current()?;
-        let socket_turn = facts.call_type.as_deref() == Some(SOCKET_CALL_TYPE)
-            || (facts.socket_call_id.is_some() && facts.socket_call_id == owner);
-        socket_turn.then_some(connection)
+    fn stash(input: &HookInput) -> Option<SharedStash> {
+        input.state::<SharedStash>().cloned()
     }
 
     async fn pre_call(&self, input: &HookInput) -> HookOutput {
         let Some(Value::String(model)) = input.fields.raw(Field::Model)?.cloned() else {
             return Ok(None);
         };
-        let facts: PreCallFacts = facts(input)?;
-        let call_id = facts.call_id.as_deref();
-        let stash = match input.state::<Anchor>() {
-            Some(anchor) => anchor.claim(call_id),
-            None => self.stashes.find_or_claim(call_id),
-        };
+        let facts: KeyOnly = facts(input)?;
+        let stash = Self::stash(input).unwrap_or_default();
         let group = match self.engine.host.group(&model).await {
             Ok(Some(group)) => group,
             Ok(None) => return Ok(None),
@@ -201,9 +167,8 @@ impl ModelCapacity {
         Ok(None)
     }
 
-    fn response_headers(&self, input: &HookInput) -> HookOutput {
-        let facts: CallOnly = facts(input)?;
-        let Some(stash) = self.stash_for_call(input, facts.call_id.as_deref()) else {
+    fn response_headers(input: &HookInput) -> HookOutput {
+        let Some(stash) = Self::stash(input) else {
             return Ok(None);
         };
         let Some(steered_from) = stash.lock().steered_from.clone() else {
@@ -221,7 +186,7 @@ impl ModelCapacity {
 
     async fn attempt_ended(&self, input: &HookInput) -> HookOutput {
         let facts: AttemptFacts = facts(input)?;
-        let stash = self.settled_stash(input, &facts);
+        let stash = Self::stash(input);
         if facts.failed {
             return self.failure(facts, stash).await;
         }
@@ -294,18 +259,17 @@ impl ModelCapacity {
 
     pub async fn fallback_target_allowed(
         &self,
-        call_id: Option<&str>,
+        stash: &SharedStash,
         key: &KeyFacts,
         model: &str,
         commit: bool,
     ) -> Result<bool, CapacityError> {
-        let stash = self.stashes.find_or_claim(call_id);
         let settings = self.engine.host.settings().await?;
         let request = Request {
             key,
             call_type: None,
             settings: &settings,
-            stash: &stash,
+            stash,
         };
         self.engine
             .fallback_target_allowed(&request, model, commit)
@@ -314,12 +278,11 @@ impl ModelCapacity {
 
     pub async fn enforce_frame(
         &self,
-        connection_call_id: Option<&str>,
+        connection: Option<&SharedStash>,
         key: &KeyFacts,
         model: &str,
     ) -> Result<Frame, CapacityError> {
-        let connection = connection_call_id.and_then(|call_id| self.stashes.find(call_id));
-        let stash = connection.clone().unwrap_or_default();
+        let stash = connection.cloned().unwrap_or_default();
         let settings = self.engine.host.settings().await?;
         let request = Request {
             key,
@@ -327,9 +290,7 @@ impl ModelCapacity {
             settings: &settings,
             stash: &stash,
         };
-        self.engine
-            .enforce_frame(&request, model, connection.as_ref())
-            .await
+        self.engine.enforce_frame(&request, model, connection).await
     }
 }
 
@@ -338,16 +299,12 @@ impl Callback for ModelCapacity {
         &self.manifest
     }
 
-    fn request_state(&self) -> Option<RequestState> {
-        Some(Arc::new(Anchor::new(Arc::clone(&self.stashes))))
-    }
-
     fn handle<'a>(&'a self, input: &'a HookInput) -> BoxFuture<'a, HookOutput> {
         Box::pin(async move {
             match input.hook {
                 Hook::PreCall => self.pre_call(input).await,
                 Hook::PostCallSuccess => self.post_call_success(input).await,
-                Hook::ResponseHeaders => self.response_headers(input),
+                Hook::ResponseHeaders => Self::response_headers(input),
                 Hook::AttemptEnded => self.attempt_ended(input).await,
                 _ => Ok(None),
             }
