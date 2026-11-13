@@ -209,4 +209,58 @@ mod tests {
                 .all(|(_, values)| values.is_empty())
         );
     }
+
+    #[rstest]
+    #[case::without_reason(json!({"note": "x"}), Err("'reason'".to_owned()), vec![])]
+    #[case::with_reason(json!({"reason": "failed_call"}), Ok(()), vec![(vec!["team-1".to_owned(), "failed_call".to_owned()], 1.0)])]
+    fn the_failure_step_counts_the_failure_before_the_zero_cost_reason(
+        #[case] diagnostic: Value,
+        #[case] expected: Result<(), String>,
+        #[case] zero_cost: Vec<(Vec<String>, f64)>,
+    ) {
+        let store = Store::new(SeriesLimits::default(), Box::new(ManualClock::default()));
+        for (name, labelnames) in [
+            ("litellm_llm_api_failed_requests_metric", vec!["team"]),
+            ("litellm_zero_cost_requests_total", vec!["team", "reason"]),
+        ] {
+            store
+                .register(FamilySpec {
+                    declared: name.to_owned(),
+                    documentation: "doc".to_owned(),
+                    kind: Kind::Counter,
+                    labelnames: labelnames.into_iter().map(str::to_owned).collect(),
+                    excluded: Vec::new(),
+                    buckets: Vec::new(),
+                    most_recent: false,
+                    wrapped: false,
+                    shares_overflow: true,
+                })
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        let mut facts = facts(json!(10));
+        if let Value::Object(payload) = &mut facts.payload {
+            payload.insert("zero_cost_diagnostic".to_owned(), diagnostic);
+        }
+        let recorded = record(&store, &facts, Step::Failure, None);
+        assert_eq!(
+            recorded.outcome.map_err(|error| exception_text(&error)),
+            expected
+        );
+        let series = |name: &str| -> Vec<(Vec<String>, f64)> {
+            let id = store
+                .family(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            store
+                .snapshot(id)
+                .series
+                .into_iter()
+                .map(|(values, series)| (values, series.value))
+                .collect()
+        };
+        assert_eq!(
+            series("litellm_llm_api_failed_requests_metric"),
+            vec![(vec!["team-1".to_owned()], 1.0)]
+        );
+        assert_eq!(series("litellm_zero_cost_requests_total"), zero_cost);
+    }
 }

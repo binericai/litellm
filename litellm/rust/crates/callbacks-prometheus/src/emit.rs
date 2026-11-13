@@ -191,3 +191,40 @@ impl Emitter<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+    use crate::success::exception_text;
+
+    #[rstest]
+    #[case::int(json!(3), Ok(3.0))]
+    #[case::bool(json!(true), Ok(1.0))]
+    #[case::padded_text(json!(" 2.5 "), Ok(2.5))]
+    #[case::bad_text(json!("ten"), Err("could not convert string to float: 'ten'"))]
+    #[case::list(json!([1]), Err("float() argument must be a string or a real number, not 'list'"))]
+    #[case::none(json!(null), Err("float() argument must be a string or a real number, not 'NoneType'"))]
+    fn float_follows_the_python_builtin(#[case] value: Value, #[case] expected: Result<f64, &str>) {
+        assert_eq!(
+            py_float(&value).map_err(|error| exception_text(&error)),
+            expected.map_err(str::to_owned)
+        );
+    }
+
+    #[rstest]
+    #[case::comparison(not_comparable(">=", &json!("slow")), "'>=' not supported between instances of 'str' and 'int'")]
+    #[case::missing_end(
+        not_subtractable(false, true),
+        "unsupported operand type(s) for -: 'NoneType' and 'datetime.datetime'"
+    )]
+    #[case::missing_start(
+        not_subtractable(true, false),
+        "unsupported operand type(s) for -: 'datetime.datetime' and 'NoneType'"
+    )]
+    fn type_errors_carry_the_python_text(#[case] error: CallbackError, #[case] expected: &str) {
+        assert_eq!(exception_text(&error), expected);
+    }
+}
