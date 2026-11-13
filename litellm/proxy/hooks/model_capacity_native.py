@@ -1,5 +1,6 @@
 import os
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import count
@@ -12,7 +13,7 @@ from typing_extensions import TypeIs  # noqa: TID251  # tells the legacy and nat
 
 import litellm
 from litellm import Router
-from litellm._internal_context import with_service_target
+from litellm._internal_context import service_target
 from litellm.caching.caching import DualCache
 from litellm.caching.redis_cache import RedisCircuitBreakerOpenError
 from litellm.exceptions import ServiceUnavailableError
@@ -82,6 +83,7 @@ RATE_LIMIT_KIND: Final = "model_capacity_rate_limit"
 RERAISE_KIND: Final = "model_capacity_reraise"
 _TOKENS: Final = count(1)
 _CALL_TYPES: Final = frozenset(call_type.value for call_type in CallTypes)
+_TARGETED_HOOKS: Final = frozenset({Hook.pre_call, Hook.post_call_success, Hook.attempt_ended})
 _SYNC_CALL_TYPES: Final = frozenset(name for name in _CALL_TYPES if f"a{name}" in _CALL_TYPES)
 
 
@@ -388,7 +390,6 @@ class CapacityDelegate:
         }
 
     @_seam
-    @with_service_target(RATE_LIMITS_TARGET)
     async def read_counter(self, args: Mapping[str, object]) -> object:
         counter: Final = _Counter.model_validate(args["counter"]).counter()
         value: Final = await self.v3_limiter.rate_limits.get(counter, backfill_ttl=args["backfill_ttl"])  # pyright: ignore[reportArgumentType]  # the settings value as the handler passes it
@@ -399,7 +400,6 @@ class CapacityDelegate:
         return None if auth is None else auth.parent_otel_span
 
     @_seam
-    @with_service_target(RATE_LIMITS_TARGET)
     async def check_and_increment(self, args: Mapping[str, object]) -> object:
         response: Final = await self.v3_limiter.atomic_check_and_increment_by_n(
             descriptors=_DESCRIPTORS.validate_python(args["descriptors"]),
@@ -409,7 +409,6 @@ class CapacityDelegate:
         return _wire_response(_live(), response)
 
     @_seam
-    @with_service_target(RATE_LIMITS_TARGET)
     async def should_rate_limit(self, args: Mapping[str, object]) -> object:
         response: Final = await self.v3_limiter.should_rate_limit(
             _DESCRIPTORS.validate_python(args["descriptors"]),
@@ -420,7 +419,6 @@ class CapacityDelegate:
         return _wire_response(_live(), response)
 
     @_seam
-    @with_service_target(RATE_LIMITS_TARGET)
     async def apply(self, args: Mapping[str, object]) -> object:
         from litellm.litellm_core_utils.core_helpers import get_parent_otel_span_from_kwargs
 
@@ -504,7 +502,6 @@ class CapacityDelegate:
         return get_or_create_request_stash().call_type
 
     @_seam
-    @with_service_target(RATE_LIMITS_TARGET)
     async def post_call_success(self, args: Mapping[str, object]) -> object:
         live: Final = _live()
         await self.v3_limiter.async_post_call_success_hook(  # pyright: ignore[reportUnknownMemberType]  # the legacy hook signature
@@ -520,7 +517,6 @@ class CapacityDelegate:
         return None
 
     @_seam
-    @with_service_target(RATE_LIMITS_TARGET)
     async def touch(self, args: Mapping[str, object]) -> object:
         members: Final = await self.active_teams.touch(
             str(args["model"]),
@@ -730,11 +726,12 @@ class NativeDynamicRateLimiter(NativeLogger):
         )
         token: Final = _LIVE.set(live)
         try:
-            if hook is Hook.post_call_success:
-                headers: Final = self.capacity.post_call_headers(key_facts(live.auth))
-                _ = await self.delegate.post_call_success({"headers": headers})
-                return None
-            return await super().run_native(hook, reads, view, ctx)
+            with service_target(RATE_LIMITS_TARGET) if hook in _TARGETED_HOOKS else nullcontext():
+                if hook is Hook.post_call_success:
+                    headers: Final = self.capacity.post_call_headers(key_facts(live.auth))
+                    _ = await self.delegate.post_call_success({"headers": headers})
+                    return None
+                return await super().run_native(hook, reads, view, ctx)
         finally:
             _LIVE.reset(token)
 

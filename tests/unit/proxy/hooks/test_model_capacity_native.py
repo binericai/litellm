@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 import litellm
 from litellm import DualCache, Router
+from litellm._internal_context import current_service_target
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import RESPONSES_WEBSOCKET_CALL_ID_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger
@@ -32,7 +33,11 @@ from litellm.integrations.prometheus import PrometheusLogger
 from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks import parallel_request_limiter_v3
-from litellm.proxy.hooks.dynamic_rate_limiter_v3 import AlternateGrant, PROXY_DynamicRateLimitHandlerV3
+from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
+    AlternateAuthorizer,
+    AlternateGrant,
+    PROXY_DynamicRateLimitHandlerV3,
+)
 from litellm.proxy.hooks.model_capacity_native import (
     UNLICENSED_PRIORITY_MESSAGE,
     NativeDynamicRateLimiter,
@@ -46,7 +51,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
 )
 from litellm.proxy.request_auth_context import REQUEST_AUTH
 from litellm.proxy.utils import HookRun, InternalUsageCache, ProxyLogging, hook_fields, raise_v2_abort
-from litellm.redis.stores.rate_limits import RateLimitScope
+from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, RateLimitScope
 from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
 
 pytestmark = pytest.mark.asyncio
@@ -145,9 +150,9 @@ def _auth(data: Mapping[str, object]) -> UserAPIKeyAuth:
 
 
 class PythonSide:
-    def __init__(self, router: Router, clock: Clock) -> None:
+    def __init__(self, router: Router, clock: Clock, authorize: AlternateAuthorizer = _grant_everything) -> None:
         self.handler: Final = PROXY_DynamicRateLimitHandlerV3(
-            internal_usage_cache=DualCache(), time_provider=clock.now, is_model_authorized=_grant_everything
+            internal_usage_cache=DualCache(), time_provider=clock.now, is_model_authorized=authorize
         )
         self.handler.update_variables(llm_router=router)
         self.limiter = self.handler.v3_limiter
@@ -201,9 +206,9 @@ async def _no_legacy(_logger: object, _data: object) -> None:
 
 
 class NativeSide:
-    def __init__(self, router: Router, clock: Clock) -> None:
+    def __init__(self, router: Router, clock: Clock, authorize: AlternateAuthorizer = _grant_everything) -> None:
         self.logger: Final[NativeDynamicRateLimiter] = build_native_dynamic_rate_limiter(
-            DualCache(), is_model_authorized=_grant_everything, time_provider=clock.now
+            DualCache(), is_model_authorized=authorize, time_provider=clock.now
         )
         self.logger.update_variables(router)
         self.limiter = self.logger.v3_limiter
@@ -885,6 +890,39 @@ async def test_requests_without_a_call_id_keep_their_stash(monkeypatch: pytest.M
         ],
     )
     assert python[2][2] == {"x-litellm-model-steered-from": "luna"}, python[2]
+
+
+async def test_the_alternate_check_runs_under_the_rate_limits_service_target_like_python(
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock
+):
+    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.5)
+    router: Final = _router(("luna", None, 4), ("opus", None, 4))
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+    flexible: Final = _key(
+        "flex",
+        team_id="flex",
+        team_models=["luna", "opus"],
+        team_metadata={"model_preferences": [{"model": "luna", "alternates": ["luna", "opus"]}]},
+    )
+    steps: Final = [Step(Request(_key("plain"), "luna", f"p{i}")) for i in range(2)] + [
+        Step(Request(flexible, "luna", "f0"))
+    ]
+    seen: Final[list[list[str | None]]] = []
+    for build in (PythonSide, NativeSide):
+        targets: list[str | None] = []
+
+        async def authorize(auth: UserAPIKeyAuth, model: str, targets: list[str | None] = targets) -> AlternateGrant:
+            targets.append(current_service_target())
+            return AlternateGrant(access_groups=(f"group-{model}",))
+
+        isolated.current = datetime(2026, 11, 13, 12, 0, 0)
+        side = build(router, isolated, authorize)
+        monkeypatch.setattr(litellm, "callbacks", [side.handler if isinstance(side, PythonSide) else side.logger])
+        for step in steps:
+            await _run_step(side, step)
+        seen.append(targets)
+    assert seen[1] == seen[0]
+    assert seen[0] == [RATE_LIMITS_TARGET], seen
 
 
 async def test_steering_rebinds_the_live_keys_access_groups(monkeypatch: pytest.MonkeyPatch, isolated: Clock):
