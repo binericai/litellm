@@ -367,7 +367,15 @@ impl Engine {
             .await
         {
             Ok(members) => members,
-            Err(error) if error.is_registry_unavailable() => return Ok(None),
+            Err(error) if error.is_registry_unavailable() => {
+                let message = format!(
+                    "Active team registry unavailable for {model}, holding team {} to the class pool: {}",
+                    python_optional(request.key.team_id.as_deref()),
+                    error.python_message()
+                );
+                let _ = self.host.log("warning", &message).await;
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         if request.key.team_id.is_none() {

@@ -748,7 +748,16 @@ class NativeDynamicRateLimiter(NativeLogger):
             with service_target(RATE_LIMITS_TARGET) if hook in _TARGETED_HOOKS else nullcontext():
                 if hook is Hook.post_call_success:
                     headers: Final = self.capacity.post_call_headers(key_facts(live.auth))
-                    _ = await self.delegate.post_call_success({"headers": headers})
+                    answer: Final = await self.delegate.post_call_success({"headers": headers})
+                    raised: Final = as_str_mapping(answer.get("raised"))
+                    raised_token: Final = None if raised is None else raised.get("token")
+                    error: Final = None if not isinstance(raised_token, int) else live.raised.pop(raised_token, None)
+                    if error is not None:
+                        from litellm._logging import verbose_proxy_logger
+
+                        verbose_proxy_logger.error(
+                            "Error in dynamic rate limiter v3 post-call hook: %s", error, exc_info=error
+                        )
                     return None
                 return await super().run_native(hook, reads, view, ctx)
         finally:

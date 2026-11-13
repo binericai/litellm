@@ -9,6 +9,7 @@ from typing import Final, Protocol
 
 import pytest
 from fastapi import HTTPException
+from redis.exceptions import RedisError
 
 import litellm
 from litellm import DualCache, Router
@@ -712,6 +713,42 @@ async def test_a_retried_attempt_and_a_streamed_reply_settle_like_python(
         [("model_saturation_check", "retry"), ("model_per_team_saturated", "team-t:retry")],
     )
     assert python[-2][3][3] == 60 + 120, python[-2]
+
+
+async def test_an_unavailable_team_registry_and_a_failing_post_call_log_like_python(
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock
+):
+    monkeypatch.setattr(litellm, "priority_reservation", {"interactive": 0.75, "batch": 0.25})
+    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.0)
+    monkeypatch.setattr(
+        litellm.priority_reservation_settings, "priority_class_share_splits_equally_among_active_teams", True
+    )
+    router: Final = _router(("down", 1000, None))
+    team: Final = _key("a", team_id="team-a", team_metadata={"priority": "interactive"})
+
+    async def registry_down(*_args: object, **_kwargs: object) -> object:
+        raise RedisError("registry down")
+
+    async def post_call_fails(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("post-call down")
+
+    def prepare(side: Side) -> None:
+        registry = side.handler.active_teams if isinstance(side, PythonSide) else side.logger.delegate.active_teams
+        monkeypatch.setattr(registry, "touch", registry_down)
+        monkeypatch.setattr(side.limiter, "async_post_call_success_hook", post_call_fails)
+
+    python: Final = await _differential(
+        monkeypatch,
+        isolated,
+        router,
+        [Step(Request(team, "down", "d0"))],
+        [("model_saturation_check", "down")],
+        prepare,
+    )
+    assert [line[1].split(":")[0] for line in python[0][-1][1]] == [
+        "Active team registry unavailable for down, holding team team-a to the class pool",
+        "Error in dynamic rate limiter v3 post-call hook",
+    ], python[0]
 
 
 async def test_responses_calls_cap_their_output_the_same_way(monkeypatch: pytest.MonkeyPatch, isolated: Clock):
