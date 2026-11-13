@@ -41,7 +41,8 @@ from litellm.constants import (
 from litellm.cost_calculator import ocr_batch_cost
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2 import Abort, CallContext, CustomLoggerV2, Field, Hook, Patch, on
-from litellm.integrations.custom_logger_v2.host import V2Outcome
+from litellm.integrations.custom_logger_v2.host import V2Outcome, get_dispatcher
+from litellm.integrations.custom_logger_v2.selection import RequestSelection, Selection
 from litellm.litellm_core_utils import litellm_logging
 from litellm.litellm_core_utils.litellm_logging import Logging as LitellmLogging
 from litellm.litellm_core_utils.token_counter import token_counter
@@ -15582,3 +15583,205 @@ async def test_prompt_resolve_propagates_the_managers_error(logging_obj: Litellm
         await _resolve_prompt(logging_obj, _PromptManager(("m", [], {}), error), use_async)
 
     assert raised.value is error
+
+
+class _EndedRecorder(CustomLoggerV2):
+    def __init__(self, journal: list[object]) -> None:
+        self.journal = journal
+        self.done = threading.Event()
+
+    @on(Hook.attempt_ended, awaited=True)
+    async def attempt_ended(self, view: object, ctx: CallContext[object]) -> None:
+        self.journal.append("v2")
+        self.done.set()
+
+
+async def test_a_v2_callback_in_litellm_callbacks_gets_attempt_ended_after_an_acompletion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal: Final[list[object]] = []
+    recorder: Final = _EndedRecorder(journal)
+    _plane_lists(monkeypatch)
+    monkeypatch.setattr(litellm, "callbacks", [_Entry("legacy", journal), recorder])
+
+    _ = await litellm.acompletion(model="gpt-4o", messages=[{"role": "user", "content": "hi"}], mock_response="ok")
+
+    assert await asyncio.to_thread(recorder.done.wait, 30)
+    assert recorder in litellm._async_success_callback
+    assert recorder in litellm._async_failure_callback
+    successes: Final = _ran(journal, "success")
+    assert [entry[0] if entry in successes else entry for entry in journal if entry == "v2" or entry in successes] == [
+        "legacy",
+        "v2",
+    ]
+
+
+class _BrokenStamp(CustomLoggerV2):
+    def __init__(self, journal: list[object], outcome: Exception | Abort) -> None:
+        self.journal = journal
+        self.outcome = outcome
+
+    @on(Hook.log_prepare, reads={Field.standard_logging_payload}, writes={Field.standard_logging_payload})
+    async def log_prepare(self, view: object, ctx: CallContext[object]) -> Abort | None:
+        self.journal.append("v2")
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+@pytest.mark.parametrize("outcome", [KeyError("stamped_by"), Abort(status=403, message="no")])
+async def test_a_failing_v2_log_prepare_writer_is_contained_and_async_success_still_reaches_every_logger(
+    logging_obj: LitellmLogging, monkeypatch: pytest.MonkeyPatch, outcome: Exception | Abort
+) -> None:
+    journal: Final[list[object]] = []
+    recorder: Final = _EndedRecorder(journal)
+    _plane_lists(
+        monkeypatch,
+        _async_success_callback=[
+            _Entry("first", journal),
+            _BrokenStamp(journal, outcome),
+            recorder,
+            _Entry("last", journal),
+        ],
+    )
+    logging_obj.stream = False
+    logging_obj.update_environment_variables(litellm_params={"acompletion": True}, optional_params={})
+    now: Final = datetime.datetime.now(datetime.timezone.utc)
+
+    await logging_obj.async_success_handler(result=ModelResponse(id="served"), start_time=now, end_time=now)
+
+    assert [entry[0] for entry in _ran(journal, "hook")] == ["first", "last"]
+    assert [entry[0] for entry in _ran(journal, "success")] == ["first", "last"]
+    assert journal.count("v2") == 2
+    assert recorder.done.is_set()
+
+
+def _sync_success(logging_obj: LitellmLogging) -> None:
+    logging_obj.stream = False
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={})
+    now: Final = datetime.datetime.now(datetime.timezone.utc)
+    logging_obj.success_handler(result=ModelResponse(id="served"), start_time=now, end_time=now)
+
+
+def test_a_v2_log_prepare_writer_and_an_awaited_v2_run_inline_on_a_sync_success_between_legacy_loggers(
+    logging_obj: LitellmLogging, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal: Final[list[object]] = []
+    stamp: Final = _PayloadStamp()
+    recorder: Final = _EndedRecorder(journal)
+    _plane_lists(monkeypatch, success_callback=[_Entry("first", journal), stamp, recorder, _Entry("last", journal)])
+
+    _sync_success(logging_obj)
+
+    assert len(stamp.seen) == 1
+    assert [
+        entry[0] if isinstance(entry, tuple) else entry for entry in journal if entry not in _ran(journal, "hook")
+    ] == [
+        "first",
+        "last",
+        "v2",
+    ]
+    payload: Final[object] = logging_obj.model_call_details["standard_logging_object"]
+    assert isinstance(payload, dict)
+    assert payload["stamped_by"] == "v2"
+
+
+async def test_a_sync_success_on_a_running_loop_still_delivers_legacy_loggers_and_hands_v2_writers_off_path(
+    logging_obj: LitellmLogging, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal: Final[list[object]] = []
+    stamp: Final = _PayloadStamp()
+    recorder: Final = _EndedRecorder(journal)
+    _plane_lists(monkeypatch, success_callback=[_Entry("first", journal), stamp, recorder, _Entry("last", journal)])
+
+    _sync_success(logging_obj)
+
+    assert [entry[0] for entry in _ran(journal, "success")] == ["first", "last"]
+    assert await asyncio.to_thread(recorder.done.wait, 30)
+
+
+class _AwaitedSent(CustomLoggerV2):
+    def __init__(self, journal: list[object]) -> None:
+        self.journal = journal
+        self.done = threading.Event()
+
+    @on(Hook.provider_request_sent, awaited=True)
+    async def provider_request_sent(self, view: object, ctx: CallContext[object]) -> None:
+        self.journal.append("v2")
+        self.done.set()
+
+
+@pytest.mark.parametrize("on_loop", [False, True])
+async def test_an_awaited_v2_provider_request_sent_subscriber_keeps_every_legacy_log_pre_api_call(
+    logging_obj: LitellmLogging, monkeypatch: pytest.MonkeyPatch, on_loop: bool
+) -> None:
+    journal: Final[list[object]] = []
+    sent: Final = _AwaitedSent(journal)
+    _plane_lists(monkeypatch, input_callback=[_Entry("first", journal), sent, _Entry("last", journal)])
+
+    if on_loop:
+        _fire_provider_event(logging_obj, Hook.provider_request_sent)
+    else:
+        await asyncio.to_thread(_fire_provider_event, logging_obj, Hook.provider_request_sent)
+
+    assert await asyncio.to_thread(sent.done.wait, 30)
+    assert [entry[0] if isinstance(entry, tuple) else entry for entry in journal] == ["first", "last", "v2"]
+
+
+class _NoLogObserver(_EndedRecorder):
+    selection = Selection(name="no_log_observer", honors_no_log=True)
+
+
+@pytest.mark.parametrize("bound", [False, True])
+async def test_a_no_log_request_skips_a_v2_observer_that_honors_no_log(
+    logging_obj: LitellmLogging, monkeypatch: pytest.MonkeyPatch, bound: bool
+) -> None:
+    journal: Final[list[object]] = []
+    observer: Final = _NoLogObserver(journal)
+    _plane_lists(monkeypatch, _async_success_callback=[_Entry("legacy", journal), observer])
+    logging_obj.stream = False
+    logging_obj.update_environment_variables(litellm_params={"acompletion": True, "no-log": True}, optional_params={})
+    now: Final = datetime.datetime.now(datetime.timezone.utc)
+    logging_obj.start_time = now
+    if bound:
+        logging_obj.v2_scope = get_dispatcher().open_scope(RequestSelection(no_log=True))
+
+    await logging_obj.async_success_handler(result=ModelResponse(id="served"), start_time=now, end_time=now)
+
+    assert _ran(journal, "success") == []
+    assert "v2" not in journal
+
+
+async def test_a_logged_request_still_reaches_a_v2_observer_that_honors_no_log(
+    logging_obj: LitellmLogging, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal: Final[list[object]] = []
+    observer: Final = _NoLogObserver(journal)
+    _plane_lists(monkeypatch, _async_success_callback=[observer])
+    logging_obj.stream = False
+    logging_obj.update_environment_variables(litellm_params={"acompletion": True}, optional_params={})
+    now: Final = datetime.datetime.now(datetime.timezone.utc)
+
+    await logging_obj.async_success_handler(result=ModelResponse(id="served"), start_time=now, end_time=now)
+
+    assert journal == ["v2"]
+
+
+async def test_a_v2_attempt_ended_subscriber_gets_one_failure_when_both_failure_handlers_run(
+    logging_obj: LitellmLogging, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal: Final[list[object]] = []
+    recorder: Final = _EndedRecorder(journal)
+    _plane_lists(
+        monkeypatch,
+        failure_callback=[_Entry("sync", journal), recorder],
+        _async_failure_callback=[_Entry("async", journal), recorder],
+    )
+    logging_obj.stream = False
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={})
+    error: Final = ValueError("tool failed")
+
+    await asyncio.to_thread(logging_obj.failure_handler, error, "trace")
+    await logging_obj.async_failure_handler(error, "trace")
+
+    assert journal == [("sync", "failure", None), "v2", ("async", "failure", None)]
