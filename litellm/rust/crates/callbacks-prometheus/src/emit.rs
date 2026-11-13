@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{
     labels::{LabelContext, Settings, label_strings},
-    pyfmt::{py_number, py_str},
+    pyfmt::{is_py_int, is_py_number, py_big_int, py_number, py_str},
     store::{FamilyId, Op, Store},
 };
 
@@ -13,7 +13,9 @@ pub fn failed(message: impl Into<String>) -> CallbackError {
 
 pub fn py_float(value: &Value) -> Result<f64, CallbackError> {
     match value {
-        Value::Number(_) => py_number(value).ok_or_else(|| failed("float() of a number failed")),
+        _ if is_py_number(value) => {
+            py_number(value).ok_or_else(|| failed("float() of a number failed"))
+        }
         Value::Bool(flag) => Ok(if *flag { 1.0 } else { 0.0 }),
         Value::String(text) => text
             .trim()
@@ -29,7 +31,7 @@ pub fn py_float(value: &Value) -> Result<f64, CallbackError> {
 pub fn py_int_or_bool(value: &Value) -> Option<f64> {
     match value {
         Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
-        Value::Number(number) if number.is_i64() || number.is_u64() => number.as_f64(),
+        _ if is_py_int(value) => py_number(value),
         _ => None,
     }
 }
@@ -40,13 +42,13 @@ pub fn py_int(value: &Value) -> Option<i128> {
             .as_i64()
             .map(i128::from)
             .or_else(|| number.as_u64().map(i128::from)),
-        _ => None,
+        other => py_big_int(other),
     }
 }
 
 pub fn py_positive_number(value: &Value) -> Option<f64> {
     match value {
-        Value::Number(_) => py_number(value).filter(|number| *number > 0.0),
+        _ if is_py_number(value) => py_number(value).filter(|number| *number > 0.0),
         _ => None,
     }
 }

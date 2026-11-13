@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
-    pyfmt::{OPAQUE_KEY, py_str, py_truthy},
+    pyfmt::{NUMBER_KEY, OPAQUE_KEY, py_str, py_truthy},
     tracker::SeriesLimits,
 };
 
@@ -50,7 +50,12 @@ impl Settings {
 
 pub fn is_py_dict(value: &Value) -> Option<&Map<String, Value>> {
     match value {
-        Value::Object(map) if !(map.len() == 1 && map.contains_key(OPAQUE_KEY)) => Some(map),
+        Value::Object(map)
+            if !(map.len() == 1
+                && (map.contains_key(OPAQUE_KEY) || map.contains_key(NUMBER_KEY))) =>
+        {
+            Some(map)
+        }
         _ => None,
     }
 }

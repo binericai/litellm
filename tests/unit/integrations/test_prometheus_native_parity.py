@@ -252,6 +252,9 @@ CORPUS: Final = (
     _event(10, tokens={"prompt_tokens": 0}, response={"usage": {"prompt_tokens": 1500, "completion_tokens": 3}}),
     _event(11, tokens={"completion_tokens": "ten"}, metadata={"user_api_key_team_id": "team-raise"}),
     _event(12, hidden={"litellm_overhead_time_ms": "slow"}, metadata={"user_api_key_team_id": "team-overhead"}),
+    _event(
+        13, cost=float("nan"), tokens={"completion_tokens": float("inf")}, metadata={"user_api_key_team_id": 10**20}
+    ),
 )
 
 
@@ -338,6 +341,9 @@ async def _direct_calls(logger: PrometheusLogger) -> list[str]:
         lambda: logger.record_managed_file_size("big", "batch", "jsonl", None, "openai", "u"),  # pyright: ignore[reportArgumentType]  # callers pass untyped values at runtime
         lambda: logger.record_managed_batch_duration("long", "gpt-4o-mini"),  # pyright: ignore[reportArgumentType]  # callers pass untyped values at runtime
         lambda: logger.record_check_batch_cost_run("many", []),  # pyright: ignore[reportArgumentType]  # callers pass untyped values at runtime
+        lambda: logger._record_guardrail_metrics("nan-guard", float("nan"), "success", None, "pre_call"),
+        lambda: logger.track_provider_remaining_budget("nan-provider", float("nan"), float("inf")),
+        lambda: logger.record_managed_file_created("gpt-4o-mini", None, 10**20, None, None),  # pyright: ignore[reportArgumentType]  # callers pass untyped values at runtime
     )
     outcomes: Final = [_outcome(call) for call in calls]
     broken: Final = _failure(

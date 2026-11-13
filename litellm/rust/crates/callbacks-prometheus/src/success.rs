@@ -9,7 +9,7 @@ use crate::{
     labels::{
         LabelValues, Settings, combined_custom_metadata, custom_labels_from_metadata, is_py_dict,
     },
-    pyfmt::{py_number, py_str, py_truthy},
+    pyfmt::{is_py_number, py_number, py_str, py_truthy},
     store::Op,
 };
 
@@ -882,7 +882,7 @@ fn py_float_text(text: &str) -> Option<f64> {
 
 fn gauge_reading(value: &Value) -> Option<f64> {
     match value {
-        Value::Number(_) => py_number(value),
+        _ if is_py_number(value) => py_number(value),
         Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
         Value::String(text) => py_float_text(text),
         _ => None,
@@ -891,7 +891,7 @@ fn gauge_reading(value: &Value) -> Option<f64> {
 
 fn py_divide(value: &Value, by: f64) -> Result<f64, CallbackError> {
     match value {
-        Value::Number(_) => py_number(value).map(|number| number / by),
+        _ if is_py_number(value) => py_number(value).map(|number| number / by),
         Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 } / by),
         _ => None,
     }

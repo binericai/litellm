@@ -176,7 +176,8 @@ impl Ops<'_> {
     fn observed(&self, key: &str) -> Result<f64, OpError> {
         let value = field(self.facts, key);
         match value {
-            Value::Number(_) | Value::Bool(_) => self.number(key),
+            Value::Bool(_) => self.number(key),
+            _ if crate::pyfmt::is_py_number(value) => self.number(key),
             other => Err(OpError {
                 kind: ErrorKind::Type,
                 message: format!(

@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 pub const OPAQUE_KEY: &str = "$py";
+pub const NUMBER_KEY: &str = "$num";
 
 pub fn float_repr(value: f64) -> String {
     if value.is_nan() {
@@ -102,6 +103,18 @@ fn opaque(value: &Value) -> Option<&str> {
     }
 }
 
+fn tagged_number(value: &Value) -> Option<&str> {
+    match value {
+        Value::Object(map) if map.len() == 1 => map.get(NUMBER_KEY).and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn is_int_text(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 pub fn py_repr(value: &Value) -> String {
     match value {
         Value::String(text) => str_repr(text),
@@ -109,7 +122,7 @@ pub fn py_repr(value: &Value) -> String {
             "[{}]",
             items.iter().map(py_repr).collect::<Vec<_>>().join(", ")
         ),
-        Value::Object(map) => match opaque(value) {
+        Value::Object(map) => match opaque(value).or_else(|| tagged_number(value)) {
             Some(text) => text.to_owned(),
             None => format!(
                 "{{{}}}",
@@ -139,14 +152,27 @@ pub fn py_str(value: &Value) -> String {
 }
 
 pub fn is_py_int(value: &Value) -> bool {
-    matches!(value, Value::Number(number) if number.is_i64() || number.is_u64())
+    match value {
+        Value::Number(number) => number.is_i64() || number.is_u64(),
+        other => tagged_number(other).is_some_and(is_int_text),
+    }
+}
+
+pub fn is_py_number(value: &Value) -> bool {
+    matches!(value, Value::Number(_)) || tagged_number(value).is_some()
 }
 
 pub fn py_number(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
-        _ => None,
+        other => tagged_number(other).and_then(|text| text.parse().ok()),
     }
+}
+
+pub fn py_big_int(value: &Value) -> Option<i128> {
+    tagged_number(value)
+        .filter(|text| is_int_text(text))
+        .and_then(|text| text.parse().ok())
 }
 
 pub fn py_type_name(value: &Value) -> &'static str {
@@ -158,6 +184,8 @@ pub fn py_type_name(value: &Value) -> &'static str {
         Value::String(_) => "str",
         Value::Array(_) => "list",
         Value::Object(_) if opaque(value).is_some() => "object",
+        Value::Object(_) if is_py_int(value) => "int",
+        Value::Object(_) if tagged_number(value).is_some() => "float",
         Value::Object(_) => "dict",
     }
 }
@@ -221,7 +249,32 @@ mod tests {
     #[case(json!(["a", 1, null]), "['a', 1, None]")]
     #[case(json!({"k": "it's"}), "{'k': \"it's\"}")]
     #[case(json!({"$py": "<obj>"}), "<obj>")]
+    #[case(json!({"$num": "nan"}), "nan")]
+    #[case(json!({"$num": "-inf"}), "-inf")]
+    #[case(json!({"$num": "100000000000000000000"}), "100000000000000000000")]
+    #[case(json!([{"$num": "inf"}]), "[inf]")]
     fn json_values_print_as_python_str(#[case] value: Value, #[case] expected: &str) {
         assert_eq!(py_str(&value), expected);
+    }
+
+    #[rstest]
+    #[case::finite(json!(2.5), Some(2.5), "float")]
+    #[case::positive_infinity(json!({"$num": "inf"}), Some(f64::INFINITY), "float")]
+    #[case::negative_infinity(json!({"$num": "-inf"}), Some(f64::NEG_INFINITY), "float")]
+    #[case::big_int(json!({"$num": "100000000000000000000"}), Some(1e20), "int")]
+    #[case::opaque(json!({"$py": "inf"}), None, "object")]
+    #[case::text(json!("inf"), None, "str")]
+    fn tagged_numbers_read_as_python_numbers(
+        #[case] value: Value,
+        #[case] expected: Option<f64>,
+        #[case] type_name: &str,
+    ) {
+        assert_eq!(py_number(&value), expected);
+        assert_eq!(py_type_name(&value), type_name);
+    }
+
+    #[rstest]
+    fn a_tagged_nan_reads_as_nan() {
+        assert!(py_number(&json!({"$num": "nan"})).is_some_and(f64::is_nan));
     }
 }

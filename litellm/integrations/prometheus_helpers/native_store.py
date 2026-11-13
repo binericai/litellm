@@ -57,6 +57,8 @@ _HIDDEN_KEYS: Final = ("additional_headers", "litellm_overhead_time_ms")
 _EPOCH_NAIVE: Final = datetime(1970, 1, 1)  # noqa: DTZ001  # callback timestamps use the legacy naive contract
 _EPOCH_AWARE: Final = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _ONE_MICROSECOND: Final = timedelta(microseconds=1)
+_JSON_INTS: Final = (-(2**63), 2**64 - 1)
+NUMBER_KEY: Final = "$num"
 _MAPPING: Final[TypeAdapter[Mapping[str, object]]] = TypeAdapter(Mapping[str, object])
 _MOST_RECENT_MODES: Final = frozenset(("mostrecent", "livemostrecent"))
 _STRICT: Final = ConfigDict(strict=True)
@@ -90,10 +92,12 @@ def _items(value: object) -> Sequence[object] | None:
 
 
 def json_safe(value: object) -> object:
-    if value is None or isinstance(value, bool | int | str):
+    if value is None or isinstance(value, bool | str):
         return value
-    if isinstance(value, float) and math.isfinite(value):
-        return value
+    if isinstance(value, int):
+        return value if _JSON_INTS[0] <= value <= _JSON_INTS[1] else {NUMBER_KEY: str(value)}
+    if isinstance(value, float):
+        return value if math.isfinite(value) else {NUMBER_KEY: repr(value)}
     mapping: Final = _parsed(_DICT, value)
     if mapping is not None:
         if all(isinstance(key, str) for key in mapping):
@@ -193,7 +197,7 @@ def attempt_facts(kwargs: Mapping[str, object]) -> Mapping[str, object]:
             "api_call_start_time": moment(kwargs.get("api_call_start_time")),
             "completion_start_time": moment(kwargs.get("completion_start_time")),
         },
-        "key": _key(kwargs, params_metadata, payload),
+        "key": _key(kwargs, params_metadata, kwargs.get("standard_logging_object")),
         "deployment": _deployment(kwargs, litellm_params),
         "settings": _settings(),
     }
