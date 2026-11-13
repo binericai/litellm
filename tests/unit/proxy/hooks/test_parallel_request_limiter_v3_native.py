@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import copy
 import shutil
 import socket
 import subprocess
@@ -21,7 +22,8 @@ from litellm.caching.redis_cache import RedisCache
 from litellm.integrations.custom_logger_v2.call import CallContext, CallFacts, CallIds, CallKind, CallTarget, CallTiming
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.native import NativeState
-from litellm.integrations.custom_logger_v2.outcomes import Abort
+from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
+from litellm.integrations.custom_logger_v2.patches import apply_patch
 from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
@@ -87,6 +89,7 @@ class Side:
     responses: dict[int, object] = field(default_factory=dict)
     states: dict[int, object] = field(default_factory=dict)
     dynamic: _PROXY_DynamicRateLimitHandlerV3 | None = None
+    logged_payloads: dict[int, object] = field(default_factory=dict)
 
 
 def _free_port() -> int:
@@ -322,7 +325,7 @@ async def _ended(
                 )
             await side.limiter.async_post_call_success_hook(data, request.auth, response)  # pyright: ignore[reportArgumentType]  # a batch object stands in for the response like the proxy passes it
             if side.native is not None:
-                await side.native.run_native(
+                prepared = await side.native.run_native(
                     Hook.log_prepare,
                     frozenset({Field.deprecated_kwargs, Field.standard_logging_payload}),
                     SimpleNamespace(
@@ -330,7 +333,16 @@ async def _ended(
                     ),
                     _ctx(side, index, Hook.log_prepare, request),
                 )
+                side.logged_payloads[index] = (
+                    apply_patch(
+                        {Field.standard_logging_payload: copy.deepcopy(kwargs["standard_logging_object"])}, prepared
+                    )[Field.standard_logging_payload]
+                    if isinstance(prepared, Patch)
+                    else kwargs["standard_logging_object"]
+                )
             await side.limiter.async_logging_hook(kwargs, response, request.call_type)
+            if side.native is None:
+                side.logged_payloads[index] = copy.deepcopy(kwargs["standard_logging_object"])
             if side.dynamic is not None:
                 await side.dynamic.async_log_success_event(kwargs, response, None, None)
             await side.limiter.async_log_success_event(kwargs, response, None, None)
@@ -368,6 +380,11 @@ def _run(
     return asyncio.get_running_loop().create_task(step(side, index, request), context=context)
 
 
+def _ttl_bucket(pttl: object) -> int:
+    assert isinstance(pttl, int)
+    return pttl if pttl < 0 else pttl // 10_000
+
+
 def _snapshot(side: Side, scopes: Sequence[tuple[str, str]]) -> object:
     rows: Final[list[object]] = []
     stores: Final = (side.limiter.rate_limits,) + (
@@ -385,6 +402,10 @@ def _snapshot(side: Side, scopes: Sequence[tuple[str, str]]) -> object:
                 side.remote.get(f"{{{key}:{value}}}:tokens"),
                 side.remote.zcard(f"{{{key}:{value}}}:max_parallel_requests"),
                 side.remote.exists(f"{{{key}:{value}}}:window"),
+                tuple(
+                    _ttl_bucket(side.remote.pttl(f"{{{key}:{value}}}:{suffix}"))
+                    for suffix in ("requests", "tokens", "max_parallel_requests", "window")
+                ),
             )
         )
         rows.append(
@@ -440,6 +461,7 @@ async def _differential(
         assert _snapshot(python, scopes) == _snapshot(native, scopes), index
         if probe is not None:
             assert await probe(python) == await probe(native), index
+    assert native.logged_payloads == python.logged_payloads
     return observed
 
 
