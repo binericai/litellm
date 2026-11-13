@@ -260,6 +260,7 @@ def _logging_kwargs(index: int, request: Request) -> dict[str, object]:
     auth: Final = request.auth
     return {
         "litellm_call_id": f"call-{index}",
+        "call_type": request.call_type,
         "standard_logging_object": {
             "metadata": {
                 "user_api_key_hash": auth.api_key,
@@ -836,7 +837,7 @@ async def test_a_nested_mcp_tool_call_reuses_the_requests_slot_like_python(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("call_type", ("pass_through_endpoint", "_arealtime"))
 @pytest.mark.parametrize("end", ("success", "failure", "proxy_failure"))
-async def test_a_declined_nested_call_on_a_native_request_is_limited_like_python(
+async def test_a_nested_pass_through_or_realtime_call_on_a_native_request_is_limited_like_python(
     call_type: str, end: str, backend: tuple[int | None, int | None]
 ) -> None:
     clock: Final = Clock()
@@ -1056,6 +1057,50 @@ async def test_pass_through_requests_are_limited_natively_like_python(
         [
             Request(auth, _PASS_THROUGH, end=end, call_type="pass_through_endpoint", endpoint_type=endpoint_type)
             for _ in range(5)
+        ],
+        [("api_key", _KEY), *_PROJECT_SCOPES],
+        backend,
+    )
+    assert observed[0] is None
+
+
+_REALTIME_EVENTS: Final = [
+    {"type": "session.created", "session": {"id": "sess_1"}},
+    {
+        "type": "response.done",
+        "response": {"usage": {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42}},
+    },
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "failure", "partial_failure", "proxy_failure", "disconnect"))
+@pytest.mark.parametrize(
+    "limits",
+    (
+        {"tpm_limit": 200, "rpm_limit": 4},
+        {"max_parallel_requests": 1, "tpm_limit": 5000},
+        {
+            "project_id": "p1",
+            "project_metadata": {"model_itpm_limit": {"gpt-4o": 400}, "model_tpm_limit": {"gpt-4o": 900}},
+        },
+    ),
+)
+async def test_realtime_sessions_are_limited_natively_like_python(
+    end: str, limits: dict[str, object], backend: tuple[int | None, int | None]
+) -> None:
+    auth: Final = _auth(**limits)
+    observed: Final = await _differential(
+        [
+            Request(
+                auth,
+                {"model": "gpt-4o"},
+                end=end,
+                call_type="_arealtime",
+                response=list(_REALTIME_EVENTS),
+                held=index == 0,
+            )
+            for index in range(5)
         ],
         [("api_key", _KEY), *_PROJECT_SCOPES],
         backend,

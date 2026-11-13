@@ -62,12 +62,7 @@ RATE_LIMITED_KIND: Final = "proxy_rate_limit"
 UNVERIFIABLE_KIND: Final = "rate_limit_unverifiable"
 PTU_SHARE_EXCEEDED_KIND: Final = "ptu_share_exceeded"
 BATCH_RATE_LIMITED_KIND: Final = "batch_rate_limit"
-_UNSUPPORTED_CALL_TYPES: Final = frozenset(
-    {
-        CallTypes.aresponses_websocket.value,
-        "_arealtime",
-    }
-)
+_UNSUPPORTED_CALL_TYPES: Final = frozenset({CallTypes.aresponses_websocket.value})
 _HEADERS: Final = TypeAdapter(dict[str, str])
 _SCOPES: Final = TypeAdapter(tuple[BatchEnqueuedTokenScope, ...])
 _RESERVATION: Final = TypeAdapter(BatchEnqueuedTokenReservation)
