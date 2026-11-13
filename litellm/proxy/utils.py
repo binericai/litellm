@@ -2394,6 +2394,10 @@ class ProxyLogging:
         # Replace string entries in litellm.callbacks with initialized instances
         for idx, initialized_callback in string_callbacks_to_replace.items():
             litellm.callbacks[idx] = initialized_callback
+        if any(getattr(callback, "native_companion", None) is not None for callback in litellm.callbacks):
+            from litellm.integrations.prometheus_helpers.native_store import with_native_companions
+
+            litellm.callbacks[:] = with_native_companions(litellm.callbacks)
 
         # Fan ``litellm.callbacks`` (the "all events" registry) out into the
         # success/failure event lists eagerly, at startup. ``completion()`` does

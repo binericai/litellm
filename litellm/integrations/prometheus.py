@@ -36,9 +36,11 @@ from litellm.exceptions import (
     validate_rate_limit_type,
 )
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.integrations.custom_logger_v2.native import NativeLogger
 from litellm.integrations.prometheus_helpers import (
     PrometheusLabelFactoryContext,
     get_cached_end_user_id_for_cost_tracking,
+    native_store,
 )
 from litellm.integrations.prometheus_helpers.bounded_prometheus_series_tracker import (
     BoundedPrometheusSeriesTracker,
@@ -104,6 +106,7 @@ if TYPE_CHECKING:
 
     from litellm.proxy.utils import PrismaClient
     from litellm.router import Router
+    from litellm.rust_bridge._native import NativePrometheusMetric
 else:
     AsyncIOScheduler = Any
 
@@ -264,7 +267,7 @@ class _LabeledMetric:
         )
 
 
-_MetricLike: TypeAlias = "NoOpMetric | _LabeledMetric | MetricWrapperBase"
+_MetricLike: TypeAlias = "NoOpMetric | _LabeledMetric | MetricWrapperBase | NativePrometheusMetric"
 
 _SeriesLimitT: Final = TypeVar("_SeriesLimitT", int, float)
 _REQUEST_METADATA_ADAPTER: Final[TypeAdapter[Mapping[str, object]]] = TypeAdapter(Mapping[str, object])
@@ -600,6 +603,8 @@ class PrometheusLogger(CustomLogger):
     # Class variables or attributes
 
     _ADDITIVE_GUARDRAIL_MODES = frozenset((GuardrailEventHooks.pre_call.value, GuardrailEventHooks.post_call.value))
+    _native_store: native_store.NativeStore | None = None
+    native_companion: NativeLogger | None = None
 
     @staticmethod
     def get_instance() -> PrometheusLogger | None:
@@ -653,6 +658,9 @@ class PrometheusLogger(CustomLogger):
                 else SharedPrometheusSeriesAdmissions(directory=_multiproc_dir)
             )
             self._series_limits = self._configured_series_limits(multiprocess_mode=_multiproc_dir is not None)
+            self._native_store = (
+                native_store.NativeStore.open(self) if native_store.native_prometheus_enabled() else None
+            )
 
             # Create metric factory functions
             self._counter_factory = self._create_metric_factory(Counter)
@@ -1267,6 +1275,8 @@ class PrometheusLogger(CustomLogger):
                 labelnames=self.get_labels_for_metric("litellm_mcp_tool_call_spend_metric"),
             )
 
+            self.native_companion = None if self._native_store is None else self._native_store.attach(self)
+
         except Exception as e:
             print_verbose(f"Got exception on init prometheus client {e}")
             raise e
@@ -1575,6 +1585,8 @@ class PrometheusLogger(CustomLogger):
 
     def _create_metric_factory(self, metric_class, shares_overflow_series: bool = True):
         """Create a factory function that returns either a real metric or a no-op metric"""
+        if self._native_store is not None:
+            return self._native_store.factory(metric_class, self, shares_overflow_series)
 
         def factory(*args, **kwargs):
             # Extract metric name from the first argument or 'name' keyword argument
@@ -1738,6 +1750,12 @@ class PrometheusLogger(CustomLogger):
         if max_series is None and ttl_seconds is None:
             return
 
+        if self._native_store is not None:
+            self._native_store.track_end_user(
+                metric_name, tuple(labels.get(label) for label in labelnames), max_series, ttl_seconds
+            )
+            return
+
         self._bounded_prometheus_series_tracker.track_series(
             metric=metric,
             metric_name=metric_name,
@@ -1846,40 +1864,43 @@ class PrometheusLogger(CustomLogger):
         label_context: Final = PrometheusLabelFactoryContext(enum_values)  # amortized per request.
 
         # increment total LLM requests and spend metric
-        self._increment_top_level_request_and_spend_metrics(
-            end_user_id=end_user_id,
-            user_api_key=user_api_key,
-            user_api_key_alias=user_api_key_alias,
-            model=model,
-            user_api_team=user_api_team,
-            user_api_team_alias=user_api_team_alias,
-            user_id=user_id,
-            response_cost=response_cost,
-            enum_values=enum_values,
-            label_context=label_context,
-        )
-        self._increment_zero_cost_requests_metric(
-            zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
-            enum_values=enum_values,
-            label_context=label_context,
-        )
+        if self._native_store is None:
+            self._increment_top_level_request_and_spend_metrics(
+                end_user_id=end_user_id,
+                user_api_key=user_api_key,
+                user_api_key_alias=user_api_key_alias,
+                model=model,
+                user_api_team=user_api_team,
+                user_api_team_alias=user_api_team_alias,
+                user_id=user_id,
+                response_cost=response_cost,
+                enum_values=enum_values,
+                label_context=label_context,
+            )
+        if self._native_store is None:
+            self._increment_zero_cost_requests_metric(
+                zero_cost_diagnostic=standard_logging_payload.get("zero_cost_diagnostic"),
+                enum_values=enum_values,
+                label_context=label_context,
+            )
 
         # input, output, total token metrics
-        self._increment_token_metrics(
-            # why type ignore below?
-            # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
-            # 2. Pyright does not allow us to run isinstance(standard_logging_payload, StandardLoggingPayload) <- this would be ideal
-            standard_logging_payload=standard_logging_payload,
-            end_user_id=end_user_id,
-            user_api_key=user_api_key,
-            user_api_key_alias=user_api_key_alias,
-            model=model,
-            user_api_team=user_api_team,
-            user_api_team_alias=user_api_team_alias,
-            user_id=user_id,
-            enum_values=enum_values,
-            label_context=label_context,
-        )
+        if self._native_store is None:
+            self._increment_token_metrics(
+                # why type ignore below?
+                # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
+                # 2. Pyright does not allow us to run isinstance(standard_logging_payload, StandardLoggingPayload) <- this would be ideal
+                standard_logging_payload=standard_logging_payload,
+                end_user_id=end_user_id,
+                user_api_key=user_api_key,
+                user_api_key_alias=user_api_key_alias,
+                model=model,
+                user_api_team=user_api_team,
+                user_api_team_alias=user_api_team_alias,
+                user_id=user_id,
+                enum_values=enum_values,
+                label_context=label_context,
+            )
 
         # remaining budget metrics
         await self._increment_remaining_budget_metrics(
@@ -1903,30 +1924,32 @@ class PrometheusLogger(CustomLogger):
             model_id=enum_values.model_id,
         )
 
-        self._set_v3_rate_limit_allowed_and_used_metrics(
-            standard_logging_payload=standard_logging_payload,  # pyright: ignore[reportArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
-            enum_values=enum_values,
-        )
+        if self._native_store is None:
+            self._set_v3_rate_limit_allowed_and_used_metrics(
+                standard_logging_payload=standard_logging_payload,  # pyright: ignore[reportArgumentType]  # isinstance(dict) above narrows the TypedDict to dict[Unknown, Unknown]
+                enum_values=enum_values,
+            )
 
         # set latency metrics
-        self._set_latency_metrics(
-            kwargs=kwargs,
-            model=model,
-            user_api_key=user_api_key,
-            user_api_key_alias=user_api_key_alias,
-            user_api_team=user_api_team,
-            user_api_team_alias=user_api_team_alias,
-            # why type ignore below?
-            # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
-            # 2. Pyright does not allow us to run isinstance(standard_logging_payload, StandardLoggingPayload) <- this would be ideal
-            enum_values=enum_values,
-            label_context=label_context,
-            input_sequence_length=(
-                self._get_input_sequence_length(standard_logging_payload, kwargs, response_obj)
-                if self._emit_input_sequence_length_label
-                else None
-            ),
-        )
+        if not self._native_owns_latency():
+            self._set_latency_metrics(
+                kwargs=kwargs,
+                model=model,
+                user_api_key=user_api_key,
+                user_api_key_alias=user_api_key_alias,
+                user_api_team=user_api_team,
+                user_api_team_alias=user_api_team_alias,
+                # why type ignore below?
+                # 1. We just checked if isinstance(standard_logging_payload, dict). Pyright complains.
+                # 2. Pyright does not allow us to run isinstance(standard_logging_payload, StandardLoggingPayload) <- this would be ideal
+                enum_values=enum_values,
+                label_context=label_context,
+                input_sequence_length=(
+                    self._get_input_sequence_length(standard_logging_payload, kwargs, response_obj)
+                    if self._emit_input_sequence_length_label
+                    else None
+                ),
+            )
 
         # set x-ratelimit headers
         self.set_llm_deployment_success_metrics(
@@ -1950,28 +1973,33 @@ class PrometheusLogger(CustomLogger):
         )
 
         # cache metrics
-        self._increment_cache_metrics(
-            standard_logging_payload=standard_logging_payload,
-            enum_values=enum_values,
-            label_context=label_context,
-        )
+        if self._native_store is None:
+            self._increment_cache_metrics(
+                standard_logging_payload=standard_logging_payload,
+                enum_values=enum_values,
+                label_context=label_context,
+            )
 
-        self._increment_media_generation_metrics(
-            standard_logging_payload=standard_logging_payload,
-            enum_values=enum_values,
-            label_context=label_context,
-        )
+        if self._native_store is None:
+            self._increment_media_generation_metrics(
+                standard_logging_payload=standard_logging_payload,
+                enum_values=enum_values,
+                label_context=label_context,
+            )
 
         # MCP tool call metrics
-        self._increment_mcp_tool_call_metrics(
-            standard_logging_payload=standard_logging_payload,
-            enum_values=enum_values,
-            response_cost=response_cost,
-        )
+        if self._native_store is None:
+            self._increment_mcp_tool_call_metrics(
+                standard_logging_payload=standard_logging_payload,
+                enum_values=enum_values,
+                response_cost=response_cost,
+            )
 
         # increment litellm_proxy_total_requests_metric for all successful requests
         # (both streaming and non-streaming) in this single location to prevent
         # double-counting that occurs when async_post_call_success_hook also increments
+        if self._native_store is not None:
+            return
         request_metadata: Final = {
             **_REQUEST_METADATA_ADAPTER.validate_python(get_litellm_metadata_from_kwargs(kwargs)),
             **_REQUEST_METADATA_ADAPTER.validate_python(_metadata),
@@ -1992,6 +2020,9 @@ class PrometheusLogger(CustomLogger):
             request_enum_values,
             label_context=PrometheusLabelFactoryContext(request_enum_values),
         )
+
+    def _native_owns_latency(self) -> bool:
+        return self._native_store is not None and self._native_store.owns_latency
 
     def _increment_token_metrics(
         self,
@@ -2564,8 +2595,8 @@ class PrometheusLogger(CustomLogger):
                     Literal["requests", "tokens"],
                     Literal["requests", "tokens", "input_tokens", "output_tokens"],
                     DEFINED_PROMETHEUS_METRICS,
-                    Gauge,
-                    Gauge,
+                    Gauge | NativePrometheusMetric,
+                    Gauge | NativePrometheusMetric,
                 ],
                 ...,
             ]
@@ -2667,8 +2698,8 @@ class PrometheusLogger(CustomLogger):
         ],
         header_rate_limit_type: Literal["requests", "tokens"],
         metric_name: DEFINED_PROMETHEUS_METRICS,
-        allowed_gauge: Gauge,
-        used_gauge: Gauge,
+        allowed_gauge: Gauge | NativePrometheusMetric,
+        used_gauge: Gauge | NativePrometheusMetric,
         rate_limit_type: Literal["requests", "tokens", "input_tokens", "output_tokens"],
     ) -> None:
         limit: Final = self._get_int_from_v3_rate_limit_headers(
@@ -4228,7 +4259,7 @@ class PrometheusLogger(CustomLogger):
             supported_enum_labels=self.get_labels_for_metric(metric_name=metric_name), enum_values=enum_values
         )
         series: Final = gauge.labels(**labels)
-        if isinstance(series, Gauge):
+        if isinstance(series, Gauge | native_store.NativePrometheusMetric):
             series.set(value)
 
     def increment_dynamic_limiter_throttled(

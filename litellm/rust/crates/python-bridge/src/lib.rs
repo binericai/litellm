@@ -12,6 +12,7 @@ mod marshal;
 mod model_cost;
 mod model_registry;
 mod preflight;
+mod prometheus;
 mod python_settings;
 mod redis;
 mod router;
@@ -46,6 +47,8 @@ mod _native {
     };
     #[pymodule_export]
     use crate::model_registry::bundled_model_cost_map;
+    #[pymodule_export]
+    use crate::prometheus::{NativePrometheusMetric, NativePrometheusStore, prometheus_callback};
     #[pymodule_export]
     use crate::redis::breaker::{NativeAdmission, NativeRedisBreaker, native_redis_breaker_states};
     #[pymodule_export]
@@ -194,6 +197,9 @@ mod tests {
                 "process_state_started",
                 "reserve_process_for_forking",
                 "unsupported_tls_settings",
+                "NativePrometheusStore",
+                "NativePrometheusMetric",
+                "prometheus_callback",
             ];
             #[cfg(feature = "huggingface")]
             expected.push("HuggingFaceEncoding");
