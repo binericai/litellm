@@ -3,17 +3,13 @@ use std::sync::Arc;
 use litellm_callbacks::{CallFacts, Callback, Field, FieldValues, Hook, HookInput, Verdict};
 use litellm_callbacks_parallel_request_limiter::{
     AuthFacts, Backend, Ctx, Descriptor, Engine, EnqueuedReservation, EnqueuedScope, FailureFacts,
-    IoReservation, LimiterState, OutputCapFacts, ParallelRequestLimiter, PolicyFacts, Response,
+    IoReservation, LimiterState, Op, OutputCapFacts, ParallelRequestLimiter, PolicyFacts, Response,
     Settings, SlotAcquisition, SuccessFacts, Unverifiable, WindowIdentity, auth_descriptors,
     output_cap, process_monotonic,
 };
 use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value};
-use litellm_redis_store::rate_limits::Scope;
-use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
-    prelude::*,
-    types::PyDict,
-};
+use litellm_redis_store::{Number, rate_limits::Scope};
+use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 use serde_json::{Value, json};
 
 use crate::redis::store::{
@@ -93,6 +89,36 @@ fn io_json(reservation: &IoReservation) -> Value {
         "scopes": reservation.scopes,
         "windows": windows_json(&reservation.windows),
     })
+}
+
+fn op_json(op: &Op) -> Value {
+    let (increment, guard) = match op {
+        Op::Plain(increment) => (increment, None),
+        Op::Guarded(guarded) => (
+            &guarded.increment,
+            Some((
+                guarded.expected_window_start.as_str(),
+                match guarded.backend {
+                    Backend::Redis => "redis",
+                    Backend::Local => "local",
+                },
+            )),
+        ),
+    };
+    let kind: &str = increment.counter.kind.into();
+    let amount = match increment.amount {
+        Number::Int(value) => json!(value),
+        Number::Float(value) => json!(value),
+    };
+    json!([
+        increment.counter.scope.descriptor,
+        increment.counter.scope.value,
+        kind,
+        amount,
+        increment.ttl.map(|ttl| ttl.as_secs()),
+        guard.map(|(window_start, _)| window_start),
+        guard.map(|(_, backend)| backend),
+    ])
 }
 
 fn reservation_json(reservation: &EnqueuedReservation) -> Value {
@@ -200,7 +226,7 @@ impl NativeParallelRequestLimiter {
             let verdict: Option<Verdict> = limiter
                 .handle(&input)
                 .await
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
             Ok(Pythonized(verdict))
         })
     }
@@ -329,6 +355,7 @@ impl NativeParallelRequestLimiter {
             "itpm": io_json(&stash.itpm),
             "otpm": io_json(&stash.otpm),
             "batch_enqueued_reservation": stash.batch_enqueued.take().map(|reservation| reservation_json(&reservation)),
+            "batch_tpd_refunds": std::mem::take(&mut stash.batch_tpd_refunds).iter().map(op_json).collect::<Vec<_>>(),
         });
         serde_json::to_string(&exported).map_err(|error| PyValueError::new_err(error.to_string()))
     }

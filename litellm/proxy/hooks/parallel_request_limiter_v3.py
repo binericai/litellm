@@ -106,6 +106,7 @@ from litellm.redis.stores.rate_limits import (
     AtomicOverLimit,
     AtomicReply,
     CounterIncrement,
+    CounterKind,
     GaugeOverLimit,
     LocalValue,
     RateLimitCounter,
@@ -530,36 +531,50 @@ _NATIVE_WINDOWS: Final = TypeAdapter[list[_NativeWindow] | None](list[_NativeWin
 
 
 class _NativeSlot(TypedDict):
-    slot_id: str
-    gauges: list[tuple[str, str]]
+    slot_id: ReadOnly[str]
+    gauges: ReadOnly[list[tuple[str, str]]]
 
 
 class _NativeResponse(TypedDict):
-    overall_code: str
-    statuses: list[RateLimitStatus]
+    overall_code: ReadOnly[str]
+    statuses: ReadOnly[list[RateLimitStatus]]
 
 
 class _NativeIo(TypedDict):
-    tokens: int
-    scopes: list[tuple[str, str]]
-    windows: list[_NativeWindow]
+    tokens: ReadOnly[int]
+    scopes: ReadOnly[list[tuple[str, str]]]
+    windows: ReadOnly[list[_NativeWindow]]
+
+
+_NativeOp: TypeAlias = tuple[
+    str, str, CounterKind, int | float, int | None, str | None, Literal["redis", "local"] | None
+]
+
+
+def _reservation_operation(op: _NativeOp) -> ReservationOperation:
+    key, value, kind, amount, ttl, window_start, backend = op
+    increment: Final = CounterIncrement(counter=RateLimitScope(key, value).counter(kind), amount=amount, ttl=ttl)
+    if window_start is None or backend is None:
+        return increment
+    return WindowGuardedIncrement(increment=increment, expected_window_start=window_start, reservation_backend=backend)
 
 
 class _NativeStash(TypedDict):
-    rate_limit_response: _NativeResponse | None
-    parallel_slot: _NativeSlot | None
-    reserved_tokens: int
-    reserved_model: tuple[str, str] | None
-    reserved_scopes: list[tuple[str, str]]
-    fallback_models: list[str]
-    reservation_released: bool
-    io_reservation_released: bool
-    tpm_limited_tags: list[str]
-    ptu_reserved_tokens: int
-    ptu_windows: list[_NativeWindow]
-    itpm: _NativeIo
-    otpm: _NativeIo
-    batch_enqueued_reservation: BatchEnqueuedTokenReservation | None  # writable-ok: read once from the bridge's JSON
+    rate_limit_response: ReadOnly[_NativeResponse | None]
+    parallel_slot: ReadOnly[_NativeSlot | None]
+    reserved_tokens: ReadOnly[int]
+    reserved_model: ReadOnly[tuple[str, str] | None]
+    reserved_scopes: ReadOnly[list[tuple[str, str]]]
+    fallback_models: ReadOnly[list[str]]
+    reservation_released: ReadOnly[bool]
+    io_reservation_released: ReadOnly[bool]
+    tpm_limited_tags: ReadOnly[list[str]]
+    ptu_reserved_tokens: ReadOnly[int]
+    ptu_windows: ReadOnly[list[_NativeWindow]]
+    itpm: ReadOnly[_NativeIo]
+    otpm: ReadOnly[_NativeIo]
+    batch_enqueued_reservation: ReadOnly[BatchEnqueuedTokenReservation | None]
+    batch_tpd_refunds: ReadOnly[tuple[_NativeOp, ...]]
 
 
 _NATIVE_STASH: Final = TypeAdapter(_NativeStash)
@@ -1034,6 +1049,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         stash.otpm_reserved_window_identities = _window_identities(exported["otpm"]["windows"])
         enqueued: Final = exported["batch_enqueued_reservation"]
         stash.batch_enqueued_reservation = enqueued  # rebind-ok: the adopted stash takes the native's reservation
+        refunds: Final = tuple(_reservation_operation(op) for op in exported["batch_tpd_refunds"])
+        stash.batch_tpd_refund_ops = refunds  # rebind-ok: the adopted stash takes the native's daily-token refunds
         stash.native_state = None
         return True
 
@@ -1720,7 +1737,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, pre_call_request
 
         assert self.native_companion is not None
-        reply: Final = await self.native_companion.should_rate_limit(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+        reply: Final = await self.native_companion.should_rate_limit(
             json.dumps([dict(descriptor) for descriptor in descriptors]),
             read_only,
             skip_tpm_check,
@@ -1740,7 +1757,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, pre_call_request
 
         assert self.native_companion is not None
-        reply: Final = await self.native_companion.atomic_check_and_increment(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+        reply: Final = await self.native_companion.atomic_check_and_increment(
             json.dumps([dict(descriptor) for descriptor in descriptors]),
             [
                 (int(increment.get("requests", 0) or 0), int(increment.get("tokens", 0) or 0))
@@ -2104,7 +2121,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         values (floored at 0) because the mirror carries no per-slot ids.
         """
         if self.native_companion is not None:
-            await self.native_companion.release_slots(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+            await self.native_companion.release_slots(
                 acquisition["slot_id"],
                 [(scope.descriptor_key, scope.descriptor_value) for scope in acquisition["gauges"]],
             )
@@ -4293,7 +4310,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 raise_wire_abort,
             )
 
-            reply: Final = await self.native_companion.fallback_target_allowed(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+            reply: Final = await self.native_companion.fallback_target_allowed(
                 native_state,
                 json.dumps([dict(descriptor) for descriptor in descriptors]),
                 model,
@@ -5397,7 +5414,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, post_call_request, usage_facts
 
         if not keep_slot:
-            await native.release_for_settlement(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+            await native.release_for_settlement(
                 native_state,
                 _call_id_from_callback_kwargs(kwargs),
                 post_call_request() if self.rate_limits.has_redis else None,
@@ -5459,7 +5476,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             },
         }
         settle: Final = native.settle_turn if turn else native.settle_success
-        await settle(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+        await settle(
             native_state,
             json.dumps(facts, default=str),
             post_call_request() if self.rate_limits.has_redis else None,
@@ -5757,12 +5774,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             if self.native_companion is not None and native_state is not None:
                 from litellm.proxy.hooks.parallel_request_limiter_v3_native import failure_facts, post_call_request
 
-                await self.native_companion.release_for_settlement(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+                await self.native_companion.release_for_settlement(
                     native_state,
                     _call_id_from_callback_kwargs(failed_call),
                     post_call_request() if self.rate_limits.has_redis else None,
                 )
-                await self.native_companion.settle_failure(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+                await self.native_companion.settle_failure(
                     native_state,
                     json.dumps(
                         {**failure_facts(self, failed_call), "call_id": _call_id_from_callback_kwargs(failed_call)}
@@ -5907,7 +5924,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         stash: Final = get_request_stash()
         native_state: Final = self._native_state(stash)
         if self.native_companion is not None and native_state is not None:
-            await self.native_companion.release_on_disconnect(native_state)  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+            await self.native_companion.release_on_disconnect(native_state)
             return
         await self._release_stashed_parallel_slot(stash, None)
 

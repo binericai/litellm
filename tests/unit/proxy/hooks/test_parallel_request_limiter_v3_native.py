@@ -189,7 +189,7 @@ def _outcome(error: BaseException | None) -> object:
         type(error).__name__,
         getattr(error, "status_code", None),
         getattr(error, "detail", None),
-        dict(getattr(error, "headers", None) or {}),
+        list(dict(getattr(error, "headers", None) or {}).items()),
         getattr(error, "rate_limit_type", None),
         getattr(error, "descriptor_key", None),
         getattr(error, "model", None),
@@ -1512,3 +1512,44 @@ async def test_tokens_are_estimated_only_after_the_first_pass_admits_like_python
     assert calls.count(True) == calls.count(False) == 2
     assert observed[2:] == [observed[2], observed[2]]
     assert observed[2] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "limits",
+    (
+        {"team_id": "t1", "team_metadata": {"model_rpm_limit": {"gpt-4o": "2"}}},
+        {"team_id": "t1", "team_metadata": {"model_tpm_limit": {"gpt-4o": " 20 "}}},
+        {"team_id": "t1", "team_metadata": {"model_rpm_limit": {"gpt-4o": "2.5"}}},
+    ),
+)
+async def test_limits_stored_as_strings_are_enforced_like_python_int(
+    limits: dict[str, object], backend: tuple[int | None, int | None]
+) -> None:
+    observed: Final = await _differential(
+        [Request(_auth(**limits), {**_CHAT, "max_tokens": 20}) for _ in range(3)],
+        [("api_key", _KEY), ("model_per_team", "t1:gpt-4o")],
+        backend,
+    )
+    assert any(outcome is not None for outcome in observed)
+
+
+@pytest.mark.asyncio
+async def test_a_handed_over_batch_keeps_its_daily_token_refunds_like_python(
+    backend: tuple[int | None, int | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _batch_usage(monkeypatch, total_tokens=600, request_count=6)
+    request: Final = Request(_auth(tpd_limit=1500, rpm_limit=100), _BATCH, call_type="acreate_batch")
+    clock: Final = Clock()
+    refunds: Final[list[object]] = []
+    for side in (_side(clock, native=False, port=backend[0]), _side(clock, native=True, port=backend[1])):
+        assert await _run(side, 0, _admit, request) is None
+        stash = side.contexts[0].run(get_request_stash)
+        assert stash is not None
+        if side.native is not None:
+            assert stash.native_state is not None
+            assert stash.batch_tpd_refund_ops == ()
+            assert side.limiter._adopt_native_state(stash, stash.native_state, "nested-call")  # pyright: ignore[reportPrivateUsage]  # the hand over under test
+        refunds.append(stash.batch_tpd_refund_ops)
+    assert refunds[0] == refunds[1]
+    assert refunds[0] != ()

@@ -54,16 +54,14 @@ pub fn rate_limited(
         status.current_limit,
         status.limit_remaining.max(0),
     );
-    let headers = BTreeMap::from([
+    let ordered = [
         ("retry-after".to_owned(), window_size.to_string()),
         ("rate_limit_type".to_owned(), kind.to_owned()),
         ("rate_limited_by".to_owned(), descriptor_key.to_owned()),
         ("reset_at".to_owned(), reset),
-    ]);
-    let header_values: Map<String, Value> = headers
-        .iter()
-        .map(|(name, value)| (name.clone(), Value::String(value.clone())))
-        .collect();
+    ];
+    let header_values = json!(ordered);
+    let headers = BTreeMap::from(ordered);
     Some(Abort {
         status: 429,
         message: detail.clone(),
@@ -73,7 +71,7 @@ pub fn rate_limited(
             kind: RATE_LIMITED.to_owned(),
             fields: Map::from_iter([
                 ("detail".to_owned(), Value::String(detail)),
-                ("headers".to_owned(), Value::Object(header_values)),
+                ("headers".to_owned(), header_values),
                 ("rate_limit_type".to_owned(), json!(kind)),
                 ("descriptor_key".to_owned(), json!(descriptor_key)),
                 ("requested_model".to_owned(), json!(requested_model)),
@@ -83,15 +81,13 @@ pub fn rate_limited(
 }
 
 pub fn batch_rate_limited(refusal: Refusal, requested_model: Option<&str>) -> Abort {
-    let headers = BTreeMap::from([
+    let ordered = [
         ("retry-after".to_owned(), refusal.retry_after.to_string()),
         ("rate_limit_type".to_owned(), refusal.limit_type.to_owned()),
         ("reset_at".to_owned(), refusal.reset_at),
-    ]);
-    let header_values: Map<String, Value> = headers
-        .iter()
-        .map(|(name, value)| (name.clone(), Value::String(value.clone())))
-        .collect();
+    ];
+    let header_values = json!(ordered);
+    let headers = BTreeMap::from(ordered);
     Abort {
         status: 429,
         message: refusal.detail.clone(),
@@ -101,7 +97,7 @@ pub fn batch_rate_limited(refusal: Refusal, requested_model: Option<&str>) -> Ab
             kind: BATCH_RATE_LIMITED.to_owned(),
             fields: Map::from_iter([
                 ("detail".to_owned(), Value::String(refusal.detail)),
-                ("headers".to_owned(), Value::Object(header_values)),
+                ("headers".to_owned(), header_values),
                 ("rate_limit_type".to_owned(), json!(refusal.limit_type)),
                 ("requested_model".to_owned(), json!(requested_model)),
             ]),
@@ -130,7 +126,7 @@ pub fn batch_enqueued_limited(
             kind: BATCH_RATE_LIMITED.to_owned(),
             fields: Map::from_iter([
                 ("detail".to_owned(), Value::String(detail)),
-                ("headers".to_owned(), json!({"rate_limit_type": "tokens"})),
+                ("headers".to_owned(), json!([["rate_limit_type", "tokens"]])),
                 ("rate_limit_type".to_owned(), json!("tokens")),
                 ("requested_model".to_owned(), json!(requested_model)),
             ]),

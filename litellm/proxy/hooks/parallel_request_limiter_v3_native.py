@@ -68,7 +68,7 @@ RATE_LIMITED_KIND: Final = "proxy_rate_limit"
 UNVERIFIABLE_KIND: Final = "rate_limit_unverifiable"
 PTU_SHARE_EXCEEDED_KIND: Final = "ptu_share_exceeded"
 BATCH_RATE_LIMITED_KIND: Final = "batch_rate_limit"
-_HEADERS: Final = TypeAdapter(dict[str, str])
+_HEADERS: Final = TypeAdapter(list[tuple[str, str]])
 _SCOPES: Final = TypeAdapter(tuple[BatchEnqueuedTokenScope, ...])
 _RESERVATION: Final = TypeAdapter(BatchEnqueuedTokenReservation)
 _OVER_LIMIT: Final = TypeAdapter(BatchEnqueuedTokenOverLimit)
@@ -138,7 +138,7 @@ def _rate_limited(wire: WireAbort) -> Exception:
     descriptor_key: Final = fields.get("descriptor_key")
     return ProxyRateLimitError(
         detail=str(fields.get("detail", wire.message)),
-        headers=_HEADERS.validate_python(headers) if headers is not None else dict(wire.headers),
+        headers=dict(_HEADERS.validate_python(headers)) if headers is not None else dict(wire.headers),
         rate_limit_type=map_v3_rate_limit_type(rate_limit_type if isinstance(rate_limit_type, str) else None),
         model=resolved_model,
         llm_provider=llm_provider,
@@ -177,7 +177,7 @@ def _batch_rate_limited(wire: WireAbort) -> Exception:
     rate_limit_type: Final = fields.get("rate_limit_type")
     return ProxyRateLimitError(
         detail=str(fields.get("detail", wire.message)),
-        headers=_HEADERS.validate_python(fields.get("headers") or {}),
+        headers=dict(_HEADERS.validate_python(fields.get("headers") or ())),
         category=RateLimitErrorCategory.LITELLM_BATCH_RATE_LIMIT,
         rate_limit_type=map_v3_rate_limit_type(rate_limit_type if isinstance(rate_limit_type, str) else None),
         model=resolved_model,

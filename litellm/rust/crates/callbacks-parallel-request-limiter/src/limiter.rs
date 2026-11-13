@@ -271,6 +271,7 @@ pub fn manifest() -> Manifest {
         subscriptions: vec![
             Subscription {
                 reads: kwargs,
+                writes: FieldSet::of(&[Field::OptionalParams]),
                 may_abort: true,
                 ..Subscription::on(Hook::PreCall)
             },
@@ -1305,7 +1306,7 @@ fn collect_targets(
         ("model_per_organization", organization),
         ("model_per_project", project),
     ];
-    if let Some(model_group) = model_group {
+    if let Some(model_group) = model_group.filter(|group| !group.is_empty()) {
         let mut seen: Vec<&str> = Vec::new();
         let groups: Vec<&str> = if model_groups.is_empty() {
             vec![model_group]
