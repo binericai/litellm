@@ -48,6 +48,15 @@ impl NativeModelCapacity {
         Ok(NativeCallback::new(callback)?)
     }
 
+    fn post_call_headers<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let key: KeyFacts = from_py(key)?;
+        Ok(to_py(py, &json!(self.inner.post_call_headers(&key)))?.into_bound(py))
+    }
+
     #[pyo3(signature = (call_id, key, model, commit))]
     fn fallback_target_allowed<'py>(
         &self,

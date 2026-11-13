@@ -196,11 +196,8 @@ impl ModelCapacity {
         let Ok(facts) = facts::<KeyOnly>(input) else {
             return Ok(None);
         };
-        if self.engine.limiter.post_call_success().await.is_err() {
-            return Ok(None);
-        }
         let headers = Engine::post_call_headers(&facts.key);
-        let _ = self.engine.host.add_response_headers(&headers).await;
+        let _ = self.engine.limiter.post_call_success(&headers).await;
         Ok(None)
     }
 
@@ -289,6 +286,10 @@ impl ModelCapacity {
             )
             .await;
         Ok(None)
+    }
+
+    pub fn post_call_headers(&self, key: &KeyFacts) -> Vec<(String, Value)> {
+        Engine::post_call_headers(key)
     }
 
     pub async fn fallback_target_allowed(

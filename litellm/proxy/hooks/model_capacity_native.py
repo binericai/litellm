@@ -4,7 +4,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import count
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias
-from weakref import WeakKeyDictionary
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -18,12 +17,9 @@ from litellm.caching.caching import DualCache
 from litellm.caching.redis_cache import RedisCircuitBreakerOpenError
 from litellm.exceptions import ServiceUnavailableError
 from litellm.integrations.custom_logger_v2.call import CallContext
-from litellm.integrations.custom_logger_v2.dispatcher import RequestScope
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
-from litellm.integrations.custom_logger_v2.host import current_scope
 from litellm.integrations.custom_logger_v2.native import (
     NativeLogger,
-    NativeState,
     WireAbort,
     WireManifest,
     _namespace,  # pyright: ignore[reportPrivateUsage]  # the generated class needs this port's base
@@ -54,10 +50,8 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RateLimitedModel,
     RateLimitResponse,
     RateLimitUnverifiableError,
-    RequestRateLimiterStash,
     ReservationOperation,
     WindowGuardedIncrement,
-    _request_stash,  # pyright: ignore[reportPrivateUsage]  # a v2 handler runs in a copied context, so the request's stash is rebound there
     _socket_connection_call_id,  # pyright: ignore[reportPrivateUsage]  # a socket turn names its connection the same way
     borrowing_team_model_limits,
     callback_kwargs_mapping,
@@ -505,13 +499,18 @@ class CapacityDelegate:
 
     @_seam
     @with_service_target(RATE_LIMITS_TARGET)
-    async def post_call_success(self, _args: Mapping[str, object]) -> object:
+    async def post_call_success(self, args: Mapping[str, object]) -> object:
         live: Final = _live()
         await self.v3_limiter.async_post_call_success_hook(  # pyright: ignore[reportUnknownMemberType]  # the legacy hook signature
             data=dict(live.data or {}) if not isinstance(live.data, dict) else live.data,
             user_api_key_dict=self._auth(),
             response=live.response,  # pyright: ignore[reportArgumentType]  # the live response the proxy handed this hook
         )
+        if not response_has_hidden_params(live.response):
+            return None
+        additional_headers: Final = ensure_response_additional_headers(live.response)
+        for name, value in _PAIRS.validate_python(args["headers"]):
+            additional_headers[name] = value  # pyright: ignore[reportArgumentType]  # the priority value as the handler set it
         return None
 
     @_seam
@@ -556,16 +555,6 @@ class CapacityDelegate:
         for bucket in _METADATA_BUCKETS:
             if bucket in stamped:
                 data[bucket] = stamped[bucket]
-        return None
-
-    @_seam
-    async def add_response_headers(self, args: Mapping[str, object]) -> object:
-        response: Final = _live().response
-        if not response_has_hidden_params(response):
-            return None
-        additional_headers: Final = ensure_response_additional_headers(response)
-        for name, value in _PAIRS.validate_python(args["headers"]):
-            additional_headers[name] = value  # pyright: ignore[reportArgumentType]  # the priority value as the handler set it
         return None
 
     @_seam
@@ -652,25 +641,6 @@ register_abort_error("proxy_rate_limit", _rate_limit_error)
 register_abort_error("reraise", _reraise)
 
 
-class _StashedState(NativeState):
-    __slots__ = ("request_stash",)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.request_stash: RequestRateLimiterStash | None = None
-
-
-_SCOPED: Final[WeakKeyDictionary[RequestScope, RequestRateLimiterStash]] = WeakKeyDictionary()
-
-
-def _scoped_stash() -> RequestRateLimiterStash | None:
-    stash: Final = get_request_stash()
-    if stash is not None:
-        return stash
-    scope: Final = current_scope()
-    return None if scope is None else _SCOPED.get(scope)
-
-
 def _native_answer(answer: Mapping[str, object], live: LiveRequest) -> Mapping[str, object]:
     raised_token: Final = answer.get("raised")
     if isinstance(raised_token, int) and raised_token in live.raised:
@@ -697,15 +667,8 @@ class NativeDynamicRateLimiter(NativeLogger):
         self, hook: Hook, reads: frozenset[Field], view: object, ctx: CallContext[object]
     ) -> Patch | Abort | None:
         data: Final = as_str_mapping(getattr(view, Field.deprecated_kwargs.value, None))
-        state: Final = ctx.state if isinstance(ctx.state, _StashedState) else None
-        if hook is Hook.pre_call and state is not None and data is not None and "model" in data:
-            state.request_stash = claim_request_stash_for_data(data)
-            scope: Final = current_scope()
-            if scope is not None:
-                _SCOPED[scope] = state.request_stash
-        stash_token: Final = (
-            None if state is None or state.request_stash is None else _request_stash.set(state.request_stash)
-        )
+        if hook is Hook.pre_call and data is not None and "model" in data:
+            claim_request_stash_for_data(data)
         live: Final = LiveRequest(
             hook=hook,
             data=data if hook is not Hook.attempt_ended else None,
@@ -715,17 +678,19 @@ class NativeDynamicRateLimiter(NativeLogger):
         )
         token: Final = _LIVE.set(live)
         try:
+            if hook is Hook.post_call_success:
+                headers: Final = self.capacity.post_call_headers(key_facts(live.auth))
+                _ = await self.delegate.post_call_success({"headers": headers})
+                return None
             return await super().run_native(hook, reads, view, ctx)
         finally:
             _LIVE.reset(token)
-            if stash_token is not None:
-                _request_stash.reset(stash_token)
 
     async def async_fallback_target_allowed(
         self, user_api_key_dict: UserAPIKeyAuth, model: str, request_data: Mapping[str, object], *, commit: bool = True
     ) -> bool:
         request_call_id: Final = request_data.get("litellm_call_id")
-        stash: Final = _scoped_stash()
+        stash: Final = get_request_stash()
         call_id: Final = (
             stash.owner_litellm_call_id
             if stash is not None and stash.owner_litellm_call_id is not None
@@ -746,7 +711,7 @@ class NativeDynamicRateLimiter(NativeLogger):
     ) -> None:
         if requested_model is None:
             return
-        stash: Final = _scoped_stash()
+        stash: Final = get_request_stash()
         live: Final = LiveRequest(auth=user_api_key_dict)
         token: Final = _LIVE.set(live)
         try:
@@ -782,13 +747,7 @@ def build_native_dynamic_rate_limiter(
     capacity: Final = NativeModelCapacity(delegate)
     native: Final = capacity.callback()
     manifest: Final = WireManifest.model_validate_json(native.manifest())
-    namespace: Final = _namespace(native, manifest)
-    namespace["request_state"] = type(
-        f"{manifest.selection.name}_state",
-        (_StashedState,),
-        {"native": native, "__slots__": ()},
-    )
-    cls: Final = type(manifest.selection.name, (NativeDynamicRateLimiter,), namespace)
+    cls: Final = type(manifest.selection.name, (NativeDynamicRateLimiter,), _namespace(native, manifest))
     logger: Final = cls(native, PROJECTIONS)
     logger.delegate = delegate
     logger.capacity = capacity

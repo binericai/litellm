@@ -48,7 +48,7 @@ pub trait V3Limiter: Send + Sync {
     fn cap_output<'a>(&'a self, tpm_share: i64, call_type: Option<&'a str>) -> SeamFuture<'a, ()>;
     fn publish<'a>(&'a self, responses: &'a [u64]) -> SeamFuture<'a, ()>;
     fn stash_call_type(&self) -> SeamFuture<'_, Option<String>>;
-    fn post_call_success(&self) -> SeamFuture<'_, ()>;
+    fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()>;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -90,7 +90,6 @@ pub trait CapacityHost: Send + Sync {
     ) -> SeamFuture<'a, bool>;
     fn authorize<'a>(&'a self, alternate: &'a str) -> SeamFuture<'a, Option<Vec<String>>>;
     fn steer<'a>(&'a self, access_groups: &'a [String]) -> SeamFuture<'a, ()>;
-    fn add_response_headers<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()>;
     fn metrics_enabled(&self) -> SeamFuture<'_, bool>;
     fn throttled<'a>(&'a self, event: &'a Throttle) -> SeamFuture<'a, ()>;
     fn set_share<'a>(&'a self, gauge: &'a ShareGauge) -> SeamFuture<'a, ()>;
@@ -209,8 +208,8 @@ impl<D: Delegate> V3Limiter for Delegated<D> {
         self.invoke("stash_call_type", json!({}))
     }
 
-    fn post_call_success(&self) -> SeamFuture<'_, ()> {
-        self.invoke("post_call_success", json!({}))
+    fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()> {
+        self.invoke("post_call_success", json!({"headers": headers}))
     }
 }
 
@@ -255,10 +254,6 @@ impl<D: Delegate> CapacityHost for Delegated<D> {
 
     fn steer<'a>(&'a self, access_groups: &'a [String]) -> SeamFuture<'a, ()> {
         self.invoke("steer", json!({"access_groups": access_groups}))
-    }
-
-    fn add_response_headers<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()> {
-        self.invoke("add_response_headers", json!({"headers": headers}))
     }
 
     fn metrics_enabled(&self) -> SeamFuture<'_, bool> {

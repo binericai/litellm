@@ -14,8 +14,9 @@ import litellm
 from litellm import DualCache, Router
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import RESPONSES_WEBSOCKET_CALL_ID_METADATA_KEY
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2.call import CallFacts, CallIds, CallKind, CallTarget, CallTiming
-from litellm.integrations.custom_logger_v2.enums import Hook
+from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.host import request_scope, reset_host_for_tests
 from litellm.integrations.custom_logger_v2.legacy import (
     PROXY_REQUEST_KEYS,
@@ -28,6 +29,7 @@ from litellm.integrations.custom_logger_v2.legacy import (
 )
 from litellm.litellm_core_utils.litellm_logging import LOGGING_KEYS
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.hooks import parallel_request_limiter_v3
 from litellm.proxy.hooks.dynamic_rate_limiter_v3 import AlternateGrant, PROXY_DynamicRateLimitHandlerV3
 from litellm.proxy.hooks.model_capacity_native import (
     UNLICENSED_PRIORITY_MESSAGE,
@@ -37,11 +39,11 @@ from litellm.proxy.hooks.model_capacity_native import (
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PROXY_MaxParallelRequestsHandler_v3,
     RateLimitUnverifiableError,
+    RequestRateLimiterStash,
     get_or_create_request_stash,
 )
 from litellm.proxy.request_auth_context import REQUEST_AUTH
-from litellm.proxy.utils import HookRun, hook_fields, raise_v2_abort
-from litellm.integrations.custom_logger_v2.enums import Field
+from litellm.proxy.utils import HookRun, InternalUsageCache, ProxyLogging, hook_fields, raise_v2_abort
 from litellm.redis.stores.rate_limits import RateLimitScope
 from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
 
@@ -996,103 +998,119 @@ async def test_attempts_settle_through_the_real_logging_path(monkeypatch: pytest
     assert [step[1] for step in python[0::2]] == [None, "InternalServerError", None, "InternalServerError"], python
 
 
+class _PayloadCapture(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.payloads: list[object] = []
+
+    async def async_log_success_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: object, end_time: object
+    ) -> None:
+        self.payloads.append(kwargs.get("standard_logging_object"))
+
+
+def _payload_headers(payload: object) -> object:
+    hidden: Final = payload.get("hidden_params") if isinstance(payload, Mapping) else None
+    return hidden.get("additional_headers") if isinstance(hidden, Mapping) else None
+
+
 @dataclass(frozen=True)
-class StashSight:
-    request_context_has_stash: bool
-    request_context_stash_is_the_limiters: bool
-    request_context_sees_the_limiters_statuses: bool
+class ProxyRun:
+    stashes_created: int
+    model: object
+    response_headers: object
+    header_hook: object
+    payload_headers: object
     matched_groups: object
 
 
-def _limiter_stash(side: Side, scope: object) -> object:
-    from litellm.proxy.hooks.model_capacity_native import _SCOPED  # pyright: ignore[reportPrivateUsage]
+async def _through_the_proxy(
+    proxy_logging: ProxyLogging, router: Router, capture: _PayloadCapture, request: Request
+) -> ProxyRun:
+    created: Final[list[RequestRateLimiterStash]] = []
 
-    if isinstance(side, NativeSide):
-        return _SCOPED.get(scope)  # pyright: ignore[reportArgumentType, reportUnknownMemberType]
-    return get_or_create_request_stash()
+    class _Counted(RequestRateLimiterStash):
+        def __init__(self) -> None:
+            super().__init__()
+            created.append(self)
 
-
-async def _proxy_pre_call(
-    proxy_logging: object, side: Side, request: Request, call_type: str = "acompletion"
-) -> StashSight:
-    from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash
-
-    async def lifecycle() -> StashSight:
+    async def lifecycle() -> ProxyRun:
         data: Final = request.data()
         live_auth: Final = _auth(data)
-        with request_scope() as scope:
-            await proxy_logging.pre_call_hook(user_api_key_dict=live_auth, data=data, call_type=call_type)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
-            in_request: Final = get_request_stash()
-            limiters: Final = (
-                _limiter_stash(side, scope) if in_request is None or isinstance(side, NativeSide) else in_request
+        with request_scope(), pytest.MonkeyPatch.context() as patch:
+            patch.setattr(parallel_request_limiter_v3, "RequestRateLimiterStash", _Counted)
+            admitted: Final = await proxy_logging.pre_call_hook(
+                user_api_key_dict=live_auth, data=data, call_type="acompletion"
             )
-            statuses: Final = (
-                []
-                if in_request is None or in_request.rate_limit_response is None
-                else in_request.rate_limit_response["statuses"]
+            assert admitted is not None
+            response: Final = await router.acompletion(
+                model=str(admitted["model"]),
+                messages=list(request.messages),
+                litellm_call_id=request.call_id,
+                metadata={"user_api_key_auth": live_auth},
+                mock_response="through the proxy",
             )
-            return StashSight(
-                request_context_has_stash=in_request is not None,
-                request_context_stash_is_the_limiters=in_request is limiters,
-                request_context_sees_the_limiters_statuses=any(
-                    status["descriptor_key"] == "model_saturation_check" for status in statuses
-                ),
-                matched_groups=live_auth.matched_model_access_groups,
+            await proxy_logging.post_call_success_hook(data=admitted, response=response, user_api_key_dict=live_auth)
+            header_hook: Final = await proxy_logging.post_call_response_headers_hook(
+                data=admitted, user_api_key_dict=live_auth, response=response
             )
+            await _settled()
+        return ProxyRun(
+            stashes_created=len(created),
+            model=admitted["model"],
+            response_headers=dict(response._hidden_params.get("additional_headers") or {}),
+            header_hook=header_hook,
+            payload_headers=_payload_headers(capture.payloads[-1]) if capture.payloads else None,
+            matched_groups=live_auth.matched_model_access_groups,
+        )
 
     return await asyncio.create_task(lifecycle(), context=contextvars.Context())
 
 
-@pytest.mark.parametrize(
-    ("build", "order", "expected"),
-    [
-        (PythonSide, "alone", (True, True, True)),
-        (PythonSide, "before_parallel_limiter", (True, True, True)),
-        (PythonSide, "after_parallel_limiter", (True, True, True)),
-        (NativeSide, "alone", (False, False, False)),
-        (NativeSide, "before_parallel_limiter", (True, False, False)),
-        (NativeSide, "after_parallel_limiter", (True, True, True)),
-    ],
-)
-async def test_the_real_proxy_pre_call_hook_shows_where_the_request_stash_lives(
-    monkeypatch: pytest.MonkeyPatch,
-    isolated: Clock,
-    build: Callable[[Router, Clock], Side],
-    order: str,
-    expected: tuple[bool, bool, bool],
-):
-    from litellm.proxy.utils import InternalUsageCache, ProxyLogging
-
+@pytest.mark.parametrize("order", ["alone", "before_parallel_limiter", "after_parallel_limiter"])
+async def test_the_real_proxy_hooks_share_one_request_stash_like_python(
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock, order: str
+) -> None:
     monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.5)
-    router: Final = _router(("luna", None, 4), ("opus", None, 4))
-    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
-    side: Final = build(router, isolated)
-    limiter: Final = side.handler if isinstance(side, PythonSide) else side.logger
-    parallel: Final = PROXY_MaxParallelRequestsHandler_v3(InternalUsageCache(dual_cache=DualCache()))
-    callbacks: Final[list[object]] = {
-        "alone": [limiter],
-        "before_parallel_limiter": [limiter, parallel],
-        "after_parallel_limiter": [parallel, limiter],
-    }[order]
-    monkeypatch.setattr(litellm, "callbacks", callbacks)
-    proxy_logging: Final = ProxyLogging(user_api_key_cache=DualCache())
     flexible: Final = _key(
         "flex",
         team_id="flex",
         team_models=["luna", "opus"],
         team_metadata={"model_preferences": [{"model": "luna", "alternates": ["luna", "opus"]}]},
     )
-    sights: Final = [
-        await _proxy_pre_call(proxy_logging, side, Request(_key("plain"), "luna", "p0")),
-        await _proxy_pre_call(proxy_logging, side, Request(_key("plain"), "luna", "p1")),
-        await _proxy_pre_call(proxy_logging, side, Request(flexible, "luna", "f0")),
+    requests: Final = [
+        Request(_key("plain"), "luna", "p0"),
+        Request(_key("plain"), "luna", "p1"),
+        Request(flexible, "luna", "f0"),
     ]
-    assert {
-        (
-            sight.request_context_has_stash,
-            sight.request_context_stash_is_the_limiters,
-            sight.request_context_sees_the_limiters_statuses,
-        )
-        for sight in sights
-    } == {expected}, sights
-    assert sights[2].matched_groups == ["group-opus"], sights
+    runs: Final[list[list[ProxyRun]]] = []
+    for build in (PythonSide, NativeSide):
+        isolated.current = datetime(2026, 11, 13, 12, 0, 0)
+        router = _router(("luna", None, 4), ("opus", None, 4))
+        monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+        side = build(router, isolated)
+        limiter = side.handler if isinstance(side, PythonSide) else side.logger
+        parallel = PROXY_MaxParallelRequestsHandler_v3(InternalUsageCache(dual_cache=DualCache()))
+        capture = _PayloadCapture()
+        registered = {
+            "alone": [limiter],
+            "before_parallel_limiter": [limiter, parallel],
+            "after_parallel_limiter": [parallel, limiter],
+        }[order]
+        for name in ("success_callback", "failure_callback", "_async_success_callback", "_async_failure_callback"):
+            monkeypatch.setattr(litellm, name, [])
+        monkeypatch.setattr(litellm, "callbacks", [*registered, capture])
+        proxy_logging = ProxyLogging(user_api_key_cache=DualCache())
+        runs.append([await _through_the_proxy(proxy_logging, router, capture, request) for request in requests])
+    python, native = runs
+    for index, (expected, actual) in enumerate(zip(python, native, strict=True)):
+        assert actual == expected, f"request {index} differs\nPY={expected!r}\nRS={actual!r}"
+    assert [run.stashes_created for run in native] == [1, 1, 1], native
+    assert [run.model for run in native] == ["luna", "luna", "opus"], native
+    assert native[2].matched_groups == ["group-opus"], native
+    assert all(
+        isinstance(run.payload_headers, Mapping)
+        and "x-ratelimit-model_saturation_check-remaining-requests" in run.payload_headers
+        and "x-ratelimit-model_saturation_check-remaining-requests" in run.response_headers
+        for run in native
+    ), native
