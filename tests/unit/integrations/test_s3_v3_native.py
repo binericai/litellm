@@ -4,6 +4,7 @@ import json
 import re
 import threading
 from collections.abc import Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,8 @@ from pydantic import BaseModel
 import litellm
 from litellm.integrations import s3_v2, s3_v3
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.host import request_scope
+from litellm.integrations.custom_logger_v2.selection import RequestSelection
 from litellm.integrations.s3_v2 import S3Logger
 from litellm.integrations.s3_v3 import S3LoggerV3, native_s3_v2_enabled, new_s3_v2_logger
 from litellm.rust_bridge import _native
@@ -702,3 +705,39 @@ async def test_the_native_opt_out_matches_should_run_callback(
     await _log_native(rust_logger, kwargs)
     await rust_logger.flush_queue()
     assert len(buckets[1].puts()) == int(expected)
+
+
+async def _until_queued(python_logger: S3Logger, rust_logger: S3LoggerV3) -> None:
+    for _ in range(100):
+        if python_logger.log_queue and rust_logger.sink.queued_keys():
+            return
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy_scope", [False, True])
+@pytest.mark.parametrize("global_disable", [False, True])
+@pytest.mark.parametrize("no_log", [False, True])
+async def test_an_acompletion_reaches_both_loggers_alike(
+    buckets: tuple[FakeBucket, FakeBucket],
+    monkeypatch: pytest.MonkeyPatch,
+    global_disable: bool,
+    no_log: bool,
+    proxy_scope: bool,
+) -> None:
+    monkeypatch.setattr(litellm, "global_disable_no_log_param", global_disable)
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, {"s3_use_team_prefix": True})
+    monkeypatch.setattr(litellm, "callbacks", [python_logger, rust_logger])
+    with request_scope(RequestSelection(no_log=no_log and not global_disable)) if proxy_scope else nullcontext():
+        await litellm.acompletion(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hello «world»"}],
+            mock_response="hi there",
+            metadata={"user_api_key_team_alias": "team-a"},
+            **({"no-log": True} if no_log else {}),
+        )
+    await _until_queued(python_logger, rust_logger)
+    await _flush(python_logger, rust_logger)
+    expected: Final = 0 if no_log and not global_disable else 1
+    _assert_same_puts(buckets, expected)
+    assert all(put.path.startswith("/logs/team-a/") for put in buckets[1].puts())

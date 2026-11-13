@@ -94,7 +94,7 @@ fn manifest() -> Manifest {
         selection: Selection {
             activation: Activation::DefaultOn,
             opt_out_by: vec![OptOutBy::Admin],
-            honors_no_log: false,
+            honors_no_log: true,
             ..Selection::named(NAME)
         },
         subscriptions: vec![Subscription {
