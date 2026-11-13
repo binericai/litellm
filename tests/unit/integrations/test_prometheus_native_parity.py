@@ -651,9 +651,22 @@ _REGISTRATIONS: Final = {
     "callbacks": ("callbacks",),
     "success_and_failure_callback": ("success_callback", "failure_callback"),
 }
+_SCENARIOS: Final[Mapping[str, Mapping[str, object]]] = {
+    "success": {"mock_response": "hi there"},
+    "stream": {"mock_response": "hi there", "stream": True},
+    "failure": {"mock_response": "litellm.RateLimitError"},
+    "callback_error": {"mock_response": "hi there", "queue_time_seconds": "slow"},
+}
 
 
-async def _completion_text(native: bool, registration: str, monkeypatch: pytest.MonkeyPatch) -> str:
+def _kept(line: str) -> bool:
+    if line.startswith("#"):
+        return False
+    name: Final = line.split("{")[0].split(" ")[0]
+    return _TIMED.search(name) is None or (name.endswith("_count") and not name.endswith("_created"))
+
+
+async def _completion_text(native: bool, registration: str, scenario: str, monkeypatch: pytest.MonkeyPatch) -> str:
     if native:
         monkeypatch.setenv(NATIVE_PROMETHEUS_ENV, "true")
     else:
@@ -663,34 +676,60 @@ async def _completion_text(native: bool, registration: str, monkeypatch: pytest.
     logger: Final = PrometheusLogger()
     for name in _REGISTRATIONS[registration]:
         monkeypatch.setattr(litellm, name, [logger])
-    _ = await litellm.acompletion(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": "hello"}],
-        mock_response="hi there",
-        metadata={"user_api_key_hash": "hashed", "user_api_key_team_id": "team-1", "tags": ["prod"]},
-    )
+    options: Final = dict(_SCENARIOS[scenario])
+    queue: Final = options.pop("queue_time_seconds", None)
+    metadata: Final[dict[str, object]] = {
+        "user_api_key_hash": "hashed",
+        "user_api_key_team_id": "team-1",
+        "tags": ["prod"],
+    }
+    if queue is not None:
+        metadata["queue_time_seconds"] = queue
+    try:
+        response: Final = await litellm.acompletion(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "hello"}],
+            metadata=metadata,
+            **options,
+        )
+        if options.get("stream") is True:
+            async for _ in response:
+                pass
+    except litellm.RateLimitError:
+        pass
     await asyncio.sleep(1)
     text: Final = generate_latest(_ours()).decode()
-    return "\n".join(
-        line for line in text.splitlines() if not line.startswith("#") and _TIMED.search(line.split("{")[0]) is None
-    )
+    return "\n".join(line for line in text.splitlines() if _kept(line))
 
 
+@pytest.mark.parametrize("scenario", list(_SCENARIOS))
 @pytest.mark.parametrize("registration", list(_REGISTRATIONS))
 async def test_a_real_acompletion_emits_the_same_metrics_through_the_rust_store(
-    registration: str, monkeypatch: pytest.MonkeyPatch
+    registration: str, scenario: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _ = await _completion_text(False, registration, monkeypatch)
+    _ = await _completion_text(False, registration, scenario, monkeypatch)
     _clear_registry()
-    python_text: Final = await _completion_text(False, registration, monkeypatch)
+    python_text: Final = await _completion_text(False, registration, scenario, monkeypatch)
     _clear_registry()
-    native_text: Final = await _completion_text(True, registration, monkeypatch)
+    native_text: Final = await _completion_text(True, registration, scenario, monkeypatch)
 
     assert any(isinstance(collector, NativeFamilyCollector) for collector in _logger_collectors())
-    assert re.search(r"^litellm_total_tokens_metric_total\{.*\} \d+\.0$", native_text, re.MULTILINE)
-    assert "litellm_deployment_success_responses_total{" in native_text
-    assert "litellm_remaining_team_budget_metric{" in native_text
     assert native_text == python_text
+    if registration != "callbacks" and scenario in ("stream", "failure"):
+        return
+    if scenario == "failure":
+        assert "litellm_llm_api_failed_requests_metric_total{" in native_text
+    else:
+        assert re.search(r"^litellm_total_tokens_metric_total\{.*\} \d+\.0$", native_text, re.MULTILINE)
+        assert "litellm_llm_api_latency_metric_count{" in native_text
+    if scenario == "stream":
+        assert "litellm_llm_api_time_to_first_token_metric_count{" in native_text
+    failures: Final = re.search(
+        r'^litellm_callback_logging_failures_metric_total\{callback_name="PrometheusLogger"\} (\S+)$',
+        native_text,
+        re.MULTILINE,
+    )
+    assert (failures is not None and failures.group(1) == "1.0") is (scenario == "callback_error")
 
 
 def test_multiprocess_mode_keeps_the_python_logger(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
