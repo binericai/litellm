@@ -79,6 +79,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2.call import CallFacts, CallIds, CallKind, CallTarget, CallTiming
 from litellm.integrations.custom_logger_v2.dispatcher import RequestScope
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.host import get_dispatcher
 from litellm.integrations.custom_logger_v2.legacy import (
     Admit,
     KwargsFields,
@@ -92,6 +93,7 @@ from litellm.integrations.custom_logger_v2.legacy import (
 from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2
 from litellm.integrations.custom_logger_v2.manifest import LegacyBinding
 from litellm.integrations.custom_logger_v2.outcomes import Patch
+from litellm.integrations.custom_logger_v2.selection import RequestSelection
 from litellm.integrations.deepeval.deepeval import DeepEvalLogger
 from litellm.integrations.langtrace import langtrace_trace_endpoint
 from litellm.integrations.mlflow import MlflowLogger
@@ -783,7 +785,7 @@ def _run_callbacks_sync(
             KwargsFields(kwargs, LOGGING_KEYS),
             binding,
             call=None if owner is None else owner.v2_call_facts(),
-            scope=None if owner is None else owner.v2_scope,
+            scope=None if owner is None else owner.v2_logging_scope(),
         )
         return
     for callback in callbacks:
@@ -806,7 +808,7 @@ async def _run_callbacks(
                 KwargsFields(kwargs, LOGGING_KEYS),
                 binding,
                 call=None if owner is None else owner.v2_call_facts(),
-                scope=None if owner is None else owner.v2_scope,
+                scope=None if owner is None else owner.v2_logging_scope(),
             )
         )
         return
@@ -861,6 +863,23 @@ class _FailureRun:
 
 class Logging(LiteLLMLoggingBaseClass):
     v2_scope: RequestScope | None = None
+    v2_failure_delivered: bool = False
+
+    def claim_v2_failure(self, eligible: bool) -> bool:
+        if not eligible or self.v2_failure_delivered:
+            return False
+        self.v2_failure_delivered = True
+        return True
+
+    def v2_logging_scope(self) -> RequestScope | None:
+        if self.v2_scope is not None or litellm.global_disable_no_log_param:
+            return self.v2_scope
+        params: Final = require_attributes(
+            self._model_call_details_view.get("litellm_params", {}), _ParamsLookup, "get"
+        )
+        if params.get("no-log", False) is not True:
+            return None
+        return get_dispatcher().open_scope(RequestSelection(no_log=True))
 
     def v2_call_facts(self) -> CallFacts | None:
         if self.v2_scope is None:
@@ -5148,7 +5167,7 @@ class Logging(LiteLLMLoggingBaseClass):
                 callbacks,
                 self.model_call_details,
                 functools.partial(self._deliver_sync_failure, run),
-                include_v2=not for_async_request,
+                include_v2=self.claim_v2_failure(not for_async_request),
                 owner=self,
             )
         except Exception as e:
@@ -5365,6 +5384,7 @@ class Logging(LiteLLMLoggingBaseClass):
                 start_time,  # pyright: ignore[reportUnknownArgumentType]  # untyped failure helper
                 end_time,  # pyright: ignore[reportUnknownArgumentType]  # untyped failure helper
             ),
+            include_v2=self.claim_v2_failure(True),
             owner=self,
         )
         await flush_post_call_redis_batches()
