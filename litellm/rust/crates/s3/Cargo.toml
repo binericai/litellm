@@ -6,7 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+litellm-auth-aws.workspace = true
 litellm-http.workspace = true
+bytes.workspace = true
 aws-sdk-s3.workspace = true
 aws-config = { version = "1.9.0", default-features = false, features = ["rustls", "rt-tokio", "credentials-process"] }
 aws-types = "1.4.0"

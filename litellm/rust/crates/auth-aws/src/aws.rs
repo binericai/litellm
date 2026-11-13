@@ -9,8 +9,8 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::ProvideCredentials;
 use aws_sigv4::http_request::{
-    SignableBody, SignableRequest, SignatureLocation, SigningInstructions, SigningParams,
-    SigningSettings, sign,
+    PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation, SigningInstructions,
+    SigningParams, SigningSettings, UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
@@ -603,6 +603,32 @@ pub fn sign_headers(
             Ok((name, value))
         })
         .collect()
+}
+
+pub fn sign_s3_headers(
+    method: &str,
+    url: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+    scope: SigningScope<'_>,
+) -> Result<Vec<(String, String)>, Error> {
+    let mut settings = SigningSettings::default();
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    let instructions = sign_request(
+        method,
+        url,
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        body,
+        settings,
+        scope,
+    )?;
+    Ok(instructions
+        .headers()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect())
 }
 
 pub fn presign_url(
