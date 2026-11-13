@@ -28,7 +28,7 @@ impl Limiter {
         if adaptive {
             Self::Adaptive(Arc::new(Adaptive::new(width, width, width.max(ceiling))))
         } else {
-            Self::Fixed(Arc::new(Semaphore::new(width)))
+            Self::Fixed(Arc::new(Semaphore::new(width.min(Semaphore::MAX_PERMITS))))
         }
     }
 
@@ -161,6 +161,14 @@ mod tests {
         assert_eq!(limiter.limit(), Some(2));
         limiter.record(true);
         assert_eq!(limiter.limit(), Some(2));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_bound_past_the_semaphore_maximum_acts_as_no_bound() {
+        let limiter = Limiter::new(usize::MAX, false, 0);
+        let _first = limiter.acquire().await;
+        let _second = limiter.acquire().await;
     }
 
     #[rstest]
