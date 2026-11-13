@@ -143,7 +143,7 @@ async def _native_admit(store: SpendCounterStore, identity: Identity, call_id: s
     logger: Final = _install_native_owner(store)
     _seed(store, identity)
     plan: Final = await reserve_budget_for_request(**_arguments(identity))  # pyright: ignore[reportArgumentType]  # the shared argument table is typed per key above
-    data: Final = {**BODY, "litellm_call_id": call_id, "metadata": {"user_api_key_budget_reservation": plan}}
+    data: Final = {**BODY, "litellm_call_id": call_id}
     view: Final = type("View", (), {Field.deprecated_kwargs.value: data})()
     state_type: Final = type(logger).request_state
     assert state_type is not None

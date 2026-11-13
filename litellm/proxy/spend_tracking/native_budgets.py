@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-import weakref
 from collections.abc import Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
 from fastapi import HTTPException, status
@@ -22,8 +23,7 @@ from litellm.integrations.custom_logger_v2.native import (
 )
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
-from litellm.litellm_core_utils.core_helpers import budget_reservation_from_metadata
-from litellm.proxy._types import ProxyErrorTypes, ProxyException
+from litellm.proxy._types import ProxyErrorTypes, ProxyException, UserAPIKeyAuth
 from litellm.redis.stores.spend_counters import SpendCounterStore
 from litellm.types.utils import CallTypes
 
@@ -31,18 +31,45 @@ if TYPE_CHECKING:
     from litellm.rust_bridge._native import NativeBudgets
 
 NATIVE_BUDGETS_ENV: Final = "LITELLM_NATIVE_BUDGETS"
-NATIVE_PLAN_KEY: Final = "native_plan"
 NATIVE_CALL_ID_KEY: Final = "native_call_id"
 
-_request_tasks: Final[weakref.WeakValueDictionary[str, asyncio.Task[object]]] = weakref.WeakValueDictionary()
+
+@dataclass(slots=True)
+class _PendingPlan:
+    reservation: dict[str, object]  # mutable-ok: the shared reservation dict auth handed the request
+    identity: UserAPIKeyAuth
+    request_task: asyncio.Task[object] | None
+    plan: Mapping[str, object] | None
+
+    def claim(self) -> Mapping[str, object] | None:
+        plan: Final = self.plan
+        self.plan = None
+        return plan
+
+
+_pending_plan: Final[ContextVar[_PendingPlan | None]] = ContextVar("native_budget_plan", default=None)
+_admitting: Final[ContextVar[Mapping[str, object] | None]] = ContextVar("native_budget_admission", default=None)
 
 
 def new_reservation_id() -> str:
-    reservation_id: Final = uuid.uuid4().hex
-    task: Final = asyncio.current_task()
-    if task is not None:
-        _request_tasks[reservation_id] = task
-    return reservation_id
+    return uuid.uuid4().hex
+
+
+def pending_native_reservation(
+    plan: Mapping[str, object], identity: UserAPIKeyAuth, input_tokens: int | None
+) -> dict[str, object]:  # mutable-ok: settlement stamps the reservation it returns
+    reservation: Final[dict[str, object]] = {  # mutable-ok: settlement stamps the reservation it returns
+        "reserved_cost": 0.0,
+        "entries": [],
+        "finalized": False,
+        "callback_bound": False,
+        "input_cost": 0.0,
+        "input_tokens": input_tokens,
+    }
+    _ = _pending_plan.set(
+        _PendingPlan(reservation=reservation, identity=identity, request_task=asyncio.current_task(), plan=plan)
+    )
+    return reservation
 
 
 _NATIVE_CALL_TYPES: Final = frozenset(
@@ -148,32 +175,10 @@ def _reservation_failed(wire: WireAbort) -> Exception:
     )
 
 
-def _metadata(data: Mapping[str, object]) -> Mapping[str, object]:
-    for name in ("litellm_metadata", "metadata"):
-        bucket = data.get(name)
-        if isinstance(bucket, Mapping) and budget_reservation_from_metadata(_STR_MAPPING.validate_python(bucket)):
-            return _STR_MAPPING.validate_python(bucket)
-    return {}
-
-
-def request_reservation(data: object) -> dict[str, object] | None:  # mutable-ok: the shared reservation dict
-    return (
-        budget_reservation_from_metadata(_metadata(_STR_MAPPING.validate_python(data)))
-        if isinstance(data, Mapping)
-        else None
-    )
-
-
 def _admission(data: object) -> object:
-    reservation: Final = request_reservation(data)
     request: Final = _STR_MAPPING.validate_python(data) if isinstance(data, Mapping) else {}
     model: Final = request.get("model")
-    call_id: Final = request.get("litellm_call_id")
-    return {
-        "plan": None if reservation is None else reservation.get(NATIVE_PLAN_KEY),
-        "call_id": call_id if isinstance(call_id, str) else None,
-        "model": model if isinstance(model, str) else None,
-    }
+    return {"plan": _admitting.get(), "call_id": None, "model": model if isinstance(model, str) else None}
 
 
 class NativeBudgetsLogger(NativeLogger):
@@ -182,17 +187,21 @@ class NativeBudgetsLogger(NativeLogger):
     async def run_native(
         self, hook: Hook, reads: frozenset[Field], view: object, ctx: CallContext[object]
     ) -> Patch | Abort | None:
-        outcome: Final = await super().run_native(hook, reads, view, ctx)
-        if hook is Hook.pre_call:
-            await self._mirror(getattr(view, Field.deprecated_kwargs.value, None))
+        pending: Final = _pending_plan.get() if hook is Hook.pre_call else None
+        plan: Final = None if pending is None else pending.claim()
+        if pending is None or plan is None:
+            return await super().run_native(hook, reads, view, ctx)
+        token: Final = _admitting.set(plan)
+        try:
+            outcome: Final = await super().run_native(hook, reads, view, ctx)
+        finally:
+            _admitting.reset(token)
+        await self._mirror(pending, plan)
         return outcome
 
-    async def _mirror(self, data: object) -> None:
-        reservation: Final = request_reservation(data)
-        plan: Final = None if reservation is None else reservation.pop(NATIVE_PLAN_KEY, None)
-        if reservation is None or not isinstance(plan, Mapping):
-            return
-        reservation_id: Final = _STR_MAPPING.validate_python(plan).get("reservation_id")
+    async def _mirror(self, pending: _PendingPlan, plan: Mapping[str, object]) -> None:
+        reservation: Final = pending.reservation
+        reservation_id: Final = plan.get("reservation_id")
         held: Final = (
             _RESERVATION.validate_python(await self.budgets.take(reservation_id))
             if isinstance(reservation_id, str)
@@ -215,7 +224,7 @@ class NativeBudgetsLogger(NativeLogger):
         start_reservation_lease_renewal(
             budget_reservation=reservation,
             counter_keys=frozenset(entry.counter_key for entry in held.entries),
-            request_task=_request_tasks.pop(reservation_id, None),
+            request_task=pending.request_task,
         )
 
 
@@ -257,7 +266,7 @@ async def settle_native_reservation(
 
 
 def is_native_reservation(reservation: Mapping[str, object] | None) -> bool:
-    return reservation is not None and (NATIVE_CALL_ID_KEY in reservation or NATIVE_PLAN_KEY in reservation)
+    return reservation is not None and NATIVE_CALL_ID_KEY in reservation
 
 
 class BudgetDecision(BaseModel):

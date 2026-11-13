@@ -47,11 +47,11 @@ from litellm.proxy.spend_tracking.input_tokens import (
     openai_chat_pdf_file_tokens,
 )
 from litellm.proxy.spend_tracking.native_budgets import (
-    NATIVE_PLAN_KEY,
     is_native_reservation,
     native_budget_route,
     native_budgets,
     new_reservation_id,
+    pending_native_reservation,
     settle_native_reservation,
 )
 from litellm.proxy.spend_tracking.spend_counter_batch import PendingSpendIncrement, spend_counter_batch_scope
@@ -397,8 +397,8 @@ async def _native_budget_plan(
     if not reservable:
         return None
     input_tokens: Final = max(input_token_counts.values(), default=None)
-    return {
-        NATIVE_PLAN_KEY: {
+    return pending_native_reservation(
+        {
             "counters": [
                 {
                     "counter_key": counter.counter_key,
@@ -420,13 +420,9 @@ async def _native_budget_plan(
             "status_code": int(litellm.budget_exceeded_status_code),
             "reservation_id": new_reservation_id(),
         },
-        "reserved_cost": 0.0,
-        "entries": [],
-        "finalized": False,
-        "callback_bound": False,
-        "input_cost": 0.0,
-        "input_tokens": input_tokens,
-    }
+        valid_token,
+        input_tokens,
+    )
 
 
 async def reconcile_budget_reservation(

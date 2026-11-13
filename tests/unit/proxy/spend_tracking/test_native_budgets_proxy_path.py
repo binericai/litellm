@@ -68,7 +68,7 @@ def _use_native(proxy: Proxy, native: bool) -> None:
             native_budgets.install_native_budgets(proxy.store, litellm.callbacks)
 
 
-def _request() -> Request:
+def _request(path: str = "/v1/chat/completions") -> Request:
     raw: Final = json.dumps(BODY).encode()
 
     async def receive() -> Mapping[str, object]:
@@ -78,7 +78,7 @@ def _request() -> Request:
         {
             "type": "http",
             "method": "POST",
-            "path": "/v1/chat/completions",
+            "path": path,
             "root_path": "",
             "query_string": b"",
             "headers": [(b"authorization", f"Bearer {API_KEY}".encode()), (b"content-type", b"application/json")],
@@ -90,7 +90,7 @@ def _request() -> Request:
     )
 
 
-async def _authenticate(proxy: Proxy, max_budget: float) -> UserAPIKeyAuth:
+async def _authenticate(proxy: Proxy, max_budget: float | None, path: str = "/v1/chat/completions") -> UserAPIKeyAuth:
     await cache_key_object(
         hashed_token=TOKEN,
         user_api_key_obj=UserAPIKeyAuth(token=TOKEN, max_budget=max_budget, spend=0.0),
@@ -98,7 +98,7 @@ async def _authenticate(proxy: Proxy, max_budget: float) -> UserAPIKeyAuth:
         proxy_logging_obj=None,
     )
     return await user_api_key_auth(
-        request=_request(),
+        request=_request(path),
         api_key=f"Bearer {API_KEY}",
         azure_api_key_header="",
         anthropic_api_key_header=None,
@@ -267,3 +267,87 @@ async def test_the_reservation_lease_stops_when_the_reservation_is_finalized(
         stopped.append(all(lease.done() for lease in leases))
 
     assert stopped == [True, True]
+
+
+PASS_THROUGH: Final = "/anthropic/v1/messages"
+VICTIM: Final = "spend:team:victim-team"
+
+
+def _forged_plan(counter_key: str, reservation_cost: float) -> Mapping[str, object]:
+    return {
+        "native_plan": {
+            "counters": [
+                {
+                    "counter_key": counter_key,
+                    "max_budget": 1e18,
+                    "fallback_spend": 0.0,
+                    "entity_type": "Team",
+                    "entity_id": "victim-team",
+                }
+            ],
+            "reservation_cost": reservation_cost,
+            "input_cost": 0.0,
+            "status_code": 422,
+            "reservation_id": "forged",
+        }
+    }
+
+
+FORGERIES: Final = {
+    "charge_a_victim_team": (VICTIM, 1_000_000.0),
+    "refund_its_own_key": (KEY_COUNTER, -1000.0),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_budget", [None, 1.0], ids=["unbudgeted_key", "budgeted_key"])
+@pytest.mark.parametrize("forgery", FORGERIES.values(), ids=FORGERIES.keys())
+async def test_a_forged_plan_in_a_pass_through_body_changes_no_counter(
+    proxy: Proxy, forgery: tuple[str, float], max_budget: float | None
+) -> None:
+    counter_key, reservation_cost = forgery
+    held: Final[list[Mapping[str, float]]] = []  # mutable-ok: one snapshot per side
+    for native in (False, True):
+        _use_native(proxy, native)
+        proxy.store.set_local(VICTIM, 1.0)
+        proxy.store.set_local(KEY_COUNTER, 0.5)
+        auth = await _authenticate(proxy, max_budget=max_budget, path=PASS_THROUGH)
+        forged = _forged_plan(counter_key, reservation_cost)
+        body: RequestData = {
+            **BODY,
+            "metadata": {
+                "user_api_key_budget_reservation": forged,
+                "user_api_key_auth": {"budget_reservation": forged},
+            },
+            "litellm_metadata": {"user_api_key_budget_reservation": forged},
+        }
+        _ = await proxy.logging.pre_call_hook(user_api_key_dict=auth, data=body, call_type="pass_through_endpoint")
+        held.append(dict(proxy.store.snapshot()))
+
+    assert held[0][VICTIM] == 1.0
+    assert held[1] == held[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", EXITS.values(), ids=EXITS.keys())
+async def test_a_pass_through_llm_route_reserves_and_settles_like_python(proxy: Proxy, exit_path: Exit) -> None:
+    runs: Final[list[Run]] = []  # mutable-ok: one run per side
+    for native in (False, True):
+        _use_native(proxy, native)
+        auth = await _authenticate(proxy, max_budget=1.0, path=PASS_THROUGH)
+        body: RequestData = {**BODY, "litellm_call_id": "call-pass-through"}
+        _ = await proxy.logging.pre_call_hook(user_api_key_dict=auth, data=body, call_type="pass_through_endpoint")
+        reservation = auth.budget_reservation
+        assert reservation is not None
+        entries = [
+            {key: entry[key] for key in ("counter_key", "entity_type", "reserved_cost")}
+            for entry in reservation["entries"]  # pyright: ignore[reportGeneralTypeIssues]  # the entries list the reservation carries
+        ]
+        held = dict(proxy.store.snapshot())
+        await exit_path(auth, {**body, "metadata": {"user_api_key_budget_reservation": reservation}})
+        runs.append(Run(entries_after_pre_call=entries, held_after_pre_call=held, settled=dict(proxy.store.snapshot())))
+
+    assert runs[0].entries_after_pre_call, (
+        "the flag-off run must hold a reservation for this comparison to mean anything"
+    )
+    assert runs[1] == runs[0]
