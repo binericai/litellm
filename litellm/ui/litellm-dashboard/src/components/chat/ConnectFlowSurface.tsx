@@ -1,10 +1,10 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import MCPAppsPanel, { type ConnectedServers } from "@/components/chat/MCPAppsPanel";
-import ConnectFlowBanner from "@/components/chat/ConnectFlowBanner";
+import MCPAppsPanel, { type ServerListReport } from "@/components/chat/MCPAppsPanel";
+import ConnectFlowBanner, { type FinishSelection } from "@/components/chat/ConnectFlowBanner";
 import { fetchConnectFlow } from "@/components/networking";
 
 interface Props {
@@ -13,27 +13,30 @@ interface Props {
   onChange: (servers: string[]) => void;
 }
 
-const picksKey = (flow: string) => `litellm-connect-picks:${flow}`;
-const signedInKey = (flow: string) => `litellm-connect-signed-in:${flow}`;
+const offServersKey = (flow: string) => `litellm-connect-off:${flow}`;
 
-const stored = (key: string): string[] | null => {
+const storedServerIds = (key: string): string[] => {
   try {
     const value: unknown = JSON.parse(sessionStorage.getItem(key) ?? "null");
-    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : null;
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
   } catch {
-    return null;
+    return [];
   }
 };
 
-const remember = (key: string, values: string[]) => {
+const rememberServerIds = (key: string, serverIds: string[]) => {
   try {
-    sessionStorage.setItem(key, JSON.stringify(values));
+    sessionStorage.setItem(key, JSON.stringify(serverIds));
   } catch {}
 };
 
-const idsToPost = (connected: ConnectedServers, signedIn: string[]) => {
-  const isPick = (id: string) => !connected.authorized.includes(id) || signedIn.includes(id);
-  return connected.on.some(isPick) ? connected.on : [];
+const finishSelectionFor = (connected: ServerListReport, offServerIds: readonly string[]): FinishSelection => {
+  if (typeof connected === "string") {
+    return offServerIds.length === 0 ? { status: "ready", serverIds: [] } : { status: "waiting" };
+  }
+  if (connected.on.length === connected.all.length) return { status: "ready", serverIds: [] };
+  if (connected.on.length === 0) return { status: "nothing-on" };
+  return { status: "ready", serverIds: connected.on };
 };
 
 /** Renders the sealed gateway connect flow without trusting URL context. */
@@ -58,37 +61,21 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
     retry: false,
   };
   const { data: flow, isError, refetch } = useQuery(flowQuery);
-  const [connected, setConnected] = useState<ConnectedServers | null>(null);
-  const [signedIn, setSignedIn] = useState(() => (connectFlow ? stored(signedInKey(connectFlow)) : null) ?? []);
-
-  useEffect(() => {
-    const picks = connectFlow ? stored(picksKey(connectFlow)) : null;
-    if (picks) onChange(picks);
-  }, [connectFlow, onChange]);
-
-  const rememberPicks = (servers: string[]) => {
-    if (connectFlow) remember(picksKey(connectFlow), servers);
-    onChange(servers);
-  };
-
-  const recordSignIn = useCallback(
-    (serverId: string) => {
-      if (connectFlow === null) return;
-      const signedInNow = [...(stored(signedInKey(connectFlow)) ?? []), serverId];
-      remember(signedInKey(connectFlow), signedInNow);
-      setSignedIn(signedInNow);
-    },
-    [connectFlow],
+  const [connected, setConnected] = useState<ServerListReport>("loading");
+  const [offServerIds, setOffServerIds] = useState(() =>
+    connectFlow ? storedServerIds(offServersKey(connectFlow)) : [],
   );
 
-  const connectedServerIds = (): string[] | null => {
-    if (flow?.state !== "unscoped" || flow.selectable === false) return [];
-    return connected && idsToPost(connected, signedIn);
+  const changeOffServerIds = (serverIds: string[]) => {
+    if (connectFlow) rememberServerIds(offServersKey(connectFlow), serverIds);
+    setOffServerIds(serverIds);
   };
 
   if (connectFlow === null) {
     return <MCPAppsPanel accessToken={accessToken} selectedServers={selectedServers} onChange={onChange} />;
   }
+
+  const narrowable = flow?.state === "unscoped" && flow.selectable !== false;
 
   return (
     <>
@@ -98,16 +85,18 @@ const ConnectFlowSurface: React.FC<Props> = ({ accessToken, selectedServers, onC
         accessToken={accessToken}
         onConnected={refetch}
         failed={isError}
-        connectedServerIds={connectedServerIds()}
+        finish={narrowable ? finishSelectionFor(connected, offServerIds) : undefined}
       />
       {flow?.state === "unscoped" && (
         <MCPAppsPanel
           accessToken={accessToken}
           selectedServers={selectedServers}
-          onChange={rememberPicks}
+          onChange={onChange}
           connectMode
+          offServerIds={offServerIds}
+          onOffServerIdsChange={changeOffServerIds}
+          switchesLocked={!narrowable}
           onConnectedServers={setConnected}
-          onSignedIn={recordSignIn}
         />
       )}
     </>

@@ -2,15 +2,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import ConnectFlowSurface from "./ConnectFlowSurface";
-import type { ConnectedServers } from "./MCPAppsPanel";
+import type { ServerListReport } from "./MCPAppsPanel";
 import { fetchConnectFlow } from "@/components/networking";
 
 const { startOAuthFlow, state, onSuccess, panel } = vi.hoisted(() => ({
   startOAuthFlow: vi.fn(),
   panel: {
-    onChange: undefined as ((servers: string[]) => void) | undefined,
-    onConnectedServers: undefined as ((servers: ConnectedServers | null) => void) | undefined,
-    onSignedIn: undefined as ((serverId: string) => void) | undefined,
+    offServerIds: undefined as readonly string[] | undefined,
+    switchesLocked: undefined as boolean | undefined,
+    onOffServerIdsChange: undefined as ((serverIds: string[]) => void) | undefined,
+    onConnectedServers: undefined as ((servers: ServerListReport) => void) | undefined,
   },
   onSuccess: { current: undefined as (() => void) | undefined },
   state: { oauthReturn: null as string | null, connectFlow: null as string | null },
@@ -29,18 +30,11 @@ vi.mock("@/components/networking", async (importOriginal) => ({
 }));
 vi.mock("@/components/chat/MCPAppsPanel", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/components/chat/MCPAppsPanel")>()),
-  default: ({
-    onChange,
-    onConnectedServers,
-    onSignedIn,
-  }: {
-    onChange: (servers: string[]) => void;
-    onConnectedServers?: (servers: ConnectedServers | null) => void;
-    onSignedIn?: (serverId: string) => void;
-  }) => {
-    panel.onChange = onChange;
+  default: ({ offServerIds, switchesLocked, onOffServerIdsChange, onConnectedServers }: typeof panel) => {
+    panel.offServerIds = offServerIds;
+    panel.switchesLocked = switchesLocked;
+    panel.onOffServerIdsChange = onOffServerIdsChange;
     panel.onConnectedServers = onConnectedServers;
-    panel.onSignedIn = onSignedIn;
     return <div data-testid="mcp-apps-panel" />;
   },
 }));
@@ -142,18 +136,34 @@ describe("ConnectFlowSurface", () => {
     expect(screen.getByTestId("mcp-apps-panel")).toBeInTheDocument();
   });
 
-  it("keeps the servers turned on across the OAuth round trip", async () => {
+  it("keeps the servers turned off across the OAuth round trip", async () => {
     state.connectFlow = "flow-handle-123";
     vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
     const { unmount } = renderSurface();
     await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onChange?.(["catalog"]));
+    act(() => panel.onOffServerIdsChange?.(["orders-id"]));
     unmount();
 
-    const onChangeAfterReturn = vi.fn();
-    renderSurface(onChangeAfterReturn);
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
 
-    expect(onChangeAfterReturn).toHaveBeenCalledWith(["catalog"]);
+    expect(panel.offServerIds).toEqual(["orders-id"]);
+  });
+
+  it("starts a new connect flow with every server on", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    const { unmount } = renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onOffServerIdsChange?.(["orders-id"]));
+    unmount();
+
+    state.connectFlow = "flow-handle-456";
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+
+    expect(panel.offServerIds).toEqual([]);
+    expect(panel.switchesLocked).toBe(false);
   });
 
   it.each([flow("interactive", true), flow("m2m", true)])(
@@ -167,111 +177,109 @@ describe("ConnectFlowSurface", () => {
     },
   );
 
-  it("keeps the panel but posts no picks when the flow cannot be narrowed", async () => {
+  it("locks the switches and posts no ids when the flow cannot be narrowed", async () => {
     state.connectFlow = "flow-handle-123";
     vi.mocked(fetchConnectFlow).mockResolvedValue({ ...flow("unscoped"), selectable: false });
     renderSurface();
 
     expect(await screen.findByTestId("mcp-apps-panel")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
+    expect(panel.switchesLocked).toBe(true);
     expect(screen.getByText(/https:\/\/claude\.ai will get every server you can reach/)).toBeInTheDocument();
-    act(() => panel.onConnectedServers?.({ on: ["catalog-id"], authorized: [] }));
+    act(() => panel.onConnectedServers?.({ on: ["catalog-id"], all: ["catalog-id", "orders-id"] }));
+
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
     expect(screen.queryByDisplayValue("catalog-id")).not.toBeInTheDocument();
   });
 
-  it("posts nothing while only the servers that were already on are on", async () => {
+  it("lets Finish through while the list loads, as on main, when nothing is off", async () => {
     state.connectFlow = "flow-handle-123";
     vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
     renderSurface();
     await screen.findByTestId("mcp-apps-panel");
-
-    act(() => panel.onConnectedServers?.({ on: ["tracker-id", "ledger-id"], authorized: ["tracker-id", "ledger-id"] }));
 
     expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
-    expect(screen.queryByDisplayValue("tracker-id")).not.toBeInTheDocument();
   });
 
-  it("posts every server that is on once one more is turned on", async () => {
+  it("holds Finish while the list loads after a server was turned off", async () => {
     state.connectFlow = "flow-handle-123";
     vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
     renderSurface();
     await screen.findByTestId("mcp-apps-panel");
 
-    act(() => panel.onConnectedServers?.({ on: ["tracker-id", "catalog-id"], authorized: ["tracker-id"] }));
+    act(() => panel.onOffServerIdsChange?.(["orders-id"]));
 
-    expect(screen.getByDisplayValue("tracker-id")).toHaveAttribute("name", "server");
-    expect(screen.getByDisplayValue("catalog-id")).toHaveAttribute("name", "server");
-  });
-
-  it("counts a login made during this flow as a pick", async () => {
-    state.connectFlow = "flow-handle-123";
-    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
-    renderSurface();
-    await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onSignedIn?.("tracker-id"));
-
-    act(() => panel.onConnectedServers?.({ on: ["ledger-id", "tracker-id"], authorized: ["ledger-id", "tracker-id"] }));
-
-    expect(screen.getByDisplayValue("ledger-id")).toHaveAttribute("name", "server");
-    expect(screen.getByDisplayValue("tracker-id")).toHaveAttribute("name", "server");
-  });
-
-  it("still counts that login after a reload", async () => {
-    state.connectFlow = "flow-handle-123";
-    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
-    const { unmount } = renderSurface();
-    await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onSignedIn?.("tracker-id"));
-    unmount();
-
-    renderSurface();
-    await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onConnectedServers?.({ on: ["ledger-id", "tracker-id"], authorized: ["ledger-id", "tracker-id"] }));
-
-    expect(screen.getByDisplayValue("ledger-id")).toHaveAttribute("name", "server");
-    expect(screen.getByDisplayValue("tracker-id")).toHaveAttribute("name", "server");
-  });
-
-  it("still counts that login after another login in the same flow", async () => {
-    state.connectFlow = "flow-handle-123";
-    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
-    const { unmount } = renderSurface();
-    await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onSignedIn?.("tracker-id"));
-    unmount();
-
-    renderSurface();
-    await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onSignedIn?.("catalog-id"));
-    act(() => panel.onConnectedServers?.({ on: ["ledger-id", "tracker-id"], authorized: ["ledger-id", "tracker-id"] }));
-
-    expect(screen.getByDisplayValue("ledger-id")).toHaveAttribute("name", "server");
-    expect(screen.getByDisplayValue("tracker-id")).toHaveAttribute("name", "server");
-  });
-
-  it("posts nothing once the login made during this flow is disconnected again", async () => {
-    state.connectFlow = "flow-handle-123";
-    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
-    renderSurface();
-    await screen.findByTestId("mcp-apps-panel");
-    act(() => panel.onSignedIn?.("tracker-id"));
-
-    act(() => panel.onConnectedServers?.({ on: ["ledger-id"], authorized: ["ledger-id"] }));
-
-    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
-    expect(screen.queryByDisplayValue("ledger-id")).not.toBeInTheDocument();
-  });
-
-  it("finishes with the ids of the servers the panel shows as connected", async () => {
-    state.connectFlow = "flow-handle-123";
-    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
-    renderSurface();
-    await screen.findByTestId("mcp-apps-panel");
     expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
+  });
 
-    act(() => panel.onConnectedServers?.({ on: ["catalog-id"], authorized: [] }));
+  it("posts nothing while every server is on, so the session stays as on main", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+
+    act(() => panel.onConnectedServers?.({ on: ["catalog-id", "orders-id"], all: ["catalog-id", "orders-id"] }));
+
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
+    expect(screen.queryByDisplayValue("catalog-id")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("orders-id")).not.toBeInTheDocument();
+  });
+
+  it("posts the servers still on once one is turned off", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+
+    act(() => panel.onConnectedServers?.({ on: ["catalog-id"], all: ["catalog-id", "orders-id"] }));
 
     expect(screen.getByDisplayValue("catalog-id")).toHaveAttribute("name", "server");
+    expect(screen.queryByDisplayValue("orders-id")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
+  });
+
+  it("holds Finish and says why when every server is off", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+
+    act(() => panel.onConnectedServers?.({ on: [], all: ["catalog-id", "orders-id"] }));
+
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
+    expect(screen.getByText("Turn on at least one server to finish connecting.")).toBeInTheDocument();
+  });
+
+  it("lets a user finish as on main when the server list fails to load and nothing is off", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+
+    act(() => panel.onConnectedServers?.("failed"));
+
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
+  });
+
+  it("holds Finish when the server list fails to load after a server was turned off", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+    act(() => panel.onOffServerIdsChange?.(["orders-id"]));
+
+    act(() => panel.onConnectedServers?.("failed"));
+
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
+  });
+
+  it("lets a user with no reachable server finish as on main", async () => {
+    state.connectFlow = "flow-handle-123";
+    vi.mocked(fetchConnectFlow).mockResolvedValue(flow("unscoped"));
+    renderSurface();
+    await screen.findByTestId("mcp-apps-panel");
+
+    act(() => panel.onConnectedServers?.({ on: [], all: [] }));
+
     expect(screen.getByRole("button", { name: /finish connecting/i })).toBeEnabled();
   });
 });

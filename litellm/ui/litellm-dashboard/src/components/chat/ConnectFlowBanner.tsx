@@ -15,8 +15,15 @@ interface Props {
   accessToken: string;
   onConnected: () => void;
   failed: boolean;
-  connectedServerIds?: string[] | null;
+  finish?: FinishSelection;
 }
+
+export type FinishSelection =
+  | { status: "waiting" }
+  | { status: "nothing-on" }
+  | { status: "ready"; serverIds: readonly string[] };
+
+const FINISH_WITHOUT_SERVERS: FinishSelection = { status: "ready", serverIds: [] };
 
 /** Finish remains an explicit POST because a cross-site navigation must never mint a code. */
 export function isLoopbackOrigin(origin: string | null): boolean {
@@ -99,7 +106,7 @@ const ConnectFlowBanner: React.FC<Props> = ({
   accessToken,
   onConnected,
   failed,
-  connectedServerIds = [],
+  finish = FINISH_WITHOUT_SERVERS,
 }) => {
   const { t } = useTranslation();
   const action = `${getProxyBaseUrl()}/authorize/complete`;
@@ -141,11 +148,15 @@ const ConnectFlowBanner: React.FC<Props> = ({
           ))}
           <form method="POST" action={action}>
             <input type="hidden" name="flow" value={flowHandle} />
-            {(connectedServerIds ?? []).map((serverId) => (
-              <input key={serverId} type="hidden" name="server" value={serverId} />
-            ))}
+            {finish.status === "ready" &&
+              finish.serverIds.map((serverId) => <input key={serverId} type="hidden" name="server" value={serverId} />)}
             {canFinish && (
-              <Button type="submit" disabled={connectedServerIds === null} className="h-[38px] px-4 font-semibold">
+              <Button
+                type="submit"
+                disabled={finish.status !== "ready"}
+                aria-describedby={finish.status === "nothing-on" ? "connect-flow-nothing-on" : undefined}
+                className="h-[38px] px-4 font-semibold"
+              >
                 {t("chat.connectFlowBanner.finish")}
               </Button>
             )}
@@ -164,6 +175,11 @@ const ConnectFlowBanner: React.FC<Props> = ({
                 <input type="checkbox" name="delivery" value="manual" />
                 {t("chat.connectFlowBanner.manualDelivery")}
               </label>
+            )}
+            {finish.status === "nothing-on" && (
+              <p id="connect-flow-nothing-on" className="mt-2 text-[13px] text-muted-foreground">
+                {t("chat.connectFlowBanner.nothingOn")}
+              </p>
             )}
           </form>
         </div>

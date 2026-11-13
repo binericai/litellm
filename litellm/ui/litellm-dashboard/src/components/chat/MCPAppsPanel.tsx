@@ -7,6 +7,7 @@ import { Search, ArrowLeft, ChevronRight, Wrench, CheckCircle, Loader2 } from "l
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   deleteMCPOAuthUserCredential,
@@ -93,17 +94,41 @@ export const OAuth2ConnectButton: React.FC<OAuth2ConnectButtonProps> = ({
 
 export interface ConnectedServers {
   on: string[];
-  authorized: string[];
+  all: string[];
 }
+
+export type ServerListReport = ConnectedServers | "loading" | "failed";
+
+const listReport = (loading: boolean, loadFailed: boolean, servers: ConnectedServers): ServerListReport => {
+  if (loading) return "loading";
+  if (loadFailed) return "failed";
+  return servers;
+};
 
 interface Props {
   accessToken: string;
   selectedServers: string[];
   onChange: (servers: string[]) => void;
   connectMode?: boolean;
-  onConnectedServers?: (servers: ConnectedServers | null) => void;
-  onSignedIn?: (serverId: string) => void;
+  offServerIds?: readonly string[];
+  onOffServerIdsChange?: (serverIds: string[]) => void;
+  switchesLocked?: boolean;
+  onConnectedServers?: (servers: ServerListReport) => void;
 }
+
+const NO_SERVER_IDS: readonly string[] = [];
+
+const CHAT_LABELS = {
+  tab: "chat.mcpAppsPanel.tabs.connected",
+  on: "chat.mcpAppsPanel.info.connected",
+  off: "chat.mcpAppsPanel.info.notConnected",
+} as const;
+const CONNECT_LABELS = {
+  tab: "chat.mcpAppsPanel.tabs.on",
+  on: "chat.mcpAppsPanel.info.on",
+  off: "chat.mcpAppsPanel.info.off",
+} as const;
+const labelsFor = (connectMode: boolean | undefined) => (connectMode ? CONNECT_LABELS : CHAT_LABELS);
 
 const AVATAR_COLORS = [
   "#1677ff",
@@ -133,8 +158,10 @@ const MCPAppsPanel: React.FC<Props> = ({
   selectedServers,
   onChange,
   connectMode,
+  offServerIds = NO_SERVER_IDS,
+  onOffServerIdsChange,
+  switchesLocked,
   onConnectedServers,
-  onSignedIn,
 }) => {
   const { t } = useTranslation();
   const [servers, setServers] = useState<MCPServer[]>([]);
@@ -190,8 +217,7 @@ const MCPAppsPanel: React.FC<Props> = ({
     serverId: returningServerId,
     onSuccess: useCallback(() => {
       setOauthConnected((prev) => new Set(prev).add(returningServerId));
-      onSignedIn?.(returningServerId);
-    }, [returningServerId, onSignedIn]),
+    }, [returningServerId]),
   });
 
   const fetchToolCount = useCallback(
@@ -319,6 +345,57 @@ const MCPAppsPanel: React.FC<Props> = ({
     }
   };
 
+  const isOn = (server: MCPServer) => {
+    if (connectUnavailabilityLabel(server) !== null) return false;
+    if (!connectMode) return selectedServers.includes(nameOf(server));
+    return switchesLocked || !offServerIds.includes(server.server_id);
+  };
+
+  const setServerOn = (server: MCPServer, on: boolean) =>
+    onOffServerIdsChange?.(
+      on ? offServerIds.filter((id) => id !== server.server_id) : [...offServerIds, server.server_id],
+    );
+
+  const renderServerSwitch = (server: MCPServer) => (
+    <Switch
+      checked={isOn(server)}
+      disabled={switchesLocked}
+      onCheckedChange={(checked) => setServerOn(server, checked)}
+      onClick={(e) => e.stopPropagation()}
+      aria-label={t("chat.mcpAppsPanel.useServer", { serverName: nameOf(server) })}
+    />
+  );
+
+  const renderLoginState = (server: MCPServer) => {
+    const mode = getMcpOAuthMode(server);
+    if (mode === "m2m") return <CheckCircle className="h-3.5 w-3.5 text-success shrink-0" />;
+    if (mode !== "authorization_code") return null;
+    if (oauthConnected.has(server.server_id)) {
+      return <CheckCircle className="h-3.5 w-3.5 text-success shrink-0" />;
+    }
+    if (
+      oauthChecking.has(server.server_id) ||
+      (returningOAuth.status === "exchanging" && server.server_id === returningServerId)
+    ) {
+      return <Skeleton className="h-6 w-16 shrink-0 rounded-md" />;
+    }
+    return (
+      <>
+        {connectMode && (
+          <span className="text-[11px] text-muted-foreground shrink-0 whitespace-nowrap">
+            {t("chat.mcpAppsPanel.signInToUse")}
+          </span>
+        )}
+        <OAuth2ConnectButton
+          server={server}
+          accessToken={accessToken}
+          onConnect={(id) => setOauthConnected((prev) => new Set(prev).add(id))}
+          variant="badge"
+        />
+      </>
+    );
+  };
+
   const renderConnectionIndicator = (server: MCPServer) => {
     const unavailabilityLabel = connectUnavailabilityLabel(server);
     if (unavailabilityLabel !== null) {
@@ -326,28 +403,16 @@ const MCPAppsPanel: React.FC<Props> = ({
         <span className="text-[11px] text-muted-foreground shrink-0 whitespace-nowrap">{unavailabilityLabel}</span>
       );
     }
-    if (getMcpOAuthMode(server) === "m2m") {
-      return <CheckCircle className="h-3.5 w-3.5 text-success shrink-0" />;
-    }
-    if (getMcpOAuthMode(server) === "authorization_code") {
-      if (oauthConnected.has(server.server_id)) {
-        return <CheckCircle className="h-3.5 w-3.5 text-success shrink-0" />;
-      }
-      if (
-        oauthChecking.has(server.server_id) ||
-        (returningOAuth.status === "exchanging" && server.server_id === returningServerId)
-      ) {
-        return <Skeleton className="h-6 w-16 shrink-0 rounded-md" />;
-      }
+    const loginState = renderLoginState(server);
+    if (connectMode) {
       return (
-        <OAuth2ConnectButton
-          server={server}
-          accessToken={accessToken}
-          onConnect={(id) => setOauthConnected((prev) => new Set(prev).add(id))}
-          variant="badge"
-        />
+        <div className="flex items-center gap-2 shrink-0">
+          {loginState}
+          {renderServerSwitch(server)}
+        </div>
       );
     }
+    if (loginState !== null) return loginState;
     if (selectedServers.includes(nameOf(server))) {
       return <span className="w-[7px] h-[7px] rounded-full bg-success shrink-0" />;
     }
@@ -367,37 +432,20 @@ const MCPAppsPanel: React.FC<Props> = ({
       !query.trim() ||
       name.toLowerCase().includes(query.toLowerCase()) ||
       (s.description ?? "").toLowerCase().includes(query.toLowerCase());
-    const matchesTab =
-      activeTab === "all" || (selectedServers.includes(name) && connectUnavailabilityLabel(s) === null);
+    const matchesTab = activeTab === "all" || isOn(s);
     return matchesQuery && matchesTab;
   });
 
-  const connectedCount = servers.filter(
-    (s) => selectedServers.includes(nameOf(s)) && connectUnavailabilityLabel(s) === null,
-  ).length;
+  const connectedCount = servers.filter(isOn).length;
+  const labels = labelsFor(connectMode);
 
   const connectedServers = useMemo(() => {
-    const isAuthorized = (s: MCPServer) => getMcpOAuthMode(s) === "m2m" || oauthConnected.has(s.server_id);
-    const isToggledOn = (s: MCPServer) =>
-      getMcpOAuthMode(s) !== "authorization_code" && selectedServers.includes(nameOf(s));
-    const available = servers.filter((s) => connectUnavailabilityLabel(s) === null);
-    return {
-      on: available.filter((s) => isAuthorized(s) || isToggledOn(s)).map((s) => s.server_id),
-      authorized: available.filter(isAuthorized).map((s) => s.server_id),
-    };
-  }, [servers, selectedServers, oauthConnected, connectUnavailabilityLabel]);
+    const all = servers.filter((s) => connectUnavailabilityLabel(s) === null).map((s) => s.server_id);
+    return { on: all.filter((id) => !offServerIds.includes(id)), all };
+  }, [servers, offServerIds, connectUnavailabilityLabel]);
   useEffect(() => {
-    const settling = oauthChecking.size + togglingOn.size > 0 || returningOAuth.status === "exchanging";
-    onConnectedServers?.(loading || loadFailed || settling ? null : connectedServers);
-  }, [
-    loading,
-    loadFailed,
-    oauthChecking.size,
-    togglingOn.size,
-    returningOAuth.status,
-    connectedServers,
-    onConnectedServers,
-  ]);
+    onConnectedServers?.(listReport(loading, loadFailed, connectedServers));
+  }, [loading, loadFailed, connectedServers, onConnectedServers]);
 
   const emptyStateText = () => {
     if (loadFailed && connectMode) return t("chat.mcpAppsPanel.empty.loadFailed");
@@ -412,19 +460,16 @@ const MCPAppsPanel: React.FC<Props> = ({
 
   if (detailServer) {
     const name = nameOf(detailServer);
-    const isConnected = selectedServers.includes(name);
+    const isConnected = isOn(detailServer);
     const isTogglingOn = togglingOn.has(name);
     const color = getAvatarColor(name);
 
-    const renderDetailAction = () => {
-      const unavailabilityLabel = connectUnavailabilityLabel(detailServer);
-      if (unavailabilityLabel !== null) {
-        return <span className="text-[13px] text-muted-foreground py-2.5 shrink-0">{unavailabilityLabel}</span>;
-      }
+    const renderDetailLogin = () => {
       if (getMcpOAuthMode(detailServer) === "m2m") {
         return <span className="text-[13px] text-muted-foreground">{t("chat.mcpAppsPanel.authorized")}</span>;
       }
       if (getMcpOAuthMode(detailServer) !== "authorization_code") {
+        if (connectMode) return null;
         return (
           <Button
             variant={isConnected ? "outline" : "default"}
@@ -452,7 +497,7 @@ const MCPAppsPanel: React.FC<Props> = ({
                 n.delete(detailServer.server_id);
                 return n;
               });
-              onChangeRef.current(selectedServersRef.current.filter((s) => s !== name));
+              if (!connectMode) onChangeRef.current(selectedServersRef.current.filter((s) => s !== name));
             }}
             className="font-semibold h-[38px] min-w-[110px]"
           >
@@ -469,6 +514,20 @@ const MCPAppsPanel: React.FC<Props> = ({
           }}
           variant="button"
         />
+      );
+    };
+
+    const renderDetailAction = () => {
+      const unavailabilityLabel = connectUnavailabilityLabel(detailServer);
+      if (unavailabilityLabel !== null) {
+        return <span className="text-[13px] text-muted-foreground py-2.5 shrink-0">{unavailabilityLabel}</span>;
+      }
+      if (!connectMode) return renderDetailLogin();
+      return (
+        <div className="flex items-center gap-3 shrink-0">
+          {renderDetailLogin()}
+          {renderServerSwitch(detailServer)}
+        </div>
       );
     };
 
@@ -513,10 +572,7 @@ const MCPAppsPanel: React.FC<Props> = ({
           {[
             [t("chat.mcpAppsPanel.info.serverId"), detailServer.server_id],
             [t("chat.mcpAppsPanel.info.transport"), handleTransport(detailServer.transport, detailServer.spec_path)],
-            [
-              t("chat.mcpAppsPanel.info.status"),
-              isConnected ? t("chat.mcpAppsPanel.info.connected") : t("chat.mcpAppsPanel.info.notConnected"),
-            ],
+            [t("chat.mcpAppsPanel.info.status"), isConnected ? t(labels.on) : t(labels.off)],
           ]
             .filter(([, v]) => v)
             .map(([label, value], i, arr) => (
@@ -611,7 +667,7 @@ const MCPAppsPanel: React.FC<Props> = ({
             {t("chat.mcpAppsPanel.tabs.all")}
           </TabsTrigger>
           <TabsTrigger value="connected" className="rounded-none px-4 py-2 text-[13px]">
-            {t("chat.mcpAppsPanel.tabs.connected")}
+            {t(labels.tab)}
             {connectedCount > 0 ? ` (${connectedCount})` : ""}
           </TabsTrigger>
         </TabsList>

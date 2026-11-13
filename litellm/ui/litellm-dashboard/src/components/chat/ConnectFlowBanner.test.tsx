@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import type { ConnectFlowStatus } from "@/components/networking";
-import ConnectFlowBanner, { isLoopbackOrigin } from "./ConnectFlowBanner";
+import ConnectFlowBanner, { isLoopbackOrigin, type FinishSelection } from "./ConnectFlowBanner";
 
 const { startOAuthFlow } = vi.hoisted(() => ({ startOAuthFlow: vi.fn() }));
 
@@ -27,7 +27,7 @@ const unscoped = (client_origin: string): ConnectFlowStatus => ({
   servers: null,
 });
 
-const renderBanner = (clientOrigin: string, connectedServerIds: string[] | null = []) =>
+const renderBanner = (clientOrigin: string, finish?: FinishSelection) =>
   render(
     <ConnectFlowBanner
       flowHandle="flow-handle-123"
@@ -35,7 +35,7 @@ const renderBanner = (clientOrigin: string, connectedServerIds: string[] | null 
       accessToken="tok"
       onConnected={vi.fn()}
       failed={false}
-      connectedServerIds={connectedServerIds}
+      finish={finish}
     />,
   );
 
@@ -52,8 +52,8 @@ describe("ConnectFlowBanner", () => {
     expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
   });
 
-  it("posts the id of each server shown as connected with Finish", () => {
-    renderBanner("https://claude.ai", ["catalog-id", "orders-id"]);
+  it("posts the id of each server that is on with Finish", () => {
+    renderBanner("https://claude.ai", { status: "ready", serverIds: ["catalog-id", "orders-id"] });
 
     expect(screen.getByDisplayValue("catalog-id")).toHaveAttribute("name", "server");
     expect(screen.getByDisplayValue("orders-id")).toHaveAttribute("name", "server");
@@ -61,9 +61,20 @@ describe("ConnectFlowBanner", () => {
   });
 
   it("holds Finish until the page has loaded its servers", () => {
-    renderBanner("https://claude.ai", null);
+    renderBanner("https://claude.ai", { status: "waiting" });
 
     expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
+    expect(screen.queryByText("Turn on at least one server to finish connecting.")).not.toBeInTheDocument();
+  });
+
+  it("holds Finish and says why when every server is off", () => {
+    renderBanner("https://claude.ai", { status: "nothing-on" });
+
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /finish connecting/i })).toHaveAccessibleDescription(
+      "Turn on at least one server to finish connecting.",
+    );
+    expect(screen.queryByDisplayValue(/./, { exact: false })).toHaveAttribute("name", "flow");
   });
 
   it("lists multi-server consent and requires every server before finishing", () => {
