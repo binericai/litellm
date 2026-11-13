@@ -23,6 +23,7 @@ from litellm.integrations.custom_logger_v2.host import request_scope
 from litellm.integrations.custom_logger_v2.selection import RequestSelection
 from litellm.integrations.s3_v2 import S3Logger
 from litellm.integrations.s3_v3 import S3LoggerV3, native_s3_v2_enabled, new_s3_v2_logger
+from litellm.litellm_core_utils.litellm_logging import V2_ASYNC_LOGGING_LINE
 from litellm.rust_bridge import _native
 
 pytestmark = pytest.mark.skipif(not hasattr(_native, "NativeS3Log"), reason="the built _native has no NativeS3Log")
@@ -149,12 +150,16 @@ async def _loggers(
 
 
 async def _log_native(rust_logger: S3LoggerV3, kwargs: Mapping[str, object]) -> None:
-    await rust_logger.run_native(
-        Hook.attempt_ended,
-        frozenset({Field.deprecated_kwargs}),
-        SimpleNamespace(deprecated_kwargs=kwargs),
-        SimpleNamespace(call=None, state=None),  # pyright: ignore[reportArgumentType]  # run_native reads only call and state
-    )
+    line: Final = V2_ASYNC_LOGGING_LINE.set(True)
+    try:
+        await rust_logger.run_native(
+            Hook.attempt_ended,
+            frozenset({Field.deprecated_kwargs}),
+            SimpleNamespace(deprecated_kwargs=kwargs),
+            SimpleNamespace(call=None, state=None),  # pyright: ignore[reportArgumentType]  # run_native reads only call and state
+        )
+    finally:
+        V2_ASYNC_LOGGING_LINE.reset(line)
 
 
 async def _log_each(python_logger: S3Logger, rust_logger: S3LoggerV3, payloads: tuple[object, object]) -> None:
@@ -805,3 +810,48 @@ async def test_the_periodic_flush_keeps_running_after_a_flush_fails() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def _settled(pair: tuple[FakeBucket, FakeBucket], python_logger: S3Logger, rust_logger: S3LoggerV3) -> None:
+    for _ in range(3):
+        await asyncio.sleep(0.3)
+        await _flush(python_logger, rust_logger)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_a_sync_completion_reaches_both_loggers_alike(
+    buckets: tuple[FakeBucket, FakeBucket], monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    python_logger, rust_logger = await _loggers(monkeypatch, buckets, {})
+    monkeypatch.setattr(litellm, "callbacks", [python_logger, rust_logger])
+
+    def call() -> None:
+        response = litellm.completion(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hello"}],
+            mock_response="hi there",
+            stream=stream,
+        )
+        if stream:
+            for _ in response:  # pyright: ignore[reportGeneralTypeIssues]  # a stream when stream=True
+                pass
+
+    await asyncio.to_thread(call)
+    await _settled(buckets, python_logger, rust_logger)
+    _assert_same_puts(buckets, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_sync_line_delivery_is_skipped_by_the_native_logger(
+    buckets: tuple[FakeBucket, FakeBucket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, rust_logger = await _loggers(monkeypatch, buckets, {})
+    await rust_logger.run_native(
+        Hook.attempt_ended,
+        frozenset({Field.deprecated_kwargs}),
+        SimpleNamespace(deprecated_kwargs={"standard_logging_object": _payload()}),
+        SimpleNamespace(call=None, state=None),  # pyright: ignore[reportArgumentType]  # run_native reads only call and state
+    )
+    assert rust_logger.sink.queued_keys() == []
+    assert rust_logger.sink.stashed() == 0

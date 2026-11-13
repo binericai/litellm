@@ -168,7 +168,9 @@ def project_payload(sink: "NativeS3Log", payload: object) -> object:
 
 
 def project_kwargs(sink: "NativeS3Log", kwargs: object) -> object:
-    if not isinstance(kwargs, Mapping) or not legacy_should_log(kwargs):
+    from litellm.litellm_core_utils.litellm_logging import V2_ASYNC_LOGGING_LINE
+
+    if not V2_ASYNC_LOGGING_LINE.get() or not isinstance(kwargs, Mapping) or not legacy_should_log(kwargs):
         return None
     try:
         return project_payload(sink, kwargs.get("standard_logging_object"))

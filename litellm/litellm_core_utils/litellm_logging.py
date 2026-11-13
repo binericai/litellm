@@ -14,6 +14,7 @@ import sys
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime as dt_object
 from enum import Enum
@@ -766,6 +767,9 @@ def _holds_v2(callbacks: Iterable[object]) -> bool:
     return any(isinstance(callback, CustomLoggerV2) for callback in callbacks)
 
 
+V2_ASYNC_LOGGING_LINE: Final[ContextVar[bool]] = ContextVar("v2_async_logging_line", default=False)
+
+
 # include_v2=False runs only the legacy callbacks in the list. Sync handlers pass it when they also run for an async
 # request (the async handler delivers the same event) or for one chunk of a stream (the complete response is
 # delivered once at the end), so a V2 callback isn't sent the same event twice or once per chunk. Legacy callbacks
@@ -801,15 +805,19 @@ async def _run_callbacks(
     owner: "Logging | None" = None,
 ) -> None:
     if include_v2 and _holds_v2(callbacks):
-        _ = kwargs_after(
-            await run_subscribers(
-                hook_subscribers(hook, callbacks, admit=Admit.every_entry),
-                KwargsFields(kwargs, LOGGING_KEYS),
-                binding,
-                call=None if owner is None else owner.v2_call_facts(),
-                scope=None if owner is None else owner.v2_logging_scope(),
+        line: Final = V2_ASYNC_LOGGING_LINE.set(True)
+        try:
+            _ = kwargs_after(
+                await run_subscribers(
+                    hook_subscribers(hook, callbacks, admit=Admit.every_entry),
+                    KwargsFields(kwargs, LOGGING_KEYS),
+                    binding,
+                    call=None if owner is None else owner.v2_call_facts(),
+                    scope=None if owner is None else owner.v2_logging_scope(),
+                )
             )
-        )
+        finally:
+            V2_ASYNC_LOGGING_LINE.reset(line)
         return
     for callback in callbacks:
         if isinstance(callback, CustomLoggerV2):
