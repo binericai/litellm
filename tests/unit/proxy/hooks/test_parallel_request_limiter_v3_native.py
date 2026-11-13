@@ -70,6 +70,9 @@ class Request:
     nested: bool = False
     response: object = None
     endpoint_type: EndpointType = EndpointType.GENERIC
+    logged: Mapping[str, object] = field(default_factory=dict)
+    logged_metadata: Mapping[str, object] = field(default_factory=dict)
+    ceiling_raises_at_end: bool = False
 
 
 @dataclass
@@ -269,12 +272,18 @@ def _logging_kwargs(index: int, request: Request) -> dict[str, object]:
                 "user_api_key_org_id": auth.org_id,
                 "user_api_key_project_id": auth.project_id,
                 "user_api_key_end_user_id": auth.end_user_id,
+                **request.logged_metadata,
             },
             "hidden_params": {},
         },
         "litellm_params": {"metadata": {"model_group": request.fallback or request.body.get("model")}},
         **({"combined_usage_object": request.usage} if request.end == "partial_failure" else {}),
+        **request.logged,
     }
+
+
+def _raising_ceiling(team_id: str, group: str) -> PTUTeamCeiling | None:
+    raise RuntimeError(f"no ceiling for {team_id}:{group}")
 
 
 async def _end(side: Side, index: int, request: Request) -> object:
@@ -286,6 +295,18 @@ async def _end(side: Side, index: int, request: Request) -> object:
     )
     side.responses[index] = response
     kwargs: Final = _logging_kwargs(index, request)
+    resolver: Final = side.limiter._ptu_team_ceiling_resolver  # pyright: ignore[reportPrivateUsage]  # the resolver fails only while settling
+    if request.ceiling_raises_at_end:
+        side.limiter._ptu_team_ceiling_resolver = _raising_ceiling  # pyright: ignore[reportPrivateUsage]  # the resolver fails only while settling
+    try:
+        return await _ended(side, index, request, data, response, kwargs)
+    finally:
+        side.limiter._ptu_team_ceiling_resolver = resolver  # pyright: ignore[reportPrivateUsage]  # the resolver fails only while settling
+
+
+async def _ended(
+    side: Side, index: int, request: Request, data: dict[str, object], response: object, kwargs: dict[str, object]
+) -> object:
     match request.end:
         case "success":
             if side.dynamic is not None:
@@ -310,6 +331,9 @@ async def _end(side: Side, index: int, request: Request) -> object:
             await side.limiter.async_logging_hook(kwargs, response, request.call_type)
             if side.dynamic is not None:
                 await side.dynamic.async_log_success_event(kwargs, response, None, None)
+            await side.limiter.async_log_success_event(kwargs, response, None, None)
+        case "log_success":
+            await side.limiter.async_logging_hook(kwargs, response, request.call_type)
             await side.limiter.async_log_success_event(kwargs, response, None, None)
         case "failure" | "partial_failure":
             if side.dynamic is not None:
@@ -520,6 +544,49 @@ async def test_windows_roll_over_with_the_clock_like_python(backend: tuple[int |
         backend,
         advance,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ("success", "log_success", "failure", "partial_failure"))
+@pytest.mark.parametrize(
+    "unusual",
+    (
+        Request(_auth(), _CHAT, logged={"user": 123}),
+        Request(_auth(), _CHAT, logged={"user": 1.5}),
+        Request(_auth(), _CHAT, logged={"user": True}),
+        Request(_auth(), _CHAT, logged_metadata={"session_id": 7, "agent_id": "a1"}),
+        Request(_auth(), _CHAT, logged_metadata={"agent_id": ["a1"]}),
+        Request(_auth(project_id="p1"), _CHAT, logged_metadata={"user_api_key_project_id": 9}),
+        Request(_auth(team_id="t1"), _CHAT, ceiling_raises_at_end=True),
+    ),
+)
+async def test_a_settlement_that_cannot_be_built_still_frees_the_slot_like_python(
+    unusual: Request, end: str, backend: tuple[int | None, int | None]
+) -> None:
+    limits: Final = {"max_parallel_requests": 1, "tpm_limit": 5000, "rpm_limit": 50}
+    auth: Final = unusual.auth.model_copy(update=limits)
+    first: Final = Request(
+        auth,
+        {**_CHAT, "max_tokens": 40},
+        end=end,
+        usage=_CACHED_USAGE,
+        logged=unusual.logged,
+        logged_metadata=unusual.logged_metadata,
+        ceiling_raises_at_end=unusual.ceiling_raises_at_end,
+    )
+    observed: Final = await _differential(
+        [first, Request(auth, {**_CHAT, "max_tokens": 40})],
+        [
+            ("api_key", _KEY),
+            ("team", "t1"),
+            ("end_user", "123"),
+            ("agent", "a1"),
+            ("agent_session", "a1:7"),
+            ("model_per_project", "9:gpt-4o"),
+        ],
+        backend,
+    )
+    assert observed == [None, None]
 
 
 @pytest.mark.asyncio

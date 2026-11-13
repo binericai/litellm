@@ -807,6 +807,25 @@ impl ParallelRequestLimiter {
         )
     }
 
+    pub async fn release_for_settlement(
+        &self,
+        state: &LimiterState,
+        call_id: Option<&str>,
+        request: Option<&RequestRedis>,
+    ) {
+        {
+            let stash = state.stash();
+            if !stash.owned || !stash.for_call(call_id) {
+                return;
+            }
+        }
+        let ctx = Ctx {
+            policy: Policy::default(),
+            request,
+        };
+        self.release_stashed(state, true, ctx).await;
+    }
+
     pub async fn settle_failure(
         &self,
         state: &LimiterState,

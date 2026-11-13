@@ -5396,6 +5396,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         )
         from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, post_call_request, usage_facts
 
+        if not keep_slot:
+            await native.release_for_settlement(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+                native_state,
+                _call_id_from_callback_kwargs(kwargs),
+                post_call_request() if self.rate_limits.has_redis else None,
+            )
         empty: Final[Mapping[str, object]] = MappingProxyType({})
         standard_logging_object: Final = as_str_mapping(kwargs.get("standard_logging_object")) or empty
         request_metadata: Final = (
@@ -5413,6 +5419,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         usage_source: Final = response_obj if usage is None else usage
         end_user: Final = kwargs.get("user") or metadata.get("user_api_key_end_user_id")
         session: Final = metadata.get("session_id") or metadata.get("trace_id")
+        project_id: Final = metadata.get("user_api_key_project_id")
         socket: Final = kwargs.get("call_type") == CallTypes.aresponses_websocket.value
         ptu_usage_source: Final = response_obj if usage is None or socket else usage
         ptu_total_tokens: Final = 0 if socket else total_tokens
@@ -5425,10 +5432,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 "user_api_key_user_id": metadata.get("user_api_key_user_id") or None,
                 "user_api_key_team_id": team_id or None,
                 "user_api_key_org_id": metadata.get("user_api_key_org_id") or None,
-                "user_api_key_project_id": metadata.get("user_api_key_project_id") or None,
+                "user_api_key_project_id": f"{project_id}" if project_id else None,
                 "end_user_id": end_user or None,
                 "agent_id": metadata.get("agent_id") or None,
-                "session_id": session or None,
+                "session_id": f"{session}" if session else None,
             },
             "served_model": None
             if served_model is None
@@ -5750,6 +5757,11 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             if self.native_companion is not None and native_state is not None:
                 from litellm.proxy.hooks.parallel_request_limiter_v3_native import failure_facts, post_call_request
 
+                await self.native_companion.release_for_settlement(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
+                    native_state,
+                    _call_id_from_callback_kwargs(failed_call),
+                    post_call_request() if self.rate_limits.has_redis else None,
+                )
                 await self.native_companion.settle_failure(  # pyright: ignore[reportGeneralTypeIssues]  # the bridge returns an awaitable
                     native_state,
                     json.dumps(

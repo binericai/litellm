@@ -506,6 +506,25 @@ impl NativeParallelRequestLimiter {
         })
     }
 
+    #[pyo3(signature = (state, call_id, request = None))]
+    fn release_for_settlement<'py>(
+        &self,
+        py: Python<'py>,
+        state: PyRef<'py, NativeParallelRequestLimiterState>,
+        call_id: Option<String>,
+        request: Option<PyRef<'py, NativeRequestRedis>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&state.0);
+        let request = request.map(|request| request.0.clone());
+        let limiter = Arc::clone(&self.limiter);
+        run_async_value(py, async move {
+            limiter
+                .release_for_settlement(&state, call_id.as_deref(), request.as_ref())
+                .await;
+            Ok(())
+        })
+    }
+
     fn release_on_disconnect<'py>(
         &self,
         py: Python<'py>,
