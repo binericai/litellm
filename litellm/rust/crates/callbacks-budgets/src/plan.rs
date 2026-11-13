@@ -24,7 +24,7 @@ pub struct Plan {
     #[serde(default)]
     pub fail_closed: bool,
     #[serde(default)]
-    pub lease_seconds: Option<f64>,
+    pub reservation_id: Option<String>,
     pub status_code: u16,
 }
 

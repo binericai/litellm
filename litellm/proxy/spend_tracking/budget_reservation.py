@@ -51,6 +51,7 @@ from litellm.proxy.spend_tracking.native_budgets import (
     is_native_reservation,
     native_budget_route,
     native_budgets,
+    new_reservation_id,
     settle_native_reservation,
 )
 from litellm.proxy.spend_tracking.spend_counter_batch import PendingSpendIncrement, spend_counter_batch_scope
@@ -140,7 +141,11 @@ def get_reserved_counter_keys(budget_reservation: dict | None) -> set:
 _lease_renewals: Final[set[asyncio.Task[None]]] = set()  # mutable-ok: asyncio only weak-refs pending tasks
 
 
-def _start_reservation_lease_renewal(budget_reservation: Mapping[str, object], counter_keys: frozenset[str]) -> None:
+def start_reservation_lease_renewal(
+    budget_reservation: Mapping[str, object],
+    counter_keys: frozenset[str],
+    request_task: asyncio.Task[object] | None = None,
+) -> None:
     """A reservation lives inside spend counter keys that expire on their Redis TTL. Renew the TTL
     while the request is in flight so a request longer than the TTL does not drop its
     reservation and admit concurrent requests against the DB floor on any worker."""
@@ -154,7 +159,7 @@ def _start_reservation_lease_renewal(budget_reservation: Mapping[str, object], c
             budget_reservation=budget_reservation,
             counter_keys=counter_keys,
             interval=redis_ttl / 2,
-            request_task=asyncio.current_task(),
+            request_task=request_task or asyncio.current_task(),
         )
     )
     _lease_renewals.add(task)
@@ -369,7 +374,7 @@ async def reserve_budget_for_request(
         "input_cost": min(float(input_cost or 0.0), reservation_cost),
         "input_tokens": max(input_token_counts.values(), default=None),
     }
-    _start_reservation_lease_renewal(
+    start_reservation_lease_renewal(
         budget_reservation=budget_reservation,
         counter_keys=frozenset(get_reserved_counter_keys(budget_reservation=budget_reservation)),
     )
@@ -412,8 +417,8 @@ async def _native_budget_plan(
             if should_throttle_budget_exceeded(valid_token)
             else None,
             "fail_closed": fail_closed_budget_enforcement,
-            "lease_seconds": float(litellm.request_timeout),
             "status_code": int(litellm.budget_exceeded_status_code),
+            "reservation_id": new_reservation_id(),
         },
         "reserved_cost": 0.0,
         "entries": [],

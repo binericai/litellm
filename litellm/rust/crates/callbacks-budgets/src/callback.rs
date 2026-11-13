@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError, Weak},
-    time::Duration,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use futures_util::future::BoxFuture;
@@ -155,25 +154,6 @@ impl Budgets {
         Ok(reservation)
     }
 
-    fn lease(
-        self: &Arc<Self>,
-        held: &Arc<Held>,
-        request: Option<Weak<BudgetState>>,
-        seconds: Option<f64>,
-    ) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let lease = Lease {
-            budgets: Arc::downgrade(self),
-            held: Arc::downgrade(held),
-            request,
-            interval: self.store.redis_ttl().map(|ttl| ttl / 2),
-            deadline: Duration::from_secs_f64(seconds.unwrap_or(0.0).max(0.0)),
-        };
-        runtime.spawn(lease.run());
-    }
-
     async fn admit(self: &Arc<Self>, input: &HookInput) -> HookOutput {
         let Some(admission) = decode::<Admission>(input.fields.raw(Field::DeprecatedKwargs)?)?
         else {
@@ -182,33 +162,23 @@ impl Budgets {
         let Some(plan) = admission.plan else {
             return Ok(None);
         };
-        let call_id = admission
-            .call_id
+        let call_id = plan
+            .reservation_id
+            .clone()
+            .or(admission.call_id)
             .or_else(|| input.call.as_ref().map(|call| call.ids.call_id.clone()))
             .unwrap_or_default();
         match engine::reserve(&self.store, &plan).await {
             Ok(None) => Ok(None),
             Ok(Some(reservation)) => {
-                let keyed = !reservation.entries.is_empty();
                 let held = Arc::new(Held {
                     call_id: call_id.clone(),
                     reservation: tokio::sync::Mutex::new(reservation),
                 });
-                let request = input
-                    .state
-                    .clone()
-                    .and_then(|state| state.downcast::<BudgetState>().ok());
-                if let Some(state) = &request {
+                if let Some(state) = input.state::<BudgetState>() {
                     state.set(Arc::clone(&held));
                 }
                 self.registry().insert(call_id, Arc::clone(&held));
-                if keyed {
-                    self.lease(
-                        &held,
-                        request.as_ref().map(Arc::downgrade),
-                        plan.lease_seconds,
-                    );
-                }
                 Ok(None)
             }
             Err(error) => Ok(Some(Verdict::Abort(abort(
@@ -216,45 +186,6 @@ impl Budgets {
                 plan.status_code,
                 admission.model,
             )))),
-        }
-    }
-}
-
-struct Lease {
-    budgets: Weak<Budgets>,
-    held: Weak<Held>,
-    request: Option<Weak<BudgetState>>,
-    interval: Option<Duration>,
-    deadline: Duration,
-}
-
-impl Lease {
-    fn request_ended(&self) -> bool {
-        self.request
-            .as_ref()
-            .is_some_and(|request| request.strong_count() == 0)
-    }
-
-    async fn run(self) {
-        let until = tokio::time::Instant::now() + self.deadline;
-        let step = self.interval.unwrap_or(self.deadline);
-        while tokio::time::Instant::now() < until {
-            tokio::time::sleep(step.min(until - tokio::time::Instant::now())).await;
-            let (Some(budgets), Some(held)) = (self.budgets.upgrade(), self.held.upgrade()) else {
-                return;
-            };
-            let reservation = held.snapshot().await;
-            if reservation.finalized || self.request_ended() {
-                return;
-            }
-            if self.interval.is_some() {
-                for entry in &reservation.entries {
-                    let _ = budgets.store.refresh_ttl(entry.counter()).await;
-                }
-            }
-        }
-        if let (Some(budgets), Some(held)) = (self.budgets.upgrade(), self.held.upgrade()) {
-            budgets.forget(&held);
         }
     }
 }

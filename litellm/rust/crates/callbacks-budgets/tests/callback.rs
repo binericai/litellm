@@ -28,7 +28,7 @@ fn plan(counters: Vec<PlannedCounter>, cost: f64) -> Plan {
         input_tokens: Some(12),
         throttle_counter: None,
         fail_closed: false,
-        lease_seconds: Some(60.0),
+        reservation_id: None,
         status_code: 400,
     }
 }

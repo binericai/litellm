@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import uuid
+import weakref
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final, Literal
 
@@ -30,6 +33,17 @@ if TYPE_CHECKING:
 NATIVE_BUDGETS_ENV: Final = "LITELLM_NATIVE_BUDGETS"
 NATIVE_PLAN_KEY: Final = "native_plan"
 NATIVE_CALL_ID_KEY: Final = "native_call_id"
+
+_request_tasks: Final[weakref.WeakValueDictionary[str, asyncio.Task[object]]] = weakref.WeakValueDictionary()
+
+
+def new_reservation_id() -> str:
+    reservation_id: Final = uuid.uuid4().hex
+    task: Final = asyncio.current_task()
+    if task is not None:
+        _request_tasks[reservation_id] = task
+    return reservation_id
+
 
 _NATIVE_CALL_TYPES: Final = frozenset(
     {
@@ -175,12 +189,13 @@ class NativeBudgetsLogger(NativeLogger):
 
     async def _mirror(self, data: object) -> None:
         reservation: Final = request_reservation(data)
-        if reservation is None or reservation.pop(NATIVE_PLAN_KEY, None) is None:
+        plan: Final = None if reservation is None else reservation.pop(NATIVE_PLAN_KEY, None)
+        if reservation is None or not isinstance(plan, Mapping):
             return
-        call_id: Final = _admission(data)
+        reservation_id: Final = _STR_MAPPING.validate_python(plan).get("reservation_id")
         held: Final = (
-            _RESERVATION.validate_python(await self.budgets.take(str(call_id["call_id"])))  # pyright: ignore[reportIndexIssue]  # _admission builds this dict
-            if isinstance(call_id, dict) and isinstance(call_id.get("call_id"), str)
+            _RESERVATION.validate_python(await self.budgets.take(reservation_id))
+            if isinstance(reservation_id, str)
             else None
         )
         if held is None:
@@ -192,8 +207,15 @@ class NativeBudgetsLogger(NativeLogger):
                 "entries": [entry.model_dump() for entry in held.entries],
                 "input_cost": held.input_cost,
                 "input_tokens": held.input_tokens,
-                NATIVE_CALL_ID_KEY: call_id["call_id"],  # pyright: ignore[reportIndexIssue]  # _admission builds this dict
+                NATIVE_CALL_ID_KEY: reservation_id,
             }
+        )
+        from litellm.proxy.spend_tracking.budget_reservation import start_reservation_lease_renewal
+
+        start_reservation_lease_renewal(
+            budget_reservation=reservation,
+            counter_keys=frozenset(entry.counter_key for entry in held.entries),
+            request_task=_request_tasks.pop(reservation_id, None),
         )
 
 
