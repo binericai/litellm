@@ -255,6 +255,8 @@ CORPUS: Final = (
     _event(
         13, cost=float("nan"), tokens={"completion_tokens": float("inf")}, metadata={"user_api_key_team_id": 10**20}
     ),
+    _event(14, queue="slow", metadata={"user_api_key_team_id": "team-queue"}),
+    _event(15, tokens={"completion_tokens": [10]}, metadata={"user_api_key_team_id": "team-list"}),
 )
 
 
@@ -297,7 +299,7 @@ async def _success_outcome(logger: PrometheusLogger, kwargs: dict[str, object]) 
     try:
         await logger.async_log_success_event(kwargs, response, kwargs["start_time"], kwargs["end_time"])
     except Exception as error:  # noqa: BLE001  # parity compares what each side raises to the logging caller
-        return f"success raised: {error}"
+        return f"success raised: {type(error).__name__}: {error}"
     return "success ok"
 
 
@@ -544,7 +546,9 @@ async def test_the_native_store_and_handler_expose_exactly_what_the_python_logge
     assert ('input_sequence_length="1k-4k"' in python_text) is (config == "input_sequence_length")
     if config == "defaults":
         assert "ERROR prometheus Layer Error(): Exception occured - 'reason'" in python_text
-        assert "success raised: could not convert string to float: 'ten'" in python_text
+        assert "success raised: ValueError: could not convert string to float: 'ten'" in python_text
+        assert "success raised: TypeError: '>=' not supported between instances of 'str' and 'int'" in python_text
+        assert "TypeError: float() argument must be a string or a real number, not 'list'" in python_text
         assert "ERROR Prometheus Error: set_llm_deployment_success_metrics. Exception occured" in python_text
         assert 'team="team-raise"' in python_text
         assert 'litellm_remaining_team_budget_metric{team="team-raise"' not in python_text

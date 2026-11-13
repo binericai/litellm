@@ -5,11 +5,14 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
-    emit::{Emitter, failed, py_float, py_int, py_int_or_bool, py_positive_number},
+    emit::{
+        Emitter, failed, not_comparable, not_subtractable, py_float, py_int, py_int_or_bool,
+        py_positive_number,
+    },
     labels::{
         LabelValues, Settings, combined_custom_metadata, custom_labels_from_metadata, is_py_dict,
     },
-    pyfmt::{is_py_number, py_number, py_str, py_truthy},
+    pyfmt::{is_py_number, py_number, py_str, py_truthy, py_type_name},
     store::Op,
 };
 
@@ -148,8 +151,8 @@ fn tag_values(tags: &Value) -> Result<Vec<Value>, CallbackError> {
         Value::String(text) => Ok(text.chars().map(|ch| Value::from(ch.to_string())).collect()),
         Value::Object(map) => Ok(map.keys().map(|key| Value::from(key.clone())).collect()),
         other => Err(failed(format!(
-            "'{}' object is not iterable",
-            py_str(other)
+            "TypeError: '{}' object is not iterable",
+            py_type_name(other)
         ))),
     }
 }
@@ -485,10 +488,7 @@ impl Success<'_> {
         let queue_seconds = if queue.is_null() {
             None
         } else {
-            Some(
-                py_number(queue)
-                    .ok_or_else(|| failed("'>=' not supported for queue_time_seconds"))?,
-            )
+            Some(py_number(queue).ok_or_else(|| not_comparable(">=", queue))?)
         }
         .filter(|seconds| *seconds >= 0.0);
         if let Some(total) = duration(times.start_time, times.end_time)? {
@@ -520,7 +520,7 @@ impl Success<'_> {
                     .unwrap_or(Value::from(0));
                 let total = py_number(&total)
                     .or_else(|| total.as_bool().map(|flag| if flag { 1.0 } else { 0.0 }))
-                    .ok_or_else(|| failed("'>' not supported for total_tokens"))?;
+                    .ok_or_else(|| not_comparable(">", &total))?;
                 if total > 0.0 {
                     self.emit
                         .inc("litellm_cached_tokens_metric", &context, total)?;
@@ -758,18 +758,19 @@ impl Success<'_> {
         self.emit
             .inc("litellm_deployment_total_requests", &context, 1.0)?;
         let times = &self.facts.times;
-        let response = duration(times.start_time, times.end_time)?
-            .ok_or_else(|| failed("unsupported operand type(s) for -"))?;
+        let response = duration(times.start_time, times.end_time)?.ok_or_else(|| {
+            not_subtractable(times.end_time.is_some(), times.start_time.is_some())
+        })?;
         let mut latency = response;
         if self.facts.stream == Value::Bool(true) {
             let first = if deployment.completion_start_present {
-                times.completion_start_time.ok_or_else(|| {
-                    failed("unsupported operand type(s) for -: 'NoneType' and 'datetime.datetime'")
-                })?
+                times
+                    .completion_start_time
+                    .ok_or_else(|| not_subtractable(false, true))?
             } else {
                 times
                     .end_time
-                    .ok_or_else(|| failed("unsupported operand type(s) for -"))?
+                    .ok_or_else(|| not_subtractable(false, true))?
             };
             let ttft = duration(times.start_time, Some(first))?.unwrap_or(0.0);
             if ttft != 0.0 {
@@ -786,7 +787,7 @@ impl Success<'_> {
                     .as_bool()
                     .map(|flag| if flag { 1.0 } else { 0.0 })
             })
-            .ok_or_else(|| failed("'>' not supported for completion_tokens"))?;
+            .ok_or_else(|| not_comparable(">", output_tokens))?;
         if tokens > 0.0 {
             let name = "litellm_deployment_latency_per_output_token";
             let labels = self.emit.labels(name, &context);
@@ -898,7 +899,7 @@ fn py_divide(value: &Value, by: f64) -> Result<f64, CallbackError> {
     .ok_or_else(|| {
         failed(format!(
             "unsupported operand type(s) for /: '{}' and 'int'",
-            crate::pyfmt::py_type_name(value)
+            py_type_name(value)
         ))
     })
 }

@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use litellm_callbacks_prometheus::{
     AttemptFacts, FamilySpec, Kind, ManualClock, Op, SeriesLimits, Step, Store, StoreError,
-    SystemClock, Target, exception_text,
+    SystemClock, Target,
     ops::{self, ErrorKind, OpError},
     record,
     store::{Clock, FamilyId},
 };
 use pyo3::{
-    exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError},
+    exceptions::{PyBaseException, PyKeyError, PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
     types::{PyDict, PyFloat, PyTuple},
 };
@@ -178,9 +178,10 @@ impl NativePrometheusAttempt {
     #[pyo3(signature = (step, input_sequence_length=None))]
     fn record(
         &self,
+        py: Python<'_>,
         step: &str,
         input_sequence_length: Option<String>,
-    ) -> PyResult<(Vec<LoggedLine>, Option<String>)> {
+    ) -> PyResult<(Vec<LoggedLine>, Option<Py<PyBaseException>>)> {
         let step: Step = step
             .parse()
             .map_err(|_| PyValueError::new_err(format!("unknown prometheus step {step}")))?;
@@ -191,7 +192,10 @@ impl NativePrometheusAttempt {
                 .into_iter()
                 .map(|line| (line.level.into(), line.format, line.args))
                 .collect(),
-            recorded.outcome.err().map(|error| exception_text(&error)),
+            recorded
+                .outcome
+                .err()
+                .map(|error| op_error(OpError::from(error)).into_value(py)),
         ))
     }
 }

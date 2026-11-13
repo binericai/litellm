@@ -3,12 +3,34 @@ use serde_json::Value;
 
 use crate::{
     labels::{LabelContext, Settings, label_strings},
-    pyfmt::{is_py_int, is_py_number, py_big_int, py_number, py_str},
+    pyfmt::{is_py_int, is_py_number, py_big_int, py_number, py_type_name},
     store::{FamilyId, Op, Store},
 };
 
 pub fn failed(message: impl Into<String>) -> CallbackError {
     CallbackError::Failed(message.into())
+}
+
+pub fn not_comparable(operator: &str, value: &Value) -> CallbackError {
+    failed(format!(
+        "TypeError: '{operator}' not supported between instances of '{}' and 'int'",
+        py_type_name(value)
+    ))
+}
+
+pub fn not_subtractable(end: bool, start: bool) -> CallbackError {
+    let name = |present: bool| {
+        if present {
+            "datetime.datetime"
+        } else {
+            "NoneType"
+        }
+    };
+    failed(format!(
+        "TypeError: unsupported operand type(s) for -: '{}' and '{}'",
+        name(end),
+        name(start)
+    ))
 }
 
 pub fn py_float(value: &Value) -> Result<f64, CallbackError> {
@@ -22,8 +44,8 @@ pub fn py_float(value: &Value) -> Result<f64, CallbackError> {
             .parse::<f64>()
             .map_err(|_| failed(format!("could not convert string to float: '{text}'"))),
         other => Err(failed(format!(
-            "float() argument must be a string or a real number, not {}",
-            py_str(other)
+            "TypeError: float() argument must be a string or a real number, not '{}'",
+            py_type_name(other)
         ))),
     }
 }

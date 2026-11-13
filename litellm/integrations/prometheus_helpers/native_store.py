@@ -188,10 +188,6 @@ def _hashed_key(key: object) -> object:
     return hash_token(key)
 
 
-class NativePrometheusError(Exception):
-    pass
-
-
 def attempt_facts(kwargs: Mapping[str, object]) -> Mapping[str, object]:
     payload: Final = kwargs.get("standard_logging_object")
     litellm_params: Final = _mapping_or_empty(kwargs.get("litellm_params"))
@@ -265,7 +261,7 @@ def record(
     for level, message, args in logs:
         (verbose_logger.debug if level == "debug" else verbose_logger.error)(message, *args)
     if error is not None:
-        raise NativePrometheusError(error)
+        raise error
 
 
 def _labelnames(kwargs: Mapping[str, object]) -> tuple[str, ...]:

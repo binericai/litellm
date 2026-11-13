@@ -64,6 +64,9 @@ impl From<litellm_callbacks::CallbackError> for OpError {
                 message: rest.to_owned(),
             };
         }
+        if let Some(rest) = message.strip_prefix("ValueError: ") {
+            return Self::value(rest);
+        }
         if message.contains("must not be used with the mostrecent mode") {
             return Self {
                 kind: ErrorKind::Runtime,
