@@ -296,6 +296,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (  # noqa: F401, RUF
     _PROXY_MaxParallelRequestsHandler_v3,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
+    ParallelRequestLimiterNativeLogger,
     PreCallInputsScope,
     native_parallel_request_limiter,
     native_parallel_request_limiter_enabled,
@@ -2381,8 +2382,10 @@ class ProxyLogging:
             }
             passed_in_args = {name: value for name, value in available_args.items() if name in expected_args}
             proxy_hook_obj = proxy_hook(**passed_in_args)
-            if isinstance(proxy_hook_obj, _PROXY_MaxParallelRequestsHandler_v3) and (
-                native_parallel_request_limiter_enabled()
+            if (
+                isinstance(proxy_hook_obj, _PROXY_MaxParallelRequestsHandler_v3)
+                and native_parallel_request_limiter_enabled()
+                and not any(isinstance(callback, ParallelRequestLimiterNativeLogger) for callback in litellm.callbacks)
             ):
                 litellm.logging_callback_manager.add_litellm_callback(
                     native_parallel_request_limiter(proxy_hook_obj)  # pyright: ignore[reportArgumentType]  # a V2 native takes its list position like a legacy callback

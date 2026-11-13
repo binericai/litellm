@@ -15,6 +15,7 @@ import pytest
 import redis
 from pydantic import TypeAdapter
 
+import litellm
 from litellm.caching.caching import DualCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.integrations.custom_logger_v2.call import CallContext, CallFacts, CallIds, CallKind, CallTarget, CallTiming
@@ -23,6 +24,7 @@ from litellm.integrations.custom_logger_v2.native import NativeState
 from litellm.integrations.custom_logger_v2.outcomes import Abort
 from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
     _PROXY_DynamicRateLimitHandlerV3,  # pyright: ignore[reportPrivateUsage]  # the class has no public alias
 )
@@ -37,7 +39,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
     native_parallel_request_limiter,
     PreCallInputsScope,
 )
-from litellm.proxy.utils import InternalUsageCache
+from litellm.proxy.utils import InternalUsageCache, ProxyLogging
 from litellm.redis.stores.rate_limits import RateLimitScope
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 from litellm.types.utils import CallTypes, ModelResponse, Usage
@@ -1362,3 +1364,59 @@ async def test_auth_descriptors_from_rust_limit_requests_like_python(
         backend,
     )
     assert observed[0] is None
+
+
+async def _through_proxy_logging(monkeypatch: pytest.MonkeyPatch, native: bool) -> list[object]:
+    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true" if native else "false")
+    monkeypatch.setattr(litellm, "callbacks", [])
+    proxy_logging: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
+    proxy_logging._add_proxy_hooks()  # pyright: ignore[reportPrivateUsage]  # the startup registration under test
+    proxy_logging._add_proxy_hooks()  # pyright: ignore[reportPrivateUsage]  # a second startup in one process
+    natives: Final = [
+        index
+        for index, callback in enumerate(litellm.callbacks)
+        if isinstance(callback, ParallelRequestLimiterNativeLogger)
+    ]
+    limiters: Final = [
+        index
+        for index, callback in enumerate(litellm.callbacks)
+        if isinstance(callback, PROXY_MaxParallelRequestsHandler_v3)
+    ]
+    assert len(limiters) == 1
+    assert natives == ([limiters[0] - 1] if native else [])
+    auth: Final = _auth(max_parallel_requests=1, rpm_limit=4)
+    observed: Final[list[object]] = []
+    for index in range(5):
+        data = {**_CHAT, "litellm_call_id": f"call-{index}"}
+        context = contextvars.copy_context()
+        try:
+            await asyncio.create_task(proxy_logging.pre_call_hook(auth, data, "acompletion"), context=context)
+        except Exception as refused:
+            observed.append(
+                (type(refused).__name__, getattr(refused, "status_code", None), str(refused).split(" Limit resets")[0])
+            )
+            continue
+        stash = context.run(get_request_stash)
+        observed.append(None)
+        assert stash is not None
+        assert (stash.native_state is not None) == native
+        if index != 2:
+            await asyncio.create_task(
+                proxy_logging.post_call_failure_hook(data, RuntimeError("upstream"), auth), context=context
+            )
+    return observed
+
+
+@pytest.mark.asyncio
+async def test_the_real_dispatcher_registers_one_native_and_limits_like_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python: Final = await _through_proxy_logging(monkeypatch, native=False)
+    native: Final = await _through_proxy_logging(monkeypatch, native=True)
+    assert native == python
+    assert python[:3] == [None, None, None]
+    assert python[3] == (
+        "ProxyRateLimitError",
+        429,
+        f"429: Rate limit exceeded for api_key: {_KEY}. Limit type: max_parallel_requests. Current limit: 1, Remaining: 0.",
+    )
