@@ -193,27 +193,54 @@ impl Ops<'_> {
     }
 
     fn named(&self, metric: &str, pairs: &[(&str, Value)], op: Op) -> OpResult {
+        self.named_with(metric, pairs, || Ok(op))
+    }
+
+    fn named_with(
+        &self,
+        metric: &str,
+        pairs: &[(&str, Value)],
+        op: impl FnOnce() -> Result<Op, OpError>,
+    ) -> OpResult {
         let labels = Labels {
             names: pairs.iter().map(|(name, _)| (*name).to_owned()).collect(),
             values: pairs.iter().map(|(_, value)| Some(text(value))).collect(),
         };
-        self.emit().record(metric, &labels, op, false)?;
-        Ok(())
+        self.emit().record_with(metric, &labels, op, false)
     }
 
     fn positional(&self, metric: &str, values: &[String], op: Op) -> OpResult {
+        self.positional_with(metric, values, || Ok(op))
+    }
+
+    fn positional_with(
+        &self,
+        metric: &str,
+        values: &[String],
+        op: impl FnOnce() -> Result<Op, OpError>,
+    ) -> OpResult {
         let Some(id) = self.store.family(metric) else {
             return Ok(());
         };
-        self.store.record(id, values, op)?;
+        let target = self.store.labels(id, values)?;
+        self.store.apply(id, &target, op()?)?;
         Ok(())
     }
 
     fn factory(&self, metric: &str, values: &LabelValues, op: Op, track: bool) -> OpResult {
+        self.factory_with(metric, values, || Ok(op), track)
+    }
+
+    fn factory_with(
+        &self,
+        metric: &str,
+        values: &LabelValues,
+        op: impl FnOnce() -> Result<Op, OpError>,
+        track: bool,
+    ) -> OpResult {
         let context = values.context(self.settings);
         let labels = self.emit().labels(metric, &context);
-        self.emit().record(metric, &labels, op, track)?;
-        Ok(())
+        self.emit().record_with(metric, &labels, op, track)
     }
 
     fn number(&self, key: &str) -> Result<f64, OpError> {
@@ -248,10 +275,10 @@ impl Ops<'_> {
             .with("model_id", field(self.facts, "model_id").clone())
             .with("api_base", field(self.facts, "api_base").clone())
             .with("api_provider", field(self.facts, "api_provider").clone());
-        self.factory(
+        self.factory_with(
             "litellm_deployment_state",
             &values,
-            Op::Set(self.number("state")?),
+            || Ok(Op::Set(self.number("state")?)),
             false,
         )
     }
@@ -292,7 +319,7 @@ impl Ops<'_> {
         let error_type = field(self.facts, "error_type").clone();
         let hook_type = field(self.facts, "hook_type").clone();
         if self.present("litellm_guardrail_latency_seconds") {
-            self.named(
+            self.named_with(
                 "litellm_guardrail_latency_seconds",
                 &[
                     ("guardrail_name", name.clone()),
@@ -300,7 +327,7 @@ impl Ops<'_> {
                     ("error_type", or_none(&error_type)),
                     ("hook_type", hook_type.clone()),
                 ],
-                Op::Observe(self.number("latency_seconds")?),
+                || Ok(Op::Observe(self.number("latency_seconds")?)),
             )?;
         }
         self.named(
@@ -344,7 +371,7 @@ impl Ops<'_> {
         if !self.present("litellm_managed_file_size_bytes") {
             return Ok(());
         }
-        self.named(
+        self.named_with(
             "litellm_managed_file_size_bytes",
             &[
                 ("purpose", field(self.facts, "purpose").clone()),
@@ -353,7 +380,7 @@ impl Ops<'_> {
                 ("api_provider", or_empty(field(self.facts, "api_provider"))),
                 ("user", or_empty(field(self.facts, "user"))),
             ],
-            Op::Set(self.number("size_bytes")?),
+            || Ok(Op::Set(self.number("size_bytes")?)),
         )
     }
 
@@ -361,13 +388,13 @@ impl Ops<'_> {
         if !self.present("litellm_managed_batch_duration_seconds") {
             return Ok(());
         }
-        self.named(
+        self.named_with(
             "litellm_managed_batch_duration_seconds",
             &[
                 ("model", or_empty(field(self.facts, "model"))),
                 ("api_provider", or_empty(field(self.facts, "api_provider"))),
             ],
-            Op::Observe(self.observed("duration_seconds")?),
+            || Ok(Op::Observe(self.observed("duration_seconds")?)),
         )
     }
 
@@ -430,14 +457,15 @@ impl Ops<'_> {
     }
 
     fn provider_budget(&self) -> OpResult {
-        let remaining = remaining_budget(
-            field(self.facts, "budget_limit"),
-            field(self.facts, "spend"),
-        )?;
-        self.positional(
+        self.positional_with(
             "litellm_provider_remaining_budget_metric",
             &[text(field(self.facts, "provider"))],
-            Op::Set(remaining),
+            || {
+                Ok(Op::Set(remaining_budget(
+                    field(self.facts, "budget_limit"),
+                    field(self.facts, "spend"),
+                )?))
+            },
         )
     }
 
@@ -446,17 +474,18 @@ impl Ops<'_> {
         let values =
             LabelValues::default().with("api_provider", field(self.facts, "api_provider").clone());
         let rate = field(self.facts, "capture_rate");
-        let value = if rate.is_null() {
-            f64::NAN
-        } else {
-            py_float(rate)?
+        let value = || -> Result<Op, OpError> {
+            Ok(Op::Set(if rate.is_null() {
+                f64::NAN
+            } else {
+                py_float(rate)?
+            }))
         };
         let labels = self.emit().labels(metric, &values.context(self.settings));
         if labels.names.is_empty() {
-            return self.positional(metric, &[], Op::Set(value));
+            return self.positional_with(metric, &[], value);
         }
-        self.emit().record(metric, &labels, Op::Set(value), false)?;
-        Ok(())
+        self.emit().record_with(metric, &labels, value, false)
     }
 
     fn limiter_values(&self) -> LabelValues {
@@ -476,7 +505,7 @@ impl Ops<'_> {
             if self.store.family(metric).is_none() {
                 continue;
             }
-            self.factory(metric, &values, Op::Set(self.number(key)?), false)?;
+            self.factory_with(metric, &values, || Ok(Op::Set(self.number(key)?)), false)?;
         }
         Ok(())
     }
@@ -576,10 +605,10 @@ impl Ops<'_> {
         }
         let max_budget = field(self.facts, "max_budget");
         let spend = field(self.facts, "spend");
-        self.emit().record(
+        self.emit().record_with(
             remaining,
             &labels,
-            Op::Set(remaining_budget(max_budget, spend)?),
+            || Ok::<_, OpError>(Op::Set(remaining_budget(max_budget, spend)?)),
             customer,
         )?;
         if !max_budget.is_null() {
@@ -587,8 +616,12 @@ impl Ops<'_> {
                 labels = self.emit().labels(max, &context);
             }
             if self.present(max) {
-                self.emit()
-                    .record(max, &labels, Op::Set(py_float(max_budget)?), customer)?;
+                self.emit().record_with(
+                    max,
+                    &labels,
+                    || Ok::<_, OpError>(Op::Set(py_float(max_budget)?)),
+                    customer,
+                )?;
             }
         }
         if let Some(reset_at) = self.moment("budget_reset_at")? {
@@ -598,10 +631,10 @@ impl Ops<'_> {
             if !customer && entity != "api_key" {
                 labels = self.emit().labels(hours, &context);
             }
-            self.emit().record(
+            self.emit().record_with(
                 hours,
                 &labels,
-                Op::Set(hours_until(reset_at, now)?),
+                || Ok::<_, OpError>(Op::Set(hours_until(reset_at, now)?)),
                 customer,
             )?;
         }

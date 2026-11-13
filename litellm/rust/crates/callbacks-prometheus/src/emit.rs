@@ -143,12 +143,26 @@ impl Emitter<'_> {
         op: Op,
         track_end_user: bool,
     ) -> Result<(), CallbackError> {
+        self.record_with(metric, labels, || Ok(op), track_end_user)
+    }
+
+    pub fn record_with<E: From<CallbackError>>(
+        &self,
+        metric: &str,
+        labels: &Labels,
+        op: impl FnOnce() -> Result<Op, E>,
+        track_end_user: bool,
+    ) -> Result<(), E> {
         let Some(id) = self.store.family(metric) else {
             return Ok(());
         };
         let values = self.kwargs_values(id, labels)?;
+        let target = self
+            .store
+            .labels(id, &values)
+            .map_err(|error| failed(error.to_string()))?;
         self.store
-            .record(id, &values, op)
+            .apply(id, &target, op()?)
             .map_err(|error| failed(error.to_string()))?;
         if track_end_user {
             self.track_end_user(id, labels);

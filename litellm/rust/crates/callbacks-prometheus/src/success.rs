@@ -596,7 +596,9 @@ impl Success<'_> {
         let context = mcp.context(self.settings());
         self.emit
             .inc("litellm_mcp_tool_calls_total", &context, 1.0)?;
-        let cost = py_float(response_cost)?;
+        let cost = py_number(response_cost)
+            .or_else(|| response_cost.as_bool().map(f64::from))
+            .ok_or_else(|| not_comparable(">", response_cost))?;
         if cost > 0.0 {
             self.emit
                 .inc("litellm_mcp_tool_call_spend_metric", &context, cost)?;
@@ -643,7 +645,7 @@ impl Success<'_> {
         ] {
             let labels = self.emit.labels(name, &context);
             self.emit
-                .record(name, &labels, Op::Set(py_float(&value)?), false)?;
+                .record_with(name, &labels, || py_float(&value).map(Op::Set), false)?;
         }
         Ok(())
     }
@@ -699,7 +701,7 @@ impl Success<'_> {
                 }
                 let labels = self.emit.labels(name, &context);
                 self.emit
-                    .record(name, &labels, Op::Set(py_float(&limit)?), false)?;
+                    .record_with(name, &labels, || py_float(&limit).map(Op::Set), false)?;
             }
         }
         let hidden = required(payload, "hidden_params")?;
@@ -718,11 +720,14 @@ impl Success<'_> {
         let context = values.context(self.settings());
         let overhead = get(hidden, "litellm_overhead_time_ms");
         if py_truthy(overhead) {
-            let seconds = py_divide(overhead, 1000.0)?;
             let name = "litellm_overhead_latency_metric";
             let labels = self.emit.labels(name, &context);
-            self.emit
-                .record(name, &labels, Op::Observe(seconds), false)?;
+            self.emit.record_with(
+                name,
+                &labels,
+                || py_divide(overhead, 1000.0).map(Op::Observe),
+                false,
+            )?;
         }
         let guardrail = guardrail_overhead_seconds(payload)?;
         if !overhead.is_null() || guardrail > 0.0 {
