@@ -334,15 +334,18 @@ def install_native_budgets(store: SpendCounterStore, callbacks: list[object]) ->
         return
     if not native_budgets_requested():
         return
-    from litellm.rust_bridge._native import NativeBudgets
+    from litellm.rust_bridge._native import NativeBudgets, NativeSpendCounters
 
-    budgets: Final = NativeBudgets(store.handle)
-    logger: Final = native_logger(budgets.callback(), _PROJECTIONS)
-    logger.__class__ = type(type(logger).__name__, (NativeBudgetsLogger, type(logger)), {"budgets": budgets})
+    handle: Final = store.handle
+    if not isinstance(handle, NativeSpendCounters):
+        return
+    budgets: Final = NativeBudgets(handle)
+    template: Final = native_logger(budgets.callback(), _PROJECTIONS)
+    owner_type: Final = type(type(template).__name__, (NativeBudgetsLogger, type(template)), {"budgets": budgets})
+    logger: Final = owner_type(template.native, _PROJECTIONS)
     register_abort_error("budget_exceeded", _budget_exceeded)
     register_abort_error("budget_unavailable", _budget_unavailable)
     register_abort_error("budget_reservation_failed", _reservation_failed)
-    assert isinstance(logger, NativeBudgetsLogger)
     callbacks.insert(0, logger)
     _installed.append(_Owner(budgets=budgets, logger=logger))
 

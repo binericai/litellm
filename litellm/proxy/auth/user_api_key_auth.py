@@ -191,6 +191,7 @@ from litellm.proxy.spend_tracking.committed_spend import (
     committed_spend_tracked,
     read_admission_committed_spend,
 )
+from litellm.proxy.spend_tracking.native_budgets import bind_native_request, native_budget_decision
 from litellm.proxy.spend_tracking.spend_counter_batch import (
     bind_admission_counter_keys,
     release_spend_counter_batch,
@@ -3329,8 +3330,6 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
                                 fallback_spend=team_member_spend,
                                 max_budget=team_member_budget,
                             )
-                        from litellm.proxy.spend_tracking.native_budgets import native_budget_decision
-
                         native: Final = native_budget_decision(
                             {
                                 "check": "team_member_positive",
@@ -4354,7 +4353,6 @@ async def _reserve_budget_after_common_checks(
         from litellm.proxy.spend_tracking.budget_reservation import (
             reserve_budget_for_request,
         )
-        from litellm.proxy.spend_tracking.native_budgets import bind_native_request
 
         reservation_path_params: Final = read_request_path_params(request)
         user_api_key_auth_obj.budget_reservation = await reserve_budget_for_request(
