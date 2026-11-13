@@ -88,3 +88,125 @@ fn success<'a>(
         logs,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rstest::{fixture, rstest};
+    use serde_json::json;
+    use strum::VariantArray;
+
+    use super::*;
+
+    const COUNTERS: [&str; 5] = [
+        "litellm_requests_metric",
+        "litellm_spend_metric",
+        "litellm_total_tokens_metric",
+        "litellm_input_tokens_metric",
+        "litellm_output_tokens_metric",
+    ];
+
+    #[fixture]
+    fn store() -> Store {
+        let store = Store::new(SeriesLimits::default(), Box::new(ManualClock::default()));
+        for name in COUNTERS {
+            store
+                .register(FamilySpec {
+                    declared: name.to_owned(),
+                    documentation: "doc".to_owned(),
+                    kind: Kind::Counter,
+                    labelnames: vec!["team".to_owned()],
+                    excluded: Vec::new(),
+                    buckets: Vec::new(),
+                    most_recent: false,
+                    wrapped: false,
+                    shares_overflow: true,
+                })
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        store
+    }
+
+    fn facts(completion_tokens: Value) -> AttemptFacts {
+        serde_json::from_value(json!({
+            "payload": {
+                "metadata": {
+                    "user_api_key_user_id": "u",
+                    "user_api_key_hash": "hashed",
+                    "user_api_key_alias": null,
+                    "user_api_key_team_id": "team-1",
+                    "user_api_key_team_alias": null,
+                    "user_api_key_user_email": null,
+                },
+                "completion_tokens": completion_tokens,
+                "total_tokens": 30,
+                "prompt_tokens": 20,
+                "response_cost": 0.5,
+                "request_tags": [],
+                "model_group": "group",
+                "model_id": "id",
+                "api_base": "base",
+                "custom_llm_provider": "openai",
+            },
+            "settings": {},
+        }))
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn totals(store: &Store) -> Vec<(&'static str, Vec<f64>)> {
+        COUNTERS
+            .into_iter()
+            .map(|name| {
+                let id = store
+                    .family(name)
+                    .unwrap_or_else(|| panic!("{name} is registered"));
+                let values = store
+                    .snapshot(id)
+                    .series
+                    .into_iter()
+                    .map(|(_, series)| series.value)
+                    .collect();
+                (name, values)
+            })
+            .collect()
+    }
+
+    #[rstest]
+    fn steps_parse_from_the_names_python_sends(#[values(0, 1, 2, 3, 4)] index: usize) {
+        let step = Step::VARIANTS[index];
+        let name: &'static str = step.into();
+        assert_eq!(name.parse::<Step>(), Ok(step));
+    }
+
+    #[rstest]
+    fn the_head_step_stops_where_python_raises(store: Store) {
+        let recorded = record(&store, &facts(json!("ten")), Step::SuccessHead, None);
+        assert_eq!(
+            recorded.outcome.map_err(|error| exception_text(&error)),
+            Err("could not convert string to float: 'ten'".to_owned())
+        );
+        assert_eq!(
+            totals(&store),
+            vec![
+                ("litellm_requests_metric", vec![1.0]),
+                ("litellm_spend_metric", vec![0.5]),
+                ("litellm_total_tokens_metric", vec![30.0]),
+                ("litellm_input_tokens_metric", vec![20.0]),
+                ("litellm_output_tokens_metric", vec![]),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn only_the_head_step_counts_requests_and_tokens(
+        store: Store,
+        #[values(Step::SuccessLimits, Step::SuccessLatency, Step::SuccessTail)] step: Step,
+    ) {
+        let recorded = record(&store, &facts(json!(10)), step, None);
+        assert!(recorded.outcome.is_ok());
+        assert!(
+            totals(&store)
+                .into_iter()
+                .all(|(_, values)| values.is_empty())
+        );
+    }
+}

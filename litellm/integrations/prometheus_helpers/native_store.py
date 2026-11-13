@@ -33,6 +33,29 @@ if TYPE_CHECKING:
 _Parsed: Final = TypeVar("_Parsed")
 PrometheusKind: TypeAlias = Literal["counter", "gauge", "histogram"]
 NativeStep: TypeAlias = Literal["success_head", "success_limits", "success_latency", "success_tail", "failure"]
+NativeOp: TypeAlias = Literal[
+    "deployment_state",
+    "deployment_failure",
+    "cooled_down",
+    "guardrail",
+    "managed_batch_created",
+    "managed_file_created",
+    "managed_file_size",
+    "managed_batch_duration",
+    "managed_file_deleted",
+    "check_batch_cost_run",
+    "check_batch_cost_error",
+    "callback_failure",
+    "provider_budget",
+    "spend_capture_rate",
+    "dynamic_limiter_share",
+    "dynamic_limiter_throttled",
+    "fallback",
+    "proxy_failure",
+    "budget",
+    "team_members",
+    "counts",
+]
 
 NATIVE_PROMETHEUS_ENV: Final = "LITELLM_NATIVE_PROMETHEUS"
 NativePrometheusMetric: Final = _native.NativePrometheusMetric
@@ -378,7 +401,7 @@ class NativeStore:
     def attempt(self, kwargs: Mapping[str, object]) -> _native.NativePrometheusAttempt:
         return self.store.attempt(json.dumps(attempt_facts(kwargs)))
 
-    def op(self, name: str, facts: Mapping[str, object]) -> None:
+    def op(self, name: NativeOp, facts: Mapping[str, object]) -> None:
         self.store.op(
             name, json.dumps({**{key: json_safe(value) for key, value in facts.items()}, "settings": _settings()})
         )

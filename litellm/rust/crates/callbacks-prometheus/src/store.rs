@@ -501,3 +501,114 @@ impl Store {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rstest::{fixture, rstest};
+
+    use super::*;
+
+    fn spec(kind: Kind, declared: &str, labelnames: &[&str], buckets: &[f64]) -> FamilySpec {
+        FamilySpec {
+            declared: declared.to_owned(),
+            documentation: "doc".to_owned(),
+            kind,
+            labelnames: labelnames.iter().map(|name| (*name).to_owned()).collect(),
+            excluded: Vec::new(),
+            buckets: buckets.to_vec(),
+            most_recent: false,
+            wrapped: true,
+            shares_overflow: kind != Kind::Gauge,
+        }
+    }
+
+    fn values(family: &FamilySnapshot) -> Vec<(Vec<String>, f64)> {
+        family
+            .series
+            .iter()
+            .map(|(labels, series)| (labels.clone(), series.value))
+            .collect()
+    }
+
+    fn label(value: &str) -> Vec<String> {
+        vec![value.to_owned()]
+    }
+
+    #[fixture]
+    fn capped() -> Store {
+        Store::new(
+            SeriesLimits {
+                max_series: Some(1),
+                ttl_seconds: None,
+                cleanup_interval_seconds: None,
+            },
+            Box::new(ManualClock::default()),
+        )
+    }
+
+    #[rstest]
+    #[case::unsorted(&[2.0, 1.0], Err(StoreError::BucketsUnsorted))]
+    #[case::empty(&[], Err(StoreError::TooFewBuckets))]
+    #[case::only_infinity(&[f64::INFINITY], Err(StoreError::TooFewBuckets))]
+    #[case::infinity_appended(&[1.0], Ok(vec![1.0, f64::INFINITY]))]
+    fn histogram_buckets_follow_the_python_client(
+        #[case] buckets: &[f64],
+        #[case] expected: Result<Vec<f64>, StoreError>,
+    ) {
+        let store = Store::new(SeriesLimits::default(), Box::new(ManualClock::default()));
+        let registered = store
+            .register(spec(Kind::Histogram, "h", &["a"], buckets))
+            .map(|id| store.snapshot(id).buckets);
+        assert_eq!(registered, expected);
+    }
+
+    #[rstest]
+    fn a_counter_refuses_a_negative_increment() {
+        let store = Store::new(SeriesLimits::default(), Box::new(ManualClock::default()));
+        let id = store
+            .register(spec(Kind::Counter, "c_total", &["a"], &[]))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            store.record(id, &label("x"), Op::Inc(-1.0)),
+            Err(StoreError::NegativeCounter)
+        );
+        assert_eq!(values(&store.snapshot(id)), vec![(label("x"), 0.0)]);
+    }
+
+    #[rstest]
+    #[case::counter_folds_into_other(Kind::Counter, vec![(label("first"), 1.0), (label(OVERFLOW_LABEL_VALUE), 1.0)])]
+    #[case::gauge_drops_the_new_series(Kind::Gauge, vec![(label("first"), 1.0)])]
+    fn a_series_past_the_cap_follows_the_python_overflow_rule(
+        capped: Store,
+        #[case] kind: Kind,
+        #[case] expected: Vec<(Vec<String>, f64)>,
+    ) {
+        let id = capped
+            .register(spec(kind, "m", &["a"], &[]))
+            .unwrap_or_else(|error| panic!("{error}"));
+        for value in ["first", "second"] {
+            capped
+                .record(id, &label(value), Op::Inc(1.0))
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        assert_eq!(values(&capped.snapshot(id)), expected);
+    }
+
+    #[rstest]
+    fn a_family_snapshot_holds_only_that_family() {
+        let store = Store::new(SeriesLimits::default(), Box::new(ManualClock::default()));
+        let first = store
+            .register(spec(Kind::Counter, "first_total", &["a"], &[]))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let second = store
+            .register(spec(Kind::Counter, "second_total", &["a"], &[]))
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .record(second, &label("x"), Op::Inc(2.0))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let snapshot = store.snapshot(first);
+        assert_eq!(snapshot.name, "first");
+        assert!(snapshot.series.is_empty());
+        assert_eq!(values(&store.snapshot(second)), vec![(label("x"), 2.0)]);
+    }
+}

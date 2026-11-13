@@ -74,6 +74,54 @@ impl From<litellm_callbacks::CallbackError> for OpError {
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray,
+)]
+pub enum OpName {
+    #[strum(serialize = "deployment_state")]
+    DeploymentState,
+    #[strum(serialize = "deployment_failure")]
+    DeploymentFailure,
+    #[strum(serialize = "cooled_down")]
+    CooledDown,
+    #[strum(serialize = "guardrail")]
+    Guardrail,
+    #[strum(serialize = "managed_batch_created")]
+    ManagedBatchCreated,
+    #[strum(serialize = "managed_file_created")]
+    ManagedFileCreated,
+    #[strum(serialize = "managed_file_size")]
+    ManagedFileSize,
+    #[strum(serialize = "managed_batch_duration")]
+    ManagedBatchDuration,
+    #[strum(serialize = "managed_file_deleted")]
+    ManagedFileDeleted,
+    #[strum(serialize = "check_batch_cost_run")]
+    CheckBatchCostRun,
+    #[strum(serialize = "check_batch_cost_error")]
+    CheckBatchCostError,
+    #[strum(serialize = "callback_failure")]
+    CallbackFailure,
+    #[strum(serialize = "provider_budget")]
+    ProviderBudget,
+    #[strum(serialize = "spend_capture_rate")]
+    SpendCaptureRate,
+    #[strum(serialize = "dynamic_limiter_share")]
+    DynamicLimiterShare,
+    #[strum(serialize = "dynamic_limiter_throttled")]
+    DynamicLimiterThrottled,
+    #[strum(serialize = "fallback")]
+    Fallback,
+    #[strum(serialize = "proxy_failure")]
+    ProxyFailure,
+    #[strum(serialize = "budget")]
+    Budget,
+    #[strum(serialize = "team_members")]
+    TeamMembers,
+    #[strum(serialize = "counts")]
+    Counts,
+}
+
 type OpResult = Result<(), OpError>;
 
 #[derive(Deserialize)]
@@ -579,44 +627,29 @@ impl Ops<'_> {
         Ok(())
     }
 
-    fn labeled(&self) -> OpResult {
-        let metric = text(field(self.facts, "metric"));
-        let amount = self.number("amount")?;
-        let op = match text(field(self.facts, "op")).as_str() {
-            "inc" => Op::Inc(amount),
-            "set" => Op::Set(amount),
-            "observe" => Op::Observe(amount),
-            other => return Err(OpError::value(format!("unknown op {other}"))),
-        };
-        let track = field(self.facts, "track_end_user") == &Value::Bool(true);
-        self.factory(&metric, &values_of(self.facts), op, track)
-    }
-
-    fn run(&self, op: &str) -> OpResult {
+    fn run(&self, op: OpName) -> OpResult {
         match op {
-            "deployment_state" => self.deployment_state(),
-            "deployment_failure" => self.deployment_failure(),
-            "cooled_down" => self.cooled_down(),
-            "guardrail" => self.guardrail(),
-            "managed_batch_created" => self.identity("litellm_managed_batch_created_total"),
-            "managed_file_created" => self.identity("litellm_managed_file_created_total"),
-            "managed_file_size" => self.file_size(),
-            "managed_batch_duration" => self.batch_duration(),
-            "managed_file_deleted" => self.file_deleted(),
-            "check_batch_cost_run" => self.check_batch_cost_run(),
-            "check_batch_cost_error" => self.check_batch_cost_error(),
-            "callback_failure" => self.callback_failure(),
-            "provider_budget" => self.provider_budget(),
-            "spend_capture_rate" => self.spend_capture_rate(),
-            "dynamic_limiter_share" => self.dynamic_limiter_share(),
-            "dynamic_limiter_throttled" => self.dynamic_limiter_throttled(),
-            "fallback" => self.fallback(),
-            "proxy_failure" => self.proxy_failure(),
-            "budget" => self.budget(),
-            "team_members" => self.team_members(),
-            "counts" => self.counts(),
-            "labeled" => self.labeled(),
-            other => Err(OpError::value(format!("unknown prometheus op {other}"))),
+            OpName::DeploymentState => self.deployment_state(),
+            OpName::DeploymentFailure => self.deployment_failure(),
+            OpName::CooledDown => self.cooled_down(),
+            OpName::Guardrail => self.guardrail(),
+            OpName::ManagedBatchCreated => self.identity("litellm_managed_batch_created_total"),
+            OpName::ManagedFileCreated => self.identity("litellm_managed_file_created_total"),
+            OpName::ManagedFileSize => self.file_size(),
+            OpName::ManagedBatchDuration => self.batch_duration(),
+            OpName::ManagedFileDeleted => self.file_deleted(),
+            OpName::CheckBatchCostRun => self.check_batch_cost_run(),
+            OpName::CheckBatchCostError => self.check_batch_cost_error(),
+            OpName::CallbackFailure => self.callback_failure(),
+            OpName::ProviderBudget => self.provider_budget(),
+            OpName::SpendCaptureRate => self.spend_capture_rate(),
+            OpName::DynamicLimiterShare => self.dynamic_limiter_share(),
+            OpName::DynamicLimiterThrottled => self.dynamic_limiter_throttled(),
+            OpName::Fallback => self.fallback(),
+            OpName::ProxyFailure => self.proxy_failure(),
+            OpName::Budget => self.budget(),
+            OpName::TeamMembers => self.team_members(),
+            OpName::Counts => self.counts(),
         }
     }
 }
@@ -630,6 +663,9 @@ fn or_none(value: &Value) -> Value {
 }
 
 pub fn apply(store: &Store, op: &str, facts: &str) -> OpResult {
+    let op: OpName = op
+        .parse()
+        .map_err(|_| OpError::value(format!("unknown prometheus op {op}")))?;
     let facts: Facts = serde_json::from_str(facts)
         .map_err(|error| OpError::value(format!("prometheus op facts: {error}")))?;
     Ops {
@@ -638,4 +674,83 @@ pub fn apply(store: &Store, op: &str, facts: &str) -> OpResult {
         facts: &facts.rest,
     }
     .run(op)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::{fixture, rstest};
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        store::{FamilySpec, Kind, ManualClock},
+        tracker::SeriesLimits,
+    };
+
+    #[fixture]
+    fn store() -> Store {
+        let store = Store::new(SeriesLimits::default(), Box::new(ManualClock::default()));
+        for name in [
+            "litellm_deployment_failure_responses",
+            "litellm_deployment_total_requests",
+        ] {
+            store
+                .register(FamilySpec {
+                    declared: name.to_owned(),
+                    documentation: "doc".to_owned(),
+                    kind: Kind::Counter,
+                    labelnames: vec!["team".to_owned()],
+                    excluded: Vec::new(),
+                    buckets: Vec::new(),
+                    most_recent: false,
+                    wrapped: false,
+                    shares_overflow: true,
+                })
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        store
+    }
+
+    fn counted(store: &Store, name: &str) -> Vec<(Vec<String>, f64)> {
+        let id = store
+            .family(name)
+            .unwrap_or_else(|| panic!("{name} is registered"));
+        store
+            .snapshot(id)
+            .series
+            .into_iter()
+            .map(|(values, series)| (values, series.value))
+            .collect()
+    }
+
+    #[rstest]
+    fn an_unknown_op_is_a_value_error(store: Store) {
+        assert_eq!(
+            apply(&store, "nope", "{}"),
+            Err(OpError::value("unknown prometheus op nope"))
+        );
+    }
+
+    #[rstest]
+    #[case::with_exception(true, vec![(vec!["team-1".to_owned()], 1.0)])]
+    #[case::without_exception(false, vec![])]
+    fn a_deployment_failure_counts_the_request_and_only_a_raised_failure(
+        store: Store,
+        #[case] has_exception: bool,
+        #[case] failures: Vec<(Vec<String>, f64)>,
+    ) {
+        let facts = json!({"values": {"team": "team-1"}, "has_exception": has_exception});
+        assert_eq!(
+            apply(&store, "deployment_failure", &facts.to_string()),
+            Ok(())
+        );
+        assert_eq!(
+            counted(&store, "litellm_deployment_total_requests"),
+            vec![(vec!["team-1".to_owned()], 1.0)]
+        );
+        assert_eq!(
+            counted(&store, "litellm_deployment_failure_responses"),
+            failures
+        );
+    }
 }
